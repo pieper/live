@@ -1,0 +1,8 @@
+[
+ {
+  "name": "MRHead",
+  "scene": "MRHead.json",
+  "thumb": "MRHead.png",
+  "desc": "MR head \u2014 volume rendering + 4-up (axial / sagittal / coronal)"
+ }
+]
