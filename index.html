@@ -1,0 +1,47 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>SlicerLive — scene gallery</title>
+<style>
+  body { margin: 0; background: #14141c; color: #d8d8e0; font-family: -apple-system, system-ui, sans-serif; }
+  header { padding: 18px 24px; border-bottom: 1px solid #2a2a3a; }
+  h1 { margin: 0; font-size: 21px; letter-spacing: .2px; }
+  .sub { opacity: .6; font-size: 13px; margin-top: 5px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 16px; padding: 24px; }
+  a.card { display: block; background: #1e1e2a; border: 1px solid #2a2a3a; border-radius: 8px; overflow: hidden;
+           text-decoration: none; color: inherit; transition: .15s; }
+  a.card:hover { border-color: #4a90d9; transform: translateY(-2px); }
+  .card img { width: 100%; height: 200px; object-fit: cover; background: #000; display: block; }
+  .card .t { padding: 11px 13px; }
+  .card .n { font-weight: 600; }
+  .card .d { opacity: .6; font-size: 12px; margin-top: 3px; }
+  .empty { padding: 44px; opacity: .55; }
+  a.gh { color: #7fa8e0; font-size: 12px; text-decoration: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>SlicerLive</h1>
+  <div class="sub">Live 3D Slicer scenes — rendered in your browser on your own GPU, no install. Click a scene to open it.
+    &nbsp;·&nbsp; <a class="gh" href="https://github.com/pieper/SlicerLive" target="_blank">github.com/pieper/SlicerLive</a></div>
+</header>
+<div class="grid" id="grid"><div class="empty">loading…</div></div>
+<script>
+  fetch('scenes/index.json').then((r) => r.json()).then((scenes) => {
+    const g = document.getElementById('grid'); g.innerHTML = '';
+    if (!scenes.length) { g.innerHTML = '<div class="empty">No scenes yet — publish one with <code>publish.py</code>.</div>'; return; }
+    for (const s of scenes) {
+      const a = document.createElement('a');
+      a.className = 'card'; a.target = '_blank';
+      a.href = 'viewer.html?scene=scenes/' + encodeURIComponent(s.scene);
+      const img = document.createElement('img'); img.src = 'scenes/' + s.thumb; img.onerror = () => { img.style.display = 'none'; };
+      const t = document.createElement('div'); t.className = 't';
+      t.innerHTML = '<div class="n"></div><div class="d"></div>';
+      t.querySelector('.n').textContent = s.name; t.querySelector('.d').textContent = s.desc || '';
+      a.appendChild(img); a.appendChild(t); g.appendChild(a);
+    }
+  }).catch(() => { document.getElementById('grid').innerHTML = '<div class="empty">No scenes index yet.</div>'; });
+</script>
+</body>
+</html>
