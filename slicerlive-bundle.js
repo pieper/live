@@ -2785,7 +2785,7 @@
       "use strict";
       Object.defineProperty(exports, "__esModule", { value: true });
       exports.append = append;
-      exports.extend = extend156;
+      exports.extend = extend157;
       exports.prepend = prepend;
       exports.replace = replace;
       exports.insert = insert;
@@ -2802,7 +2802,7 @@
       function append(list, item) {
         list.push(item);
       }
-      function extend156(listA, listB) {
+      function extend157(listA, listB) {
         listA.push(...listB);
       }
       function prepend(list, item) {
@@ -3030,7 +3030,7 @@
       "use strict";
       Object.defineProperty(exports, "__esModule", { value: true });
       exports.append = append;
-      exports.extend = extend156;
+      exports.extend = extend157;
       exports.prepend = prepend;
       exports.replace = replace;
       exports.insert = insert;
@@ -3052,7 +3052,7 @@
       function append(set7, item) {
         set7.add(item);
       }
-      function extend156(setA, setB) {
+      function extend157(setA, setB) {
         setB.forEach(setA.add, setA);
       }
       function prepend(set7, item) {
@@ -16805,7 +16805,7 @@
         else if (isNothing(sequence)) return [];
         return [sequence];
       }
-      function extend156(target, source) {
+      function extend157(target, source) {
         if (source) {
           const sourceKeys = Object.keys(source);
           for (let index = 0, length4 = sourceKeys.length; index < length4; index += 1) {
@@ -16830,7 +16830,7 @@
       module.exports.toArray = toArray;
       module.exports.repeat = repeat;
       module.exports.isNegativeZero = isNegativeZero;
-      module.exports.extend = extend156;
+      module.exports.extend = extend157;
     }
   });
 
@@ -17064,7 +17064,7 @@
       function Schema(definition) {
         return this.extend(definition);
       }
-      Schema.prototype.extend = function extend156(definition) {
+      Schema.prototype.extend = function extend157(definition) {
         let implicit = [];
         let explicit = [];
         if (definition instanceof Type) {
@@ -22519,11 +22519,11 @@
       callbacks.forEach(([cbID]) => off(cbID));
     };
   }
-  function newInstance(extend156, className) {
+  function newInstance(extend157, className) {
     const constructor = (initialValues = {}) => {
       const model = {};
       const publicAPI = {};
-      extend156(publicAPI, model, initialValues);
+      extend157(publicAPI, model, initialValues);
       return Object.freeze(publicAPI);
     };
     if (className) vtk.register(className, constructor);
@@ -66786,6 +66786,58 @@ volumeActor.getProperty().${removedMethodName}()
     extend: extend148
   };
 
+  // node_modules/@kitware/vtk.js/Rendering/Core/ImageResliceMapper/Constants.js
+  var SlabTypes = {
+    MIN: 0,
+    MAX: 1,
+    MEAN: 2,
+    SUM: 3
+  };
+  var Constants_default24 = { SlabTypes };
+
+  // node_modules/@kitware/vtk.js/Rendering/Core/ImageResliceMapper.js
+  var { SlabTypes: SlabTypes2 } = Constants_default24;
+  var { staticOffsetAPI: staticOffsetAPI4, otherStaticMethods: otherStaticMethods3 } = CoincidentTopologyHelper_default;
+  function vtkImageResliceMapper(publicAPI, model) {
+    model.classHierarchy.push("vtkImageResliceMapper");
+    publicAPI.computeBounds = () => {
+      const image = publicAPI.getInputData();
+      if (publicAPI.getSlicePolyData()) BoundingBox_default.setBounds(model.bounds, publicAPI.getSlicePolyData().getBounds());
+      else if (image) {
+        BoundingBox_default.setBounds(model.bounds, image.getBounds());
+        if (publicAPI.getSlicePlane()) BoundingBox_default.cutWithPlane(model.bounds, publicAPI.getSlicePlane().getOrigin(), publicAPI.getSlicePlane().getNormal());
+      } else BoundingBox_default.reset(model.bounds);
+    };
+  }
+  var defaultValues10 = (initialValues) => ({
+    slabThickness: 0,
+    slabTrapezoidIntegration: 0,
+    slabType: SlabTypes2.MEAN,
+    slicePlane: null,
+    slicePolyData: null,
+    ...initialValues
+  });
+  function extend149(publicAPI, model, initialValues = {}) {
+    Object.assign(model, defaultValues10(initialValues));
+    AbstractImageMapper_default.extend(publicAPI, model, initialValues);
+    macros_default.setGet(publicAPI, model, [
+      "slabThickness",
+      "slabTrapezoidIntegration",
+      "slabType",
+      "slicePlane",
+      "slicePolyData"
+    ]);
+    CoincidentTopologyHelper_default.implementCoincidentTopologyMethods(publicAPI, model);
+    vtkImageResliceMapper(publicAPI, model);
+  }
+  var newInstance141 = macros_default.newInstance(extend149, "vtkImageResliceMapper");
+  var ImageResliceMapper_default = {
+    newInstance: newInstance141,
+    extend: extend149,
+    ...staticOffsetAPI4,
+    ...otherStaticMethods3
+  };
+
   // node_modules/@kitware/vtk.js/Common/Core/ImageHelper.js
   function canvasToImageData(canvas, boundingBox = [
     0,
@@ -67002,7 +67054,7 @@ volumeActor.getProperty().${removedMethodName}()
     edgeColor: "black",
     resolution: 200
   } };
-  function extend149(publicAPI, model, initialValues = {}) {
+  function extend150(publicAPI, model, initialValues = {}) {
     Object.assign(model, DEFAULT_VALUES138, initialValues);
     Actor_default.extend(publicAPI, model, initialValues);
     macros_default.get(publicAPI, model, [
@@ -67016,10 +67068,10 @@ volumeActor.getProperty().${removedMethodName}()
     ]);
     vtkAnnotatedCubeActor(publicAPI, model);
   }
-  var newInstance141 = macros_default.newInstance(extend149, "vtkAnnotatedCubeActor");
+  var newInstance142 = macros_default.newInstance(extend150, "vtkAnnotatedCubeActor");
   var AnnotatedCubeActor_default = {
-    newInstance: newInstance141,
-    extend: extend149,
+    newInstance: newInstance142,
+    extend: extend150,
     Presets: Presets_default
   };
 
@@ -67030,11 +67082,11 @@ volumeActor.getProperty().${removedMethodName}()
     BOTTOM_LEFT: "BOTTOM_LEFT",
     BOTTOM_RIGHT: "BOTTOM_RIGHT"
   };
-  var Constants_default24 = { Corners };
+  var Constants_default25 = { Corners };
 
   // node_modules/@kitware/vtk.js/Interaction/Widgets/OrientationMarkerWidget.js
   var { vtkErrorMacro: vtkErrorMacro53 } = macros_default;
-  var { Corners: Corners2 } = Constants_default24;
+  var { Corners: Corners2 } = Constants_default25;
   function vtkOrientationMarkerWidget(publicAPI, model) {
     model.classHierarchy.push("vtkOrientationMarkerWidget");
     const superClass = { ...publicAPI };
@@ -67222,14 +67274,14 @@ volumeActor.getProperty().${removedMethodName}()
     selfSubscription = publicAPI.onModified(publicAPI.updateViewport);
   }
   var DEFAULT_VALUES139 = {
-    viewportCorner: Constants_default24.Corners.BOTTOM_LEFT,
+    viewportCorner: Constants_default25.Corners.BOTTOM_LEFT,
     viewportSize: 0.2,
     minPixelSize: 50,
     maxPixelSize: 200,
     parentRenderer: null,
     interactiveRenderer: false
   };
-  function extend150(publicAPI, model, initialValues = {}) {
+  function extend151(publicAPI, model, initialValues = {}) {
     Object.assign(model, DEFAULT_VALUES139, initialValues);
     macros_default.obj(publicAPI, model);
     macros_default.get(publicAPI, model, [
@@ -67248,11 +67300,11 @@ volumeActor.getProperty().${removedMethodName}()
     macros_default.moveToProtected(publicAPI, model, ["interactor"]);
     vtkOrientationMarkerWidget(publicAPI, model);
   }
-  var newInstance142 = macros_default.newInstance(extend150, "vtkOrientationMarkerWidget");
+  var newInstance143 = macros_default.newInstance(extend151, "vtkOrientationMarkerWidget");
   var OrientationMarkerWidget_default = {
-    newInstance: newInstance142,
-    extend: extend150,
-    ...Constants_default24
+    newInstance: newInstance143,
+    extend: extend151,
+    ...Constants_default25
   };
 
   // node_modules/@kitware/vtk.js/Filters/Sources/SphereSource.js
@@ -67392,7 +67444,7 @@ volumeActor.getProperty().${removedMethodName}()
     ],
     pointType: "Float64Array"
   };
-  function extend151(publicAPI, model, initialValues = {}) {
+  function extend152(publicAPI, model, initialValues = {}) {
     Object.assign(model, DEFAULT_VALUES140, initialValues);
     macros_default.obj(publicAPI, model);
     macros_default.setGet(publicAPI, model, [
@@ -67409,10 +67461,10 @@ volumeActor.getProperty().${removedMethodName}()
     macros_default.algo(publicAPI, model, 0, 1);
     vtkSphereSource(publicAPI, model);
   }
-  var newInstance143 = macros_default.newInstance(extend151, "vtkSphereSource");
+  var newInstance144 = macros_default.newInstance(extend152, "vtkSphereSource");
   var SphereSource_default = {
-    newInstance: newInstance143,
-    extend: extend151
+    newInstance: newInstance144,
+    extend: extend152
   };
 
   // node_modules/@kitware/vtk.js/Common/Core/Base64.js
@@ -67551,7 +67603,7 @@ volumeActor.getProperty().${removedMethodName}()
     publicAPI.getNumberOfValues = () => model.values.length;
     publicAPI.getNumberOfTuples = () => model.values.length / model.numberOfComponents;
     publicAPI.getDataType = () => model.dataType;
-    publicAPI.newClone = () => newInstance144({
+    publicAPI.newClone = () => newInstance145({
       name: model.name,
       numberOfComponents: model.numberOfComponents,
       empty: true
@@ -67574,7 +67626,7 @@ volumeActor.getProperty().${removedMethodName}()
     size: 0,
     dataType: "string"
   };
-  function extend152(publicAPI, model, initialValues = {}) {
+  function extend153(publicAPI, model, initialValues = {}) {
     Object.assign(model, DEFAULT_VALUES141, initialValues);
     if (!model.empty && !model.values && !model.size) throw new TypeError("Cannot create vtkStringArray object without: size > 0, values");
     if (!model.values) model.values = [];
@@ -67584,10 +67636,10 @@ volumeActor.getProperty().${removedMethodName}()
     macros_default.set(publicAPI, model, ["name"]);
     vtkStringArray(publicAPI, model);
   }
-  var newInstance144 = macros_default.newInstance(extend152, "vtkStringArray");
+  var newInstance145 = macros_default.newInstance(extend153, "vtkStringArray");
   var StringArray_default = {
-    newInstance: newInstance144,
-    extend: extend152
+    newInstance: newInstance145,
+    extend: extend153
   };
 
   // node_modules/@kitware/vtk.js/IO/Core/DataAccessHelper.js
@@ -68538,7 +68590,7 @@ volumeActor.getProperty().${removedMethodName}()
     };
   }
   var DEFAULT_VALUES142 = {};
-  function extend153(publicAPI, model, initialValues = {}) {
+  function extend154(publicAPI, model, initialValues = {}) {
     Object.assign(model, DEFAULT_VALUES142, initialValues);
     macros_default.obj(publicAPI, model);
     macros_default.get(publicAPI, model, ["url", "baseURL"]);
@@ -68547,7 +68599,7 @@ volumeActor.getProperty().${removedMethodName}()
     vtkXMLReader(publicAPI, model);
   }
   var XMLReader_default = {
-    extend: extend153,
+    extend: extend154,
     processDataArray,
     processFieldData,
     processCells
@@ -68596,15 +68648,15 @@ volumeActor.getProperty().${removedMethodName}()
     };
   }
   var DEFAULT_VALUES143 = { dataType: "PolyData" };
-  function extend154(publicAPI, model, initialValues = {}) {
+  function extend155(publicAPI, model, initialValues = {}) {
     Object.assign(model, DEFAULT_VALUES143, initialValues);
     XMLReader_default.extend(publicAPI, model, initialValues);
     vtkXMLPolyDataReader(publicAPI, model);
   }
-  var newInstance145 = macros_default.newInstance(extend154, "vtkXMLPolyDataReader");
+  var newInstance146 = macros_default.newInstance(extend155, "vtkXMLPolyDataReader");
   var XMLPolyDataReader_default = {
-    newInstance: newInstance145,
-    extend: extend154
+    newInstance: newInstance146,
+    extend: extend155
   };
 
   // node_modules/@kitware/vtk.js/IO/Legacy/LegacyAsciiParser.js
@@ -68886,7 +68938,7 @@ volumeActor.getProperty().${removedMethodName}()
     };
   }
   var DEFAULT_VALUES144 = {};
-  function extend155(publicAPI, model, initialValues = {}) {
+  function extend156(publicAPI, model, initialValues = {}) {
     Object.assign(model, DEFAULT_VALUES144, initialValues);
     macros_default.obj(publicAPI, model);
     macros_default.get(publicAPI, model, ["url", "baseURL"]);
@@ -68896,14 +68948,14 @@ volumeActor.getProperty().${removedMethodName}()
     if (!model.compression) model.compression = null;
     if (!model.progressCallback) model.progressCallback = null;
   }
-  var newInstance146 = macros_default.newInstance(extend155, "vtkPolyDataReader");
+  var newInstance147 = macros_default.newInstance(extend156, "vtkPolyDataReader");
   var PolyDataReader_default = {
-    newInstance: newInstance146,
-    extend: extend155
+    newInstance: newInstance147,
+    extend: extend156
   };
 
   // slicerlive.js
-  var OFFLOAD_BUILD = "slicerlive-v1h lightfollow 2026-06-14";
+  var OFFLOAD_BUILD = "slicerlive-v1n ohif-blit 2026-06-14";
   window.__offloadBuild = OFFLOAD_BUILD;
   console.log("%c[offload] BUILD " + OFFLOAD_BUILD, "color:#7fe0a0;font-weight:bold");
   try {
@@ -69047,6 +69099,63 @@ volumeActor.getProperty().${removedMethodName}()
     int8: Int8Array,
     uint8: Uint8Array
   };
+  var ZDT = {
+    // zarr dtype.str ("<i2") -> typed-array constructor (little-endian assumed)
+    "<f4": Float32Array,
+    "<f8": Float64Array,
+    "<i4": Int32Array,
+    "<u4": Uint32Array,
+    "<i2": Int16Array,
+    "<u2": Uint16Array,
+    "|i1": Int8Array,
+    "|u1": Uint8Array,
+    "<i1": Int8Array,
+    "<u1": Uint8Array
+  };
+  var zarrCache = /* @__PURE__ */ new Map();
+  function fetchZarrVolume(node, onBytes) {
+    const z = node.attrs && node.attrs.zarr;
+    if (!z) return Promise.resolve(null);
+    const dir = (window.__SLICERLIVE_BLOB_BASE || "") + z.dir + "/" + z.dataset + "/";
+    if (zarrCache.has(dir)) return zarrCache.get(dir);
+    const p = (async () => {
+      const Ctor = ZDT[z.dtype] || Int16Array;
+      const [nz, ny, nx] = z.shape, [cz, cy, cx] = z.chunks, [ncz, ncy, ncx] = z.chunkGrid;
+      const out2 = new Ctor(nz * ny * nx);
+      const jobs = [];
+      for (let kk = 0; kk < ncz; kk++) for (let jj = 0; jj < ncy; jj++) for (let ii = 0; ii < ncx; ii++) jobs.push([kk, jj, ii]);
+      let idx = 0;
+      const CONC = 12;
+      const worker = async () => {
+        while (idx < jobs.length) {
+          const [kk, jj, ii] = jobs[idx++];
+          const gz = await fetch(dir + kk + "." + jj + "." + ii).then((r) => r.arrayBuffer());
+          if (onBytes) onBytes(gz.byteLength);
+          const raw = await new Response(new Response(gz).body.pipeThrough(new DecompressionStream("deflate"))).arrayBuffer();
+          const chunk = new Ctor(raw);
+          const z0 = kk * cz, y0 = jj * cy, x0 = ii * cx;
+          const zw = Math.min(cz, nz - z0), yw = Math.min(cy, ny - y0), xw = Math.min(cx, nx - x0);
+          for (let zz = 0; zz < zw; zz++) for (let yy = 0; yy < yw; yy++) {
+            const src = (zz * cy + yy) * cx;
+            const dst = ((z0 + zz) * ny + (y0 + yy)) * nx + x0;
+            out2.set(chunk.subarray(src, src + xw), dst);
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(CONC, jobs.length) }, worker));
+      return out2;
+    })();
+    zarrCache.set(dir, p);
+    return p;
+  }
+  function getVolumeScalars(node, onBytes) {
+    if (node.attrs && node.attrs.zarr) return fetchZarrVolume(node, onBytes);
+    return fetchArray2(node.blobs && node.blobs.scalars);
+  }
+  function volScalarKey(node) {
+    if (node.attrs && node.attrs.zarr) return node.attrs.zarr.dir;
+    return node.blobs && node.blobs.scalars && node.blobs.scalars.hash;
+  }
   function fetchArray2(meta) {
     if (!meta) return Promise.resolve(null);
     if (localBlobs.has(meta.hash)) return Promise.resolve(localBlobs.get(meta.hash));
@@ -69597,14 +69706,14 @@ volumeActor.getProperty().${removedMethodName}()
     }
     async update(id, node) {
       const vr = displayNodeOf(node, isVR);
-      const hash = node.blobs.scalars && node.blobs.scalars.hash;
+      const hash = volScalarKey(node);
       let it = this.items.get(id);
       if (!hash || !vr) {
         if (it) this.remove(id);
         return;
       }
       if (!it || it.hash !== hash) {
-        const scalars = await fetchArray2(node.blobs.scalars);
+        const scalars = await getVolumeScalars(node);
         if (!scalars) return;
         const img = ImageData_default.newInstance();
         img.setDimensions(node.attrs.dims);
@@ -69988,9 +70097,6 @@ volumeActor.getProperty().${removedMethodName}()
     renderer.setViewport(0.5, 0.5, 1, 1);
     _fourUp = {};
     for (const name of ["Red", "Yellow", "Green"]) {
-      const ren = Renderer_default.newInstance({ background: [0, 0, 0] });
-      ren.setViewport(..._VP[name]);
-      renderWindow.addRenderer(ren);
       const slider = document.createElement("input");
       slider.type = "range";
       slider.min = "0";
@@ -70000,43 +70106,136 @@ volumeActor.getProperty().${removedMethodName}()
       slider.addEventListener("input", () => setSliceIndex(_fourUp[name], +slider.value));
       slider.addEventListener("pointerdown", (e) => e.stopPropagation(), true);
       document.body.appendChild(slider);
-      _fourUp[name] = { ren, mapper: null, slice: null, volHash: null, slider, index: 0, maxIndex: 1 };
+      _fourUp[name] = { slider, index: null, maxIndex: 1, pscale: 0, pan: [0, 0, 0] };
     }
   }
+  function setImageWorldGeometry(img, ijkToRAS) {
+    const M = ijkToRAS, g = (r, c) => M[r * 4 + c];
+    const sp = [0, 1, 2].map((c) => Math.hypot(g(0, c), g(1, c), g(2, c)) || 1);
+    img.setSpacing(sp[0], sp[1], sp[2]);
+    img.setOrigin(g(0, 3), g(1, 3), g(2, 3));
+    img.setDirection([
+      g(0, 0) / sp[0],
+      g(0, 1) / sp[1],
+      g(0, 2) / sp[2],
+      g(1, 0) / sp[0],
+      g(1, 1) / sp[1],
+      g(1, 2) / sp[2],
+      g(2, 0) / sp[0],
+      g(2, 1) / sp[1],
+      g(2, 2) / sp[2]
+    ]);
+  }
+  var slicesDirty = false;
+  var _sliceCtx = null;
+  function ensureSliceCtx() {
+    if (_sliceCtx) return _sliceCtx;
+    const div3 = document.createElement("div");
+    div3.style.cssText = "position:absolute; left:-99999px; top:0; width:8px; height:8px; overflow:hidden;";
+    document.body.appendChild(div3);
+    const rw = RenderWindow_default.newInstance();
+    const ren = Renderer_default.newInstance({ background: [0, 0, 0] });
+    rw.addRenderer(ren);
+    const gl = RenderWindow_default2.newInstance();
+    gl.setContainer(div3);
+    gl.get3DContext({ preserveDrawingBuffer: true });
+    rw.addView(gl);
+    _sliceCtx = { rw, ren, gl, div: div3, plane: Plane_default.newInstance(), ctMapper: null, ctSlice: null, ovMapper: null, ovSlice: null, w: 0, h: 0, key: null, win: 255, lev: 128 };
+    return _sliceCtx;
+  }
   function setSliceIndex(slot, idx) {
-    if (!slot || !slot.mapper) return;
+    if (!slot) return;
     slot.index = Math.max(0, Math.min(slot.maxIndex, Math.round(idx)));
-    slot.mapper.setSlice(slot.index);
     if (slot.slider && +slot.slider.value !== slot.index) slot.slider.value = String(slot.index);
+    slicesDirty = true;
     scene3DDirty = true;
+  }
+  var _lmCache = /* @__PURE__ */ new Map();
+  async function ensureLabelmapImage(seg) {
+    const meta = seg.blobs && seg.blobs.labelmap;
+    if (!meta || !seg.attrs.labelmapDims) return null;
+    const key = seg.id + ":" + meta.hash;
+    if (_lmCache.has(key)) return _lmCache.get(key);
+    const arr = await fetchArray2(meta);
+    if (!arr) return null;
+    const img = ImageData_default.newInstance();
+    img.setDimensions(seg.attrs.labelmapDims);
+    img.getPointData().setScalars(DataArray_default.newInstance({ numberOfComponents: 1, values: arr }));
+    setImageWorldGeometry(img, seg.attrs.labelmapIjkToRAS);
+    const ctf = ColorTransferFunction_default.newInstance();
+    ctf.addRGBPoint(0, 0, 0, 0);
+    for (const c of seg.attrs.segmentColors || []) ctf.addRGBPoint(c[0], c[1], c[2], c[3]);
+    const op = seg.attrs.seg2DOpacity != null ? seg.attrs.seg2DOpacity : 0.5;
+    const maxLabel = (seg.attrs.segmentColors || []).reduce((m, c) => Math.max(m, c[0]), 1);
+    const ofun = PiecewiseFunction_default.newInstance();
+    ofun.addPoint(0, 0);
+    ofun.addPoint(0.5, 0);
+    ofun.addPoint(1, op);
+    ofun.addPoint(maxLabel, op);
+    const rec = { img, ctf, ofun, maxLabel };
+    _lmCache.set(key, rec);
+    return rec;
   }
   async function syncFourUp() {
     const sliceNodes = [...mirror.values()].filter((n) => n.class === "vtkMRMLSliceNode");
     if (!sliceNodes.length) return;
     ensureFourUp();
+    const ctx = ensureSliceCtx();
+    const segNode = [...mirror.values()].find((n) => n.class === "vtkMRMLSegmentationNode" && n.blobs && n.blobs.labelmap);
+    const lm = segNode ? await ensureLabelmapImage(segNode) : null;
     for (const sn of sliceNodes) {
       const name = sn.attrs.layoutName, slot = _fourUp[name];
       if (!slot || !sn.attrs.sliceToRAS) continue;
       const comp = [...mirror.values()].find((n) => n.class === "vtkMRMLSliceCompositeNode" && n.attrs.layoutName === name);
       const vol = comp && comp.attrs.backgroundVolumeID ? mirror.get(comp.attrs.backgroundVolumeID) : null;
-      if (!vol || !(vol.blobs && vol.blobs.scalars) || !vol.attrs.ijkToRAS) continue;
-      const scalars = await fetchArray2(vol.blobs.scalars);
+      if (!vol || !volScalarKey(vol) || !vol.attrs.ijkToRAS) continue;
+      const scalars = await getVolumeScalars(vol);
       if (!scalars) continue;
-      if (slot.volHash !== vol.blobs.scalars.hash) {
-        if (slot.slice) slot.ren.removeActor(slot.slice);
+      const ctxKey = volScalarKey(vol) + "|" + (lm ? segNode.id + ":" + segNode.blobs.labelmap.hash : "-");
+      if (ctx.key !== ctxKey) {
+        if (ctx.ctSlice) ctx.ren.removeActor(ctx.ctSlice);
+        if (ctx.ovSlice) ctx.ren.removeActor(ctx.ovSlice);
         const img = ImageData_default.newInstance();
         img.setDimensions(vol.attrs.dims);
         img.getPointData().setScalars(DataArray_default.newInstance({ numberOfComponents: vol.attrs.comps || 1, values: scalars }));
-        const userMat = volumeGeometry(img, vol.attrs.ijkToRAS);
-        const mapper = ImageMapper_default2.newInstance();
-        mapper.setInputData(img);
-        const islice = ImageSlice_default.newInstance();
-        islice.setMapper(mapper);
-        islice.setUserMatrix(userMat);
-        slot.ren.addActor(islice);
-        slot.mapper = mapper;
-        slot.slice = islice;
-        slot.volHash = vol.blobs.scalars.hash;
+        setImageWorldGeometry(img, vol.attrs.ijkToRAS);
+        const ctm = ImageResliceMapper_default.newInstance();
+        ctm.setInputData(img);
+        ctm.setSlicePlane(ctx.plane);
+        const cts = ImageSlice_default.newInstance();
+        cts.setMapper(ctm);
+        ctx.ren.addActor(cts);
+        ctx.ctMapper = ctm;
+        ctx.ctSlice = cts;
+        ctx.ovSlice = null;
+        ctx.ovMapper = null;
+        if (lm) {
+          const ovm = ImageResliceMapper_default.newInstance();
+          ovm.setInputData(lm.img);
+          ovm.setSlicePlane(ctx.plane);
+          const ovs = ImageSlice_default.newInstance();
+          ovs.setMapper(ovm);
+          const p = ovs.getProperty();
+          p.setRGBTransferFunction(0, lm.ctf);
+          p.setScalarOpacity(0, lm.ofun);
+          p.setColorWindow(lm.maxLabel);
+          p.setColorLevel(lm.maxLabel / 2);
+          p.setInterpolationTypeToNearest();
+          ctx.ren.addActor(ovs);
+          ctx.ovMapper = ovm;
+          ctx.ovSlice = ovs;
+        }
+        ctx.key = ctxKey;
+        ctx.win = 255;
+        ctx.lev = 128;
+        for (const did of vol.refs.display || []) {
+          const d = mirror.get(did);
+          if (d && d.attrs.window != null) {
+            ctx.win = d.attrs.window;
+            ctx.lev = d.attrs.level;
+            break;
+          }
+        }
       }
       const i2r = vol.attrs.ijkToRAS, s2r = sn.attrs.sliceToRAS, normal = _nrm3(_col(s2r, 2));
       let axis = 2, best = -1;
@@ -70048,32 +70247,72 @@ volumeActor.getProperty().${removedMethodName}()
         }
       }
       const ijk = mulMatVec(inv4(i2r), [s2r[3], s2r[7], s2r[11], 1]);
+      const center = [s2r[3], s2r[7], s2r[11]], step = Math.hypot(..._col(i2r, axis));
+      slot.normal = normal;
+      slot.up = _nrm3(_col(s2r, 1));
+      slot.right = _nrm3(_col(s2r, 0));
       slot.axis = axis;
       slot.maxIndex = vol.attrs.dims[axis] - 1;
-      slot.right = _nrm3(_col(s2r, 0));
-      slot.up = _nrm3(_col(s2r, 1));
-      slot.normal = normal;
-      slot.mapper.setSlicingMode([ImageMapper_default2.SlicingMode.I, ImageMapper_default2.SlicingMode.J, ImageMapper_default2.SlicingMode.K][axis]);
+      slot.step = step;
+      slot.origin0 = [center[0] - ijk[axis] * step * normal[0], center[1] - ijk[axis] * step * normal[1], center[2] - ijk[axis] * step * normal[2]];
+      slot.fov = sn.attrs.fieldOfView && sn.attrs.fieldOfView[1] ? sn.attrs.fieldOfView[1] : 250;
       slot.slider.max = String(slot.maxIndex);
-      setSliceIndex(slot, ijk[axis]);
-      let win = 255, lev = 128;
-      for (const did of vol.refs.display || []) {
-        const d = mirror.get(did);
-        if (d && d.attrs.window != null) {
-          win = d.attrs.window;
-          lev = d.attrs.level;
-          break;
-        }
+      if (slot.index == null || slot._initKey !== ctxKey) {
+        slot.index = Math.round(ijk[axis]);
+        slot._initKey = ctxKey;
+        slot.pscale = slot.fov / 2;
+        slot.pan = [0, 0, 0];
+        slot.slider.value = String(slot.index);
       }
-      slot.slice.getProperty().setColorWindow(win);
-      slot.slice.getProperty().setColorLevel(lev);
-      const cam = slot.ren.getActiveCamera(), focal = [s2r[3], s2r[7], s2r[11]];
+    }
+    slicesDirty = true;
+  }
+  var _sliceImg = {};
+  function renderSliceTextures() {
+    const ctx = _sliceCtx;
+    if (!ctx || !ctx.ctSlice || !geom) return;
+    const qw = Math.max(1, Math.floor(geom.cw / 2)), qh = Math.max(1, Math.floor(geom.ch / 2));
+    if (ctx.w !== qw || ctx.h !== qh) {
+      ctx.gl.setSize(qw, qh);
+      ctx.w = qw;
+      ctx.h = qh;
+    }
+    ctx.ctSlice.getProperty().setColorWindow(ctx.win);
+    ctx.ctSlice.getProperty().setColorLevel(ctx.lev);
+    const cam = ctx.ren.getActiveCamera();
+    for (const name of ["Red", "Yellow", "Green"]) {
+      const slot = _fourUp[name];
+      if (!slot || !slot.normal || !slot.origin0) continue;
+      const n = slot.normal, i2 = slot.index, s = slot.step, o = slot.origin0, p = slot.pan || [0, 0, 0];
+      const orig = [o[0] + i2 * s * n[0] + p[0], o[1] + i2 * s * n[1] + p[1], o[2] + i2 * s * n[2] + p[2]];
+      ctx.plane.setOrigin(orig[0] - p[0], orig[1] - p[1], orig[2] - p[2]);
+      ctx.plane.setNormal(n[0], n[1], n[2]);
+      if (ctx.ovSlice) ctx.ovSlice.setPosition(n[0] * 0.6, n[1] * 0.6, n[2] * 0.6);
       cam.setParallelProjection(true);
-      cam.setFocalPoint(...focal);
-      cam.setPosition(focal[0] + normal[0] * 500, focal[1] + normal[1] * 500, focal[2] + normal[2] * 500);
+      cam.setFocalPoint(orig[0], orig[1], orig[2]);
+      cam.setPosition(orig[0] + n[0] * 500, orig[1] + n[1] * 500, orig[2] + n[2] * 500);
       cam.setViewUp(...slot.up);
-      if (sn.attrs.fieldOfView && sn.attrs.fieldOfView[1]) cam.setParallelScale(sn.attrs.fieldOfView[1] / 2);
-      slot.ren.resetCameraClippingRange();
+      cam.setParallelScale(slot.pscale || slot.fov / 2);
+      ctx.ren.resetCameraClippingRange();
+      ctx.rw.render();
+      let c = _sliceImg[name];
+      if (!c) c = _sliceImg[name] = document.createElement("canvas");
+      if (c.width !== qw || c.height !== qh) {
+        c.width = qw;
+        c.height = qh;
+      }
+      c.getContext("2d").drawImage(ctx.gl.getCanvas(), 0, 0);
+    }
+  }
+  var _QRECT = { Red: [0, 0], Green: [0, 0.5], Yellow: [0.5, 0.5] };
+  function blitSlices() {
+    if (!geom) return;
+    const qw = geom.cw / 2, qh = geom.ch / 2;
+    for (const name of ["Red", "Yellow", "Green"]) {
+      const c = _sliceImg[name];
+      if (!c) continue;
+      const r = _QRECT[name];
+      outCtx.drawImage(c, r[0] * geom.cw, r[1] * geom.ch, qw, qh);
     }
   }
   function fourUpSlotAt(clientX, clientY) {
@@ -70113,18 +70352,15 @@ volumeActor.getProperty().${removedMethodName}()
     const { slot, mode } = _sliceDrag, dx = e.clientX - _sliceDrag.x, dy = e.clientY - _sliceDrag.y;
     _sliceDrag.x = e.clientX;
     _sliceDrag.y = e.clientY;
-    const cam = slot.ren.getActiveCamera();
+    const ps = slot.pscale || slot.fov / 2;
     if (mode === "zoom") {
-      cam.setParallelScale(Math.max(0.5, cam.getParallelScale() * Math.exp(-dy * 6e-3)));
+      slot.pscale = Math.max(0.5, ps * Math.exp(-dy * 6e-3));
     } else {
-      const r = host.getBoundingClientRect(), worldPerPx = cam.getParallelScale() * 2 / (r.height / 2);
-      const mvx = -dx * worldPerPx, mvy = dy * worldPerPx;
-      const d = [slot.right[0] * mvx + slot.up[0] * mvy, slot.right[1] * mvx + slot.up[1] * mvy, slot.right[2] * mvx + slot.up[2] * mvy];
-      const f = cam.getFocalPoint(), p = cam.getPosition();
-      cam.setFocalPoint(f[0] + d[0], f[1] + d[1], f[2] + d[2]);
-      cam.setPosition(p[0] + d[0], p[1] + d[1], p[2] + d[2]);
+      const qh = (geom ? geom.ch : 1e3) / 2, worldPerPx = ps * 2 / qh;
+      const mvx = -dx * worldPerPx, mvy = dy * worldPerPx, p = slot.pan || [0, 0, 0];
+      slot.pan = [p[0] + slot.right[0] * mvx + slot.up[0] * mvy, p[1] + slot.right[1] * mvx + slot.up[1] * mvy, p[2] + slot.right[2] * mvx + slot.up[2] * mvy];
     }
-    slot.ren.resetCameraClippingRange();
+    slicesDirty = true;
     scene3DDirty = true;
   }
   function onSliceUp(e) {
@@ -70541,7 +70777,12 @@ volumeActor.getProperty().${removedMethodName}()
         scene3DDirty = false;
         if (pendingRenders > 0) pendingRenders--;
       }
+      if (slicesDirty) {
+        renderSliceTextures();
+        slicesDirty = false;
+      }
       outCtx.clearRect(0, 0, geom.cw, geom.ch);
+      blitSlices();
       drawDecorations2D();
       return;
     }
@@ -70825,6 +71066,89 @@ volumeActor.getProperty().${removedMethodName}()
     r.parseAsArrayBuffer(buf);
     return r.getOutputData(0);
   }
+  var _progEl = null;
+  var _progBar = null;
+  var _progTxt = null;
+  function setLoadProgress(frac, label) {
+    if (frac < 0) {
+      if (_progEl) _progEl.style.display = "none";
+      return;
+    }
+    if (!_progEl) {
+      _progEl = document.createElement("div");
+      _progEl.style.cssText = "position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:60;min-width:300px;padding:18px 22px;border-radius:16px;background:rgba(18,20,32,0.55);border:1px solid rgba(255,255,255,0.12);backdrop-filter:blur(20px) saturate(1.5);-webkit-backdrop-filter:blur(20px) saturate(1.5);box-shadow:0 10px 50px rgba(0,0,0,0.45);font:13px/1.5 -apple-system,system-ui,sans-serif;color:#eef0f8;text-align:center;";
+      _progTxt = document.createElement("div");
+      const track = document.createElement("div");
+      track.style.cssText = "height:6px;border-radius:3px;background:rgba(255,255,255,0.13);margin:11px 0 2px;overflow:hidden;";
+      _progBar = document.createElement("div");
+      _progBar.style.cssText = "height:100%;width:0%;border-radius:3px;background:linear-gradient(90deg,#5b8cff,#7be0ff);transition:width .15s ease;";
+      track.appendChild(_progBar);
+      _progEl.appendChild(_progTxt);
+      _progEl.appendChild(track);
+      document.body.appendChild(_progEl);
+    }
+    _progEl.style.display = "block";
+    _progBar.style.width = Math.round(Math.min(1, Math.max(0, frac)) * 100) + "%";
+    if (label) _progTxt.textContent = label;
+  }
+  async function prefetchBlobs() {
+    const metas = [], seen = /* @__PURE__ */ new Set(), zarrNodes = [];
+    const walk = (o) => {
+      if (!o || typeof o !== "object") return;
+      if (typeof o.hash === "string") {
+        if (!seen.has(o.hash)) {
+          seen.add(o.hash);
+          metas.push(o);
+        }
+        return;
+      }
+      if (Array.isArray(o)) {
+        for (const v of o) walk(v);
+        return;
+      }
+      for (const k in o) walk(o[k]);
+    };
+    for (const n of mirror.values()) {
+      walk(n.attrs);
+      walk(n.blobs);
+      if (n.attrs && n.attrs.zarr) zarrNodes.push(n);
+    }
+    const total = metas.length;
+    if (!total && !zarrNodes.length) return;
+    const bytesTotal = metas.reduce((s, m) => s + (m.size || 0), 0) + zarrNodes.reduce((s, n) => s + (n.attrs.zarr.bytes || 0), 0);
+    const mb = (x2) => (x2 / 1e6).toFixed(0);
+    let done = 0, bytesDone = 0;
+    const upd = () => setLoadProgress(
+      bytesTotal ? bytesDone / bytesTotal : done / total,
+      bytesTotal ? `Loading anatomy\u2026  ${mb(bytesDone)} / ${mb(bytesTotal)} MB` : `Loading\u2026  ${done} / ${total} files`
+    );
+    window.__slicerliveProgress = { total, bytesTotal };
+    upd();
+    let idx = 0;
+    const CONC = 12;
+    const worker = async () => {
+      while (idx < metas.length) {
+        const m = metas[idx++];
+        try {
+          await fetchArray2(m);
+        } catch (e) {
+        }
+        done++;
+        bytesDone += m.size || 0;
+        upd();
+      }
+    };
+    const onBytes = (n) => {
+      bytesDone += n;
+      upd();
+    };
+    await Promise.all([
+      ...Array.from({ length: Math.min(CONC, Math.max(1, total)) }, worker),
+      ...zarrNodes.map((n) => fetchZarrVolume(n, onBytes).catch(() => {
+      }))
+    ]);
+    window.__slicerlivePrefetched = total;
+  }
   async function loadSceneJson(sceneUrl, base) {
     let raw;
     try {
@@ -70844,7 +71168,10 @@ volumeActor.getProperty().${removedMethodName}()
     window.__slicerliveLoaded = mirror.size;
     threeDActive = true;
     applyCameraOnce();
+    await prefetchBlobs();
+    setLoadProgress(1, "Building scene\u2026");
     await syncDMs();
+    setLoadProgress(-1);
     renderer.resetCameraClippingRange();
     renderer.updateLightsGeometryToFollowCamera();
     renderWindow.render();

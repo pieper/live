@@ -4,5 +4,11 @@
   "scene": "MRHead.json",
   "thumb": "MRHead.png",
   "desc": "MR head \u2014 volume rendering + 4-up (axial / sagittal / coronal)"
+ },
+ {
+  "name": "TotalSegmentator-CT",
+  "scene": "TotalSegmentator-CT.json",
+  "thumb": "TotalSegmentator-CT.png",
+  "desc": "NLST chest CT with 73 TotalSegmentator organ & bone segmentations (IDC) \u2014 3D surfaces + colored MPR overlays"
  }
 ]
