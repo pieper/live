@@ -68962,9 +68962,11 @@ volumeActor.getProperty().${removedMethodName}()
   var scene3DDirty = true;
   var interacting = false;
   var lastMaskAt = 0;
+  var pendingRenders = 0;
   var MASK_MS = 100;
   var markDirty = () => {
     scene3DDirty = true;
+    pendingRenders = Math.max(pendingRenders, 8);
   };
   host.addEventListener("pointerdown", () => {
     interacting = true;
@@ -70486,11 +70488,12 @@ volumeActor.getProperty().${removedMethodName}()
     const gl = glWindow.getCanvas && glWindow.getCanvas();
     if (!gl) return;
     if (STANDALONE) {
-      if (scene3DDirty || interacting) {
-        if (scene3DDirty) renderer.resetCameraClippingRange();
+      if (scene3DDirty || interacting || pendingRenders > 0) {
+        if (scene3DDirty || pendingRenders > 0) renderer.resetCameraClippingRange();
         renderWindow.render();
         pushCameraIfChanged();
         scene3DDirty = false;
+        if (pendingRenders > 0) pendingRenders--;
       }
       outCtx.clearRect(0, 0, geom.cw, geom.ch);
       drawDecorations2D();
@@ -70499,11 +70502,12 @@ volumeActor.getProperty().${removedMethodName}()
     const v = document.getElementById("v");
     if (!v) return;
     const { sx, sy, sw, sh, cw, ch } = geom;
-    if (scene3DDirty || interacting) {
-      if (scene3DDirty) renderer.resetCameraClippingRange();
+    if (scene3DDirty || interacting || pendingRenders > 0) {
+      if (scene3DDirty || pendingRenders > 0) renderer.resetCameraClippingRange();
       renderWindow.render();
       pushCameraIfChanged();
       scene3DDirty = false;
+      if (pendingRenders > 0) pendingRenders--;
       if (window.desktopCompositor) window.desktopCompositor.invalidate();
     }
     if (now - lastMaskAt >= MASK_MS) {
