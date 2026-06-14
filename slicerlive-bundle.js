@@ -68903,7 +68903,7 @@ volumeActor.getProperty().${removedMethodName}()
   };
 
   // slicerlive.js
-  var OFFLOAD_BUILD = "slicerlive-v1 2026-06-13";
+  var OFFLOAD_BUILD = "slicerlive-v1h lightfollow 2026-06-14";
   window.__offloadBuild = OFFLOAD_BUILD;
   console.log("%c[offload] BUILD " + OFFLOAD_BUILD, "color:#7fe0a0;font-weight:bold");
   try {
@@ -68934,13 +68934,53 @@ volumeActor.getProperty().${removedMethodName}()
   var renderWindow = RenderWindow_default.newInstance();
   var renderer = Renderer_default.newInstance({ background: [0, 0, 0] });
   renderWindow.addRenderer(renderer);
+  renderer.createLight();
   var glWindow = RenderWindow_default2.newInstance();
   glWindow.setContainer(host);
+  glWindow.get3DContext({ preserveDrawingBuffer: true });
   renderWindow.addView(glWindow);
   var interactor = RenderWindowInteractor_default.newInstance();
   interactor.setView(glWindow);
   interactor.initialize();
   interactor.setCurrentRenderer(renderer);
+  window.__vrCheck = (forceRender = true) => {
+    try {
+      if (forceRender) renderWindow.render();
+      const gl = glWindow.get3DContext();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      const W = gl.drawingBufferWidth, H = gl.drawingBufferHeight, px = new Uint8Array(4), bg = new Uint8Array(4);
+      gl.readPixels(Math.round(W * 0.98), Math.round(H * 0.98), 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, bg);
+      let vol = 0, tot = 0;
+      for (let fx = 0.55; fx <= 0.97; fx += 0.03) for (let fy = 0.55; fy <= 0.97; fy += 0.03) {
+        gl.readPixels(Math.round(W * fx), Math.round(H * fy), 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+        tot++;
+        const d = Math.abs(px[0] - bg[0]) + Math.abs(px[1] - bg[1]) + Math.abs(px[2] - bg[2]);
+        if (d > 40) vol++;
+      }
+      return JSON.stringify({ volumePixels: vol, total: tot, bg: [bg[0], bg[1], bg[2]], W, H });
+    } catch (e) {
+      return "err:" + (e && e.message || e);
+    }
+  };
+  window.__slRW = renderWindow;
+  window.__slGW = glWindow;
+  window.__slRen = renderer;
+  window.__vrNudge = () => {
+    try {
+      const r = host.getBoundingClientRect();
+      const x2 = r.left + r.width * 0.75, y = r.top + r.height * 0.25;
+      const ev = (t, dx, dy, btns) => host.dispatchEvent(new PointerEvent(
+        t,
+        { clientX: x2 + dx, clientY: y + dy, button: 0, buttons: btns, pointerId: 1, pointerType: "mouse", bubbles: true, cancelable: true }
+      ));
+      ev("pointerdown", 0, 0, 1);
+      for (let i2 = 1; i2 <= 6; i2++) ev("pointermove", i2 * 3, i2 * 2, 1);
+      ev("pointerup", 18, 12, 0);
+      return "nudged";
+    } catch (e) {
+      return "err:" + (e && e.message || e);
+    }
+  };
   var istyle = InteractorStyleManipulator_default.newInstance();
   [
     MouseCameraTrackballRotateManipulator_default.newInstance({ button: 1 }),
@@ -69563,21 +69603,26 @@ volumeActor.getProperty().${removedMethodName}()
         if (it) this.remove(id);
         return;
       }
-      if (!it) {
-        const mapper = VolumeMapper_default.newInstance();
-        const volume = Volume_default.newInstance();
-        volume.setMapper(mapper);
-        renderer.addVolume(volume);
-        it = { volume, mapper, hash: null };
-        this.items.set(id, it);
-      }
-      if (it.hash !== hash) {
+      if (!it || it.hash !== hash) {
         const scalars = await fetchArray2(node.blobs.scalars);
+        if (!scalars) return;
         const img = ImageData_default.newInstance();
         img.setDimensions(node.attrs.dims);
         img.getPointData().setScalars(DataArray_default.newInstance({ numberOfComponents: node.attrs.comps || 1, values: scalars }));
+        if (!it) {
+          const mapper = VolumeMapper_default.newInstance();
+          mapper.setAutoAdjustSampleDistances(false);
+          const volume = Volume_default.newInstance();
+          volume.setMapper(mapper);
+          it = { volume, mapper, added: false, hash: null };
+          this.items.set(id, it);
+        }
         it.mapper.setInputData(img);
         if (node.attrs.ijkToRAS) it.volume.setUserMatrix(volumeGeometry(img, node.attrs.ijkToRAS));
+        if (!it.added) {
+          renderer.addVolume(it.volume);
+          it.added = true;
+        }
         it.hash = hash;
       }
       const vp = mirror.get((vr.refs.volumeProperty || [])[0]);
@@ -70490,6 +70535,7 @@ volumeActor.getProperty().${removedMethodName}()
     if (STANDALONE) {
       if (scene3DDirty || interacting || pendingRenders > 0) {
         if (scene3DDirty || pendingRenders > 0) renderer.resetCameraClippingRange();
+        renderer.updateLightsGeometryToFollowCamera();
         renderWindow.render();
         pushCameraIfChanged();
         scene3DDirty = false;
@@ -70504,6 +70550,7 @@ volumeActor.getProperty().${removedMethodName}()
     const { sx, sy, sw, sh, cw, ch } = geom;
     if (scene3DDirty || interacting || pendingRenders > 0) {
       if (scene3DDirty || pendingRenders > 0) renderer.resetCameraClippingRange();
+      renderer.updateLightsGeometryToFollowCamera();
       renderWindow.render();
       pushCameraIfChanged();
       scene3DDirty = false;
@@ -70799,8 +70846,17 @@ volumeActor.getProperty().${removedMethodName}()
     applyCameraOnce();
     await syncDMs();
     renderer.resetCameraClippingRange();
+    renderer.updateLightsGeometryToFollowCamera();
     renderWindow.render();
     markDirty();
+    for (const d of [120, 400, 1e3, 2200]) setTimeout(() => {
+      try {
+        renderer.resetCameraClippingRange();
+        renderer.updateLightsGeometryToFollowCamera();
+        renderWindow.render();
+      } catch (e) {
+      }
+    }, d);
   }
   async function loadSlicerLiveScene(sceneUrl) {
     const base = sceneUrl.slice(0, sceneUrl.lastIndexOf("/") + 1);
