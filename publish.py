@@ -68,21 +68,27 @@ for h in hashes:
     b = mrml_sync.get_blob(h)
     if b:
         open(os.path.join({blobdir!r}, h), "wb").write(b); nb += 1
+nz = 0
+for zpath, zdata in mrml_sync.get_zarr_objects().items():   # chunked zarr volumes -> nested objects under blobs/
+    zfull = os.path.join({blobdir!r}, *zpath.split("/"))
+    os.makedirs(os.path.dirname(zfull), exist_ok=True)
+    open(zfull, "wb").write(zdata); nz += 1
 try:
     tdv = slicer.app.layoutManager().threeDWidget(0).threeDView(); tdv.forceRender()
     tdv.grab().save({os.path.join(tmp, "thumb.png")!r})
 except Exception:
     slicer.util.mainWindow().grab().save({os.path.join(tmp, "thumb.png")!r})
-__result = json.dumps({{"nodes": len(state), "blobs": nb}})
+__result = json.dumps({{"nodes": len(state), "blobs": nb, "zarr": nz}})
 '''
     print("  ", mcp(code))
 
     # 2) upload the blobs to the CORS+public bucket (container ACL makes new objects public automatically)
-    blobs = glob.glob(os.path.join(blobdir, "*"))
-    print(f"uploading {len(blobs)} blobs -> {CLOUD}:{CONTAINER}/{name}/blobs/ …")
+    blobs = [os.path.join(r, fn) for r, _, fs in os.walk(blobdir) for fn in fs]   # recurse: flat blobs + nested zarr
+    print(f"uploading {len(blobs)} objects -> {CLOUD}:{CONTAINER}/{name}/blobs/ …")
     for f in blobs:
+        rel = os.path.relpath(f, blobdir).replace(os.sep, "/")
         subprocess.run(["openstack", "--os-cloud", CLOUD, "object", "create", CONTAINER, f,
-                        "--name", f"{name}/blobs/{os.path.basename(f)}"], check=True, stdout=subprocess.DEVNULL)
+                        "--name", f"{name}/blobs/{rel}"], check=True, stdout=subprocess.DEVNULL)
 
     # 3) write the small scene wrapper (blobBase -> bucket) + thumbnail into the repo
     wrapper = {"blobBase": f"{BUCKET_BASE}/{name}/blobs/",
