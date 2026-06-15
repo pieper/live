@@ -68955,7 +68955,7 @@ volumeActor.getProperty().${removedMethodName}()
   };
 
   // slicerlive.js
-  var OFFLOAD_BUILD = "slicerlive-v1n ohif-blit 2026-06-14";
+  var OFFLOAD_BUILD = "slicerlive-v1o idc-clientside 2026-06-15";
   window.__offloadBuild = OFFLOAD_BUILD;
   console.log("%c[offload] BUILD " + OFFLOAD_BUILD, "color:#7fe0a0;font-weight:bold");
   try {
@@ -68964,7 +68964,7 @@ volumeActor.getProperty().${removedMethodName}()
   }
   var SCENE = window.__OFFLOAD_BASE != null ? window.__OFFLOAD_BASE : `${location.origin}/offload`;
   var STANDALONE = !!window.__OFFLOAD_STANDALONE;
-  var SLICERLIVE = !!window.__SLICERLIVE_SCENE_URL;
+  var SLICERLIVE = !!window.__SLICERLIVE_SCENE_URL || !!window.__IDC_CT;
   var VIEW = 0;
   var KEY = [255, 0, 255];
   var KEY_TOL = 70;
@@ -69149,10 +69149,12 @@ volumeActor.getProperty().${removedMethodName}()
     return p;
   }
   function getVolumeScalars(node, onBytes) {
+    if (node.__scalars) return Promise.resolve(node.__scalars);
     if (node.attrs && node.attrs.zarr) return fetchZarrVolume(node, onBytes);
     return fetchArray2(node.blobs && node.blobs.scalars);
   }
   function volScalarKey(node) {
+    if (node.__volKey) return node.__volKey;
     if (node.attrs && node.attrs.zarr) return node.attrs.zarr.dir;
     return node.blobs && node.blobs.scalars && node.blobs.scalars.hash;
   }
@@ -70153,10 +70155,10 @@ volumeActor.getProperty().${removedMethodName}()
   var _lmCache = /* @__PURE__ */ new Map();
   async function ensureLabelmapImage(seg) {
     const meta = seg.blobs && seg.blobs.labelmap;
-    if (!meta || !seg.attrs.labelmapDims) return null;
-    const key = seg.id + ":" + meta.hash;
+    if (!seg.attrs.labelmapDims || !meta && !seg.__labelmap) return null;
+    const key = seg.id + ":" + (seg.__labelmap ? "direct" : meta.hash);
     if (_lmCache.has(key)) return _lmCache.get(key);
-    const arr = await fetchArray2(meta);
+    const arr = seg.__labelmap || await fetchArray2(meta);
     if (!arr) return null;
     const img = ImageData_default.newInstance();
     img.setDimensions(seg.attrs.labelmapDims);
@@ -70181,7 +70183,7 @@ volumeActor.getProperty().${removedMethodName}()
     if (!sliceNodes.length) return;
     ensureFourUp();
     const ctx = ensureSliceCtx();
-    const segNode = [...mirror.values()].find((n) => n.class === "vtkMRMLSegmentationNode" && n.blobs && n.blobs.labelmap);
+    const segNode = [...mirror.values()].find((n) => n.class === "vtkMRMLSegmentationNode" && (n.blobs && n.blobs.labelmap || n.__labelmap));
     const lm = segNode ? await ensureLabelmapImage(segNode) : null;
     for (const sn of sliceNodes) {
       const name = sn.attrs.layoutName, slot = _fourUp[name];
@@ -70191,7 +70193,7 @@ volumeActor.getProperty().${removedMethodName}()
       if (!vol || !volScalarKey(vol) || !vol.attrs.ijkToRAS) continue;
       const scalars = await getVolumeScalars(vol);
       if (!scalars) continue;
-      const ctxKey = volScalarKey(vol) + "|" + (lm ? segNode.id + ":" + segNode.blobs.labelmap.hash : "-");
+      const ctxKey = volScalarKey(vol) + "|" + (lm ? segNode.id + ":" + (segNode.__labelmap ? "direct" : segNode.blobs.labelmap.hash) : "-");
       if (ctx.key !== ctxKey) {
         if (ctx.ctSlice) ctx.ren.removeActor(ctx.ctSlice);
         if (ctx.ovSlice) ctx.ren.removeActor(ctx.ovSlice);
@@ -70285,12 +70287,13 @@ volumeActor.getProperty().${removedMethodName}()
       if (!slot || !slot.normal || !slot.origin0) continue;
       const n = slot.normal, i2 = slot.index, s = slot.step, o = slot.origin0, p = slot.pan || [0, 0, 0];
       const orig = [o[0] + i2 * s * n[0] + p[0], o[1] + i2 * s * n[1] + p[1], o[2] + i2 * s * n[2] + p[2]];
+      const co = cross32(slot.right, slot.up);
       ctx.plane.setOrigin(orig[0] - p[0], orig[1] - p[1], orig[2] - p[2]);
       ctx.plane.setNormal(n[0], n[1], n[2]);
-      if (ctx.ovSlice) ctx.ovSlice.setPosition(n[0] * 0.6, n[1] * 0.6, n[2] * 0.6);
+      if (ctx.ovSlice) ctx.ovSlice.setPosition(co[0] * 0.6, co[1] * 0.6, co[2] * 0.6);
       cam.setParallelProjection(true);
       cam.setFocalPoint(orig[0], orig[1], orig[2]);
-      cam.setPosition(orig[0] + n[0] * 500, orig[1] + n[1] * 500, orig[2] + n[2] * 500);
+      cam.setPosition(orig[0] + co[0] * 500, orig[1] + co[1] * 500, orig[2] + co[2] * 500);
       cam.setViewUp(...slot.up);
       cam.setParallelScale(slot.pscale || slot.fov / 2);
       ctx.ren.resetCameraClippingRange();
@@ -70395,6 +70398,7 @@ volumeActor.getProperty().${removedMethodName}()
         await syncFourUp();
       } catch (e) {
         console.warn("[SlicerLive] syncFourUp", e);
+        window.__syncFourUpErr = String(e && e.stack || e);
       }
     }
     drawVectorOverlay();
@@ -71185,6 +71189,139 @@ volumeActor.getProperty().${removedMethodName}()
       }
     }, d);
   }
+  var IDC_S3 = "https://idc-open-data.s3.us-east-1.amazonaws.com/";
+  async function s3ListKeys(prefix) {
+    if (!prefix.endsWith("/")) prefix += "/";
+    let keys = [], token = null, more = true;
+    while (more) {
+      let url = `${IDC_S3}?list-type=2&prefix=${encodeURIComponent(prefix)}`;
+      if (token) url += `&continuation-token=${encodeURIComponent(token)}`;
+      const x2 = new DOMParser().parseFromString(await fetch(url).then((r) => r.text()), "application/xml");
+      keys.push(...[...x2.getElementsByTagName("Key")].map((e) => e.textContent).filter(Boolean));
+      more = x2.getElementsByTagName("IsTruncated")[0]?.textContent === "true";
+      token = more ? x2.getElementsByTagName("NextContinuationToken")[0]?.textContent : null;
+    }
+    return keys;
+  }
+  function runIDCWorker(ctKeys, segKeys) {
+    return new Promise((resolve2, reject) => {
+      const w = new Worker("idc-worker.js?t=" + Date.now());
+      w.onmessage = (e) => {
+        const m = e.data;
+        if (m.t === "progress") {
+          setLoadProgress(m.frac, m.msg);
+          return;
+        }
+        if (m.t === "error") {
+          w.terminate();
+          reject(new Error(m.error));
+          return;
+        }
+        if (m.t === "done") {
+          w.terminate();
+          resolve2({
+            ct: { vol: new Int16Array(m.ct.vol), dims: m.ct.dims, ijkToRAS: m.ct.ijkToRAS, win: m.ct.win, lev: m.ct.lev },
+            seg: m.seg ? { lab: new Uint8Array(m.seg.lab), colors: m.seg.colors, names: m.seg.names } : null
+          });
+        }
+      };
+      w.onerror = (e) => {
+        w.terminate();
+        reject(new Error("worker: " + (e.message || e)));
+      };
+      w.postMessage({ ctKeys, segKeys });
+    });
+  }
+  function buildIDCNodes(ct, seg) {
+    const M = ct.ijkToRAS, [nx, ny, nz] = ct.dims;
+    const apply = (p) => [M[0] * p[0] + M[1] * p[1] + M[2] * p[2] + M[3], M[4] * p[0] + M[5] * p[1] + M[6] * p[2] + M[7], M[8] * p[0] + M[9] * p[1] + M[10] * p[2] + M[11]];
+    const lo = [1e9, 1e9, 1e9], hi = [-1e9, -1e9, -1e9];
+    for (const i2 of [0, nx]) for (const j of [0, ny]) for (const k of [0, nz]) {
+      const w = apply([i2, j, k]);
+      for (let d = 0; d < 3; d++) {
+        lo[d] = Math.min(lo[d], w[d]);
+        hi[d] = Math.max(hi[d], w[d]);
+      }
+    }
+    const ext = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]], center = apply([nx / 2, ny / 2, nz / 2]);
+    const axExt = (v) => Math.abs(v[0]) * ext[0] + Math.abs(v[1]) * ext[1] + Math.abs(v[2]) * ext[2];
+    const nodes = {};
+    const add7 = (id, cls, attrs, refs, extra) => {
+      nodes[id] = Object.assign({ id, class: cls, name: id, attrs, refs: refs || {}, blobs: {} }, extra || {});
+      return id;
+    };
+    add7("vtkMRMLViewNode1", "vtkMRMLViewNode", { backgroundColor: [0.756, 0.764, 0.909], backgroundColor2: [0.454, 0.47, 0.745], boxVisible: 1, axisLabelsVisible: 1, orientationMarkerType: 0 });
+    const volDisp = add7("idcVolDisp", "vtkMRMLScalarVolumeDisplayNode", { visibility: 1, window: ct.win, level: ct.lev, color: [1, 1, 1], opacity: 1 });
+    const prop = add7("idcVolProp", "vtkMRMLVolumePropertyNode", {
+      shade: 1,
+      interpolationType: 1,
+      color: [[-1e3, 0, 0, 0], [-400, 0.3, 0.1, 0.05], [40, 0.85, 0.55, 0.4], [300, 0.95, 0.85, 0.7], [1200, 1, 1, 1]],
+      scalarOpacity: [[-1e3, 0], [-300, 0], [40, 0.03], [200, 0.12], [600, 0.5], [1500, 0.85]],
+      gradientOpacity: [[0, 1], [255, 1]]
+    });
+    const vrDisp = add7("idcVRDisp", "vtkMRMLGPURayCastVolumeRenderingDisplayNode", { visibility: 1, visibility3D: 1, kind: "volumeRendering", croppingEnabled: 0 }, { volumeProperty: [prop] });
+    const vol = add7("idcVol", "vtkMRMLScalarVolumeNode", { dims: [nx, ny, nz], comps: 1, ijkToRAS: M }, { display: [volDisp, vrDisp] });
+    nodes[vol].__scalars = ct.vol;
+    nodes[vol].__volKey = "idc-ct";
+    const ORI = {
+      Red: { right: [-1, 0, 0], up: [0, 1, 0], normal: [0, 0, 1], ori: "Axial" },
+      Yellow: { right: [0, -1, 0], up: [0, 0, 1], normal: [-1, 0, 0], ori: "Sagittal" },
+      // match Slicer's sagittal
+      Green: { right: [-1, 0, 0], up: [0, 0, 1], normal: [0, 1, 0], ori: "Coronal" }
+    };
+    for (const name in ORI) {
+      const o = ORI[name], r = o.right, u = o.up, n = o.normal, c = center;
+      add7("idcSlice" + name, "vtkMRMLSliceNode", {
+        layoutName: name,
+        orientation: o.ori,
+        dimensions: [300, 300, 1],
+        sliceToRAS: [r[0], u[0], n[0], c[0], r[1], u[1], n[1], c[1], r[2], u[2], n[2], c[2], 0, 0, 0, 1],
+        fieldOfView: [axExt(r), axExt(u), 2.5]
+      });
+      add7("idcComp" + name, "vtkMRMLSliceCompositeNode", { layoutName: name, backgroundVolumeID: vol, foregroundOpacity: 0, labelOpacity: 1 }, { backgroundVolume: [vol] });
+    }
+    if (seg) {
+      const segDisp = add7("idcSegDisp", "vtkMRMLSegmentationDisplayNode", { visibility: 1, visibility3D: 1 });
+      const segNode = add7("idcSeg", "vtkMRMLSegmentationNode", { labelmapDims: [nx, ny, nz], labelmapIjkToRAS: M, segmentColors: seg.colors, seg2DOpacity: 0.5, segments: [] }, { display: [segDisp] });
+      nodes[segNode].__labelmap = seg.lab;
+    }
+    return nodes;
+  }
+  async function loadIDCScene(ctPrefix, segPrefix) {
+    try {
+      setLoadProgress(0.02, "Listing IDC instances\u2026");
+      const ctKeys = await s3ListKeys(ctPrefix);
+      const segKeys = segPrefix ? await s3ListKeys(segPrefix) : [];
+      console.log("[IDC] CT", ctKeys.length, "SEG", segKeys.length);
+      const data = await runIDCWorker(ctKeys, segKeys);
+      window.__idcData = data;
+      setLoadProgress(0.97, "Building scene\u2026");
+      mirror.clear();
+      localBlobs.clear();
+      const nodes = buildIDCNodes(data.ct, data.seg);
+      for (const id in nodes) mirror.set(id, nodes[id]);
+      window.__slicerliveLoaded = mirror.size;
+      threeDActive = true;
+      await syncDMs();
+      setLoadProgress(-1);
+      renderer.resetCamera();
+      renderer.updateLightsGeometryToFollowCamera();
+      renderWindow.render();
+      markDirty();
+      for (const d of [120, 400, 1e3, 2200]) setTimeout(() => {
+        try {
+          renderer.resetCameraClippingRange();
+          renderer.updateLightsGeometryToFollowCamera();
+          renderWindow.render();
+        } catch (e) {
+        }
+      }, d);
+    } catch (e) {
+      console.error("[IDC]", e);
+      window.__slicerliveError = String(e);
+      setLoadProgress(-1);
+    }
+  }
   async function loadSlicerLiveScene(sceneUrl) {
     const base = sceneUrl.slice(0, sceneUrl.lastIndexOf("/") + 1);
     if (/\.json(\?|$)/.test(sceneUrl)) return loadSceneJson(sceneUrl, base);
@@ -71257,7 +71394,8 @@ volumeActor.getProperty().${removedMethodName}()
       }
       positionOverlay();
       window.addEventListener("resize", positionOverlay);
-      await loadSlicerLiveScene(window.__SLICERLIVE_SCENE_URL);
+      if (window.__IDC_CT) await loadIDCScene(window.__IDC_CT, window.__IDC_SEG);
+      else await loadSlicerLiveScene(window.__SLICERLIVE_SCENE_URL);
       requestAnimationFrame(composite);
       return;
     }
