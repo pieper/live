@@ -1,10 +1,34 @@
 // IDC client-side loader worker: fetch DICOM straight from the open-CORS AWS bucket and reconstruct, off the
 // main thread (the 86 MB SEG + 2595-frame parse would otherwise freeze the UI). The main thread does the S3
 // listing (needs DOMParser) and passes the instance keys here. Returns transferable typed arrays.
-importScripts('https://cdn.jsdelivr.net/npm/dcmjs@0.41.0/build/dcmjs.min.js');
+// load dcmjs, retrying across CDN mirrors (jsdelivr/unpkg are occasionally flaky from some networks)
+(function loadDcmjs() {
+  const mirrors = [
+    'https://cdn.jsdelivr.net/npm/dcmjs@0.41.0/build/dcmjs.min.js',
+    'https://unpkg.com/dcmjs@0.41.0/build/dcmjs.min.js',
+    'https://cdn.jsdelivr.net/npm/dcmjs@0.41.0/build/dcmjs.js',
+    'https://unpkg.com/dcmjs@0.41.0/build/dcmjs.js',
+  ];
+  for (let i = 0; i < 12; i++) { try { importScripts(mirrors[i % mirrors.length]); return; } catch (e) {} }
+  throw new Error('dcmjs: all CDN mirrors failed');
+})();
 const S3 = 'https://idc-open-data.s3.us-east-1.amazonaws.com/';
 const post = (m, x) => self.postMessage(m, x || []);
 const prog = (msg, frac) => post({ t: 'progress', msg, frac });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// fetch with retries + jittered exponential backoff (IDC S3 returns transient network errors under concurrency)
+async function fetchRetry(url, opts, tries = 6) {
+  let err;
+  for (let i = 0; i < tries; i++) {
+    try {
+      const r = await fetch(url, opts);
+      if (!r.ok && r.status !== 206) throw new Error('HTTP ' + r.status);
+      return r;
+    } catch (e) { err = e; if (i < tries - 1) await sleep(Math.min(4000, 250 * 2 ** i) * (0.6 + 0.8 * Math.random())); }
+  }
+  throw err;
+}
 
 function naturalize(buf) {
   const dd = dcmjs.data.DicomMessage.readFile(buf);
@@ -15,19 +39,41 @@ const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
 const lps2ras = (v) => [-v[0], -v[1], v[2]];   // DICOM LPS -> Slicer RAS (negate X,Y)
 
-async function fetchBuf(key) { const r = await fetch(S3 + key); if (!r.ok) throw new Error('fetch ' + r.status); return r.arrayBuffer(); }
+async function fetchBuf(key) { return (await fetchRetry(S3 + key)).arrayBuffer(); }
+
+// a small windowed grayscale thumbnail of a CT slice, for the progress-bar mosaic
+function makeThumb(ds) {
+  let pd = ds.PixelData; if (Array.isArray(pd)) pd = pd[0];
+  if (!pd) return null;
+  const nx = ds.Columns, ny = ds.Rows, TW = 64, TH = Math.max(1, Math.round(64 * ny / nx));
+  const px = ds.PixelRepresentation === 1 ? new Int16Array(pd) : new Uint16Array(pd);
+  const slope = Number(ds.RescaleSlope ?? 1), inter = Number(ds.RescaleIntercept ?? 0);
+  const lev = Number((Array.isArray(ds.WindowCenter) ? ds.WindowCenter[0] : ds.WindowCenter) ?? 40);
+  const win = Number((Array.isArray(ds.WindowWidth) ? ds.WindowWidth[0] : ds.WindowWidth)) || 400;
+  const lo = lev - win / 2, sc = 255 / win, rgba = new Uint8ClampedArray(TW * TH * 4);
+  for (let ty = 0; ty < TH; ty++) {
+    const sy = (ty * ny / TH) | 0;
+    for (let tx = 0; tx < TW; tx++) {
+      let g = (px[sy * nx + ((tx * nx / TW) | 0)] * slope + inter - lo) * sc; g = g < 0 ? 0 : g > 255 ? 255 : g;
+      const o = (ty * TW + tx) * 4; rgba[o] = rgba[o + 1] = rgba[o + 2] = g; rgba[o + 3] = 255;
+    }
+  }
+  return { w: TW, h: TH, rgba };
+}
 
 // ---- CT series -> Int16 HU volume (k-fastest C order) + ijkToRAS (row-major, RAS) ----
 async function buildVolume(ctKeys) {
+  post({ t: 'ctinfo', count: ctKeys.length });   // let the UI lay out a slice-thumbnail mosaic
   const slices = [];
   let done = 0;
-  // parallel fetch+parse with a small concurrency cap (memory + connection limits)
   const CONC = 8; let idx = 0;
   async function worker() {
     while (idx < ctKeys.length) {
       const k = ctKeys[idx++];
       const ds = naturalize(await fetchBuf(k));
       slices.push(ds);
+      const th = makeThumb(ds);   // stream a thumbnail to the mosaic, placed by InstanceNumber
+      if (th) post({ t: 'thumb', n: Number(ds.InstanceNumber) || slices.length, w: th.w, h: th.h, rgba: th.rgba.buffer }, [th.rgba.buffer]);
       done++; if (done % 8 === 0) prog(`CT ${done}/${ctKeys.length}`, 0.05 + 0.45 * done / ctKeys.length);
     }
   }
@@ -63,11 +109,8 @@ async function buildVolume(ctKeys) {
 // ---- SEG (1 multiframe) -> Uint8 labelmap on the CT grid + segment colors/names ----
 // Map each SEG frame pixel (col,row) -> CT IJK using the SEG's OWN ImageOrientation/Position (per frame, oblique-
 // safe) -- the SEG may be stored flipped vs the CT (here colDir is negated), so a naive (col,row)->(i,j) is wrong.
-function buildLabelmap(segBuf, ct) {
-  const ds = naturalize(segBuf);
+function buildLabelmap(ds, bits, ct) {
   const [nx, ny, nz] = ct.dims, frameBytes = (nx * ny) >> 3;
-  let pd = ds.PixelData; if (Array.isArray(pd)) pd = pd[0];
-  const bits = new Uint8Array(pd);
   const lab = new Uint8Array(nx * ny * nz);
   const M = ct.ijkToRAS, inv = invAffine(M);
   const toIJK = (lps) => { const r = lps2ras(lps); return [
@@ -79,6 +122,13 @@ function buildLabelmap(segBuf, ct) {
   const sPs = (shared.PixelMeasuresSequence?.[0]?.PixelSpacing || ct.ps).map(Number);
   const colW = sIop.slice(0, 3).map((v) => v * sPs[1]);   // LPS world delta per +1 column (the i / DICOM rowDir)
   const rowW = sIop.slice(3, 6).map((v) => v * sPs[0]);   // LPS world delta per +1 row    (the j / DICOM colDir)
+  const colors = [], names = {};   // parse segment colors/names up front so we can announce names while processing
+  for (const s of (ds.SegmentSequence || [])) {
+    const rgb = s.RecommendedDisplayCIELabValue ? dcmjs.data.Colors.dicomlab2RGB(s.RecommendedDisplayCIELabValue) : [1, 1, 1];
+    colors.push([Number(s.SegmentNumber), rgb[0], rgb[1], rgb[2]]);
+    names[Number(s.SegmentNumber)] = s.SegmentLabel || ('Segment ' + s.SegmentNumber);
+  }
+  const seenSeg = new Set();
   const perFrame = ds.PerFrameFunctionalGroupsSequence || [];
   const ref = (perFrame[0]?.PlanePositionSequence?.[0]?.ImagePositionPatient || [0, 0, 0]).map(Number), o0 = toIJK(ref);
   const diCol = sub(toIJK([ref[0] + colW[0], ref[1] + colW[1], ref[2] + colW[2]]), o0);   // IJK step per +1 column
@@ -88,6 +138,7 @@ function buildLabelmap(segBuf, ct) {
     const segNum = fg.SegmentIdentificationSequence?.[0]?.ReferencedSegmentNumber;
     const ippLps = fg.PlanePositionSequence?.[0]?.ImagePositionPatient?.map(Number);
     if (!segNum || !ippLps) continue;
+    if (!seenSeg.has(segNum)) { seenSeg.add(segNum); post({ t: 'seg', name: names[segNum] || ('Segment ' + segNum) }); }
     const o = toIJK(ippLps), fb = f * frameBytes;
     for (let row = 0; row < ny; row++) {
       const bi = o[0] + row * diRow[0], bj = o[1] + row * diRow[1], bk = o[2] + row * diRow[2], rb = row * nx;
@@ -99,13 +150,6 @@ function buildLabelmap(segBuf, ct) {
       }
     }
     if (f % 200 === 0) prog(`SEG ${f}/${perFrame.length}`, 0.55 + 0.4 * f / perFrame.length);
-  }
-  const colors = [], names = {};
-  for (const s of (ds.SegmentSequence || [])) {
-    const rgb = s.RecommendedDisplayCIELabValue
-      ? dcmjs.data.Colors.dicomlab2RGB(s.RecommendedDisplayCIELabValue) : [1, 1, 1];
-    colors.push([Number(s.SegmentNumber), rgb[0], rgb[1], rgb[2]]);
-    names[Number(s.SegmentNumber)] = s.SegmentLabel || ('Segment ' + s.SegmentNumber);
   }
   return { lab, colors, names };
 }
@@ -125,20 +169,57 @@ function invAffine(m) {
   return [r[0], r[1], r[2], tx, r[3], r[4], r[5], ty, r[6], r[7], r[8], tz, 0, 0, 0, 1];
 }
 
+// header-first parallel SEG fetch: range the header (functional groups precede PixelData), then range-fetch the
+// bit-packed PixelData in parallel chunks. idc-open-data serves it UNCOMPRESSED (no on-the-fly gzip) but supports
+// byte ranges -> this parallelizes the 85 MB download AND skips dcmjs copying it. Falls back to a plain fetch.
+async function fetchSeg(key) {
+  const HEAD = 4 << 20;
+  const head = new Uint8Array(await fetchRetry(S3 + key, { headers: { Range: `bytes=0-${HEAD - 1}` } }).then((r) => r.arrayBuffer()));
+  const dv = new DataView(head.buffer, head.byteOffset);
+  let pt = -1;                                                       // PixelData tag 7FE0,0010 (LE) followed by a pixel VR
+  for (let i = 132; i + 12 <= head.length; i += 2) {
+    if (head[i] === 0xE0 && head[i + 1] === 0x7F && head[i + 2] === 0x10 && head[i + 3] === 0x00) {
+      const vr = String.fromCharCode(head[i + 4], head[i + 5]);
+      if (vr === 'OB' || vr === 'OW' || vr === 'UN') { pt = i; break; }
+    }
+  }
+  if (pt < 0) throw new Error('PixelData tag not in header range');
+  const valOff = pt + 12, pdLen = dv.getUint32(pt + 8, true);       // explicit-VR OB/OW/UN: 12-byte element header
+  if (!pdLen || pdLen === 0xFFFFFFFF) throw new Error('encapsulated/undefined PixelData length');
+  const ds = naturalize(head.slice(0, pt).buffer);                  // header only -> functional groups + segments
+  const bits = new Uint8Array(pdLen);
+  const have = Math.max(0, Math.min(HEAD, valOff + pdLen) - valOff);
+  if (have > 0) bits.set(head.subarray(valOff, valOff + have), 0);  // PixelData bytes already in the header range
+  const rs = valOff + have, re = valOff + pdLen - 1;
+  if (rs <= re) {
+    const CH = 8, cs = Math.ceil((re - rs + 1) / CH); let got = have;
+    await Promise.all(Array.from({ length: CH }, (_, c) => {
+      const s = rs + c * cs, e = Math.min(re, s + cs - 1);
+      if (s > e) return null;
+      return fetchRetry(S3 + key, { headers: { Range: `bytes=${s}-${e}` } }).then((r) => r.arrayBuffer()).then((ab) => {
+        bits.set(new Uint8Array(ab), s - valOff); got += ab.byteLength;
+        prog(`SEG ${(got / 1e6) | 0}/${(pdLen / 1e6) | 0} MB`, 0.5 + 0.08 * got / pdLen);
+      });
+    }));
+  }
+  return { ds, bits };
+}
+
 self.onmessage = async (e) => {
   const { ctKeys, segKeys } = e.data;
   try {
     prog('fetching CT…', 0.05);
     const ct = await buildVolume(ctKeys);
-    let seg = null;
+    // progressive: hand the CT to the main thread right away so it can render the slices while the SEG loads
+    post({ t: 'ct', vol: ct.vol, dims: ct.dims, ijkToRAS: ct.ijkToRAS, win: ct.win, lev: ct.lev }, [ct.vol.buffer]);
     if (segKeys && segKeys.length) {
-      prog('fetching SEG…', 0.55);
-      const segBuf = await fetchBuf(segKeys[0]);
-      seg = buildLabelmap(segBuf, ct);
+      prog('fetching SEG…', 0.5);
+      let parsed;
+      try { parsed = await fetchSeg(segKeys[0]); }
+      catch (err) { const buf = await fetchBuf(segKeys[0]); const ds = naturalize(buf); let pd = ds.PixelData; if (Array.isArray(pd)) pd = pd[0]; parsed = { ds, bits: new Uint8Array(pd) }; }
+      const seg = buildLabelmap(parsed.ds, parsed.bits, ct);
+      post({ t: 'labelmap', lab: seg.lab, colors: seg.colors, names: seg.names }, [seg.lab.buffer]);
     }
-    const transfer = [ct.vol.buffer];
-    if (seg) transfer.push(seg.lab.buffer);
-    post({ t: 'done', ct: { vol: ct.vol, dims: ct.dims, ijkToRAS: ct.ijkToRAS, win: ct.win, lev: ct.lev },
-           seg: seg ? { lab: seg.lab, colors: seg.colors, names: seg.names } : null }, transfer);
+    post({ t: 'alldone' });
   } catch (err) { post({ t: 'error', error: String(err && err.stack || err) }); }
 };

@@ -69617,9 +69617,10 @@ volumeActor.getProperty().${removedMethodName}()
     prop.setScalarOpacity(0, sof);
     prop.setInterpolationTypeToLinear();
     prop.setShade(a.shade ? 1 : 0);
-    prop.setAmbient(0.2);
-    prop.setDiffuse(0.7);
-    prop.setSpecular(0.3);
+    prop.setAmbient(a.ambient != null ? a.ambient : 0.2);
+    prop.setDiffuse(a.diffuse != null ? a.diffuse : 0.7);
+    prop.setSpecular(a.specular != null ? a.specular : 0.3);
+    if (a.specularPower != null) prop.setSpecularPower(a.specularPower);
     const g = a.gradientOpacity;
     if (g && g.length >= 2) {
       prop.setUseGradientOpacity(0, true);
@@ -71076,6 +71077,8 @@ volumeActor.getProperty().${removedMethodName}()
   function setLoadProgress(frac, label) {
     if (frac < 0) {
       if (_progEl) _progEl.style.display = "none";
+      mosaicHide();
+      if (_progSegs) _progSegs.innerHTML = "";
       return;
     }
     if (!_progEl) {
@@ -71094,6 +71097,20 @@ volumeActor.getProperty().${removedMethodName}()
     _progEl.style.display = "block";
     _progBar.style.width = Math.round(Math.min(1, Math.max(0, frac)) * 100) + "%";
     if (label) _progTxt.textContent = label;
+  }
+  var _progSegs = null;
+  function addSegName(name) {
+    if (!_progEl) return;
+    if (!_progSegs) {
+      _progSegs = document.createElement("div");
+      _progSegs.style.cssText = "margin-top:11px; max-width:380px; max-height:84px; overflow:hidden; display:flex; flex-wrap:wrap; gap:4px; justify-content:center;";
+      _progEl.appendChild(_progSegs);
+    }
+    const chip = document.createElement("span");
+    chip.textContent = name;
+    chip.style.cssText = "font-size:11px; background:rgba(123,224,255,0.13); border:1px solid rgba(123,224,255,0.22); border-radius:9px; padding:1px 8px; color:#cfe8ff; white-space:nowrap;";
+    _progSegs.appendChild(chip);
+    while (_progSegs.childElementCount > 18) _progSegs.removeChild(_progSegs.firstChild);
   }
   async function prefetchBlobs() {
     const metas = [], seen = /* @__PURE__ */ new Set(), zarrNodes = [];
@@ -71190,26 +71207,97 @@ volumeActor.getProperty().${removedMethodName}()
     }, d);
   }
   var IDC_S3 = "https://idc-open-data.s3.us-east-1.amazonaws.com/";
+  async function fetchRetry(url, opts, tries = 6) {
+    let err2;
+    for (let i2 = 0; i2 < tries; i2++) {
+      try {
+        const r = await fetch(url, opts);
+        if (!r.ok && r.status !== 206) throw new Error("HTTP " + r.status);
+        return r;
+      } catch (e) {
+        err2 = e;
+        if (i2 < tries - 1) await new Promise((res) => setTimeout(res, Math.min(4e3, 250 * 2 ** i2) * (0.6 + 0.8 * Math.random())));
+      }
+    }
+    throw err2;
+  }
   async function s3ListKeys(prefix) {
     if (!prefix.endsWith("/")) prefix += "/";
     let keys = [], token = null, more = true;
     while (more) {
       let url = `${IDC_S3}?list-type=2&prefix=${encodeURIComponent(prefix)}`;
       if (token) url += `&continuation-token=${encodeURIComponent(token)}`;
-      const x2 = new DOMParser().parseFromString(await fetch(url).then((r) => r.text()), "application/xml");
+      const x2 = new DOMParser().parseFromString(await fetchRetry(url).then((r) => r.text()), "application/xml");
       keys.push(...[...x2.getElementsByTagName("Key")].map((e) => e.textContent).filter(Boolean));
       more = x2.getElementsByTagName("IsTruncated")[0]?.textContent === "true";
       token = more ? x2.getElementsByTagName("NextContinuationToken")[0]?.textContent : null;
     }
     return keys;
   }
-  function runIDCWorker(ctKeys, segKeys) {
+  var _mosaic = null;
+  function mosaicInit(count) {
+    if (!_mosaic) {
+      const c = document.createElement("canvas");
+      c.style.cssText = "position:fixed; inset:0; z-index:55; width:100vw; height:100vh;";
+      document.body.appendChild(c);
+      _mosaic = { canvas: c, ctx: c.getContext("2d"), tmp: document.createElement("canvas") };
+    }
+    _mosaic.canvas.style.display = "block";
+    const W = window.innerWidth, H = window.innerHeight;
+    _mosaic.canvas.width = W;
+    _mosaic.canvas.height = H;
+    _mosaic.cols = Math.max(1, Math.round(Math.sqrt(count * W / H)));
+    _mosaic.rows = Math.ceil(count / _mosaic.cols);
+    _mosaic.cw = W / _mosaic.cols;
+    _mosaic.ch = H / _mosaic.rows;
+    _mosaic.count = count;
+    _mosaic.ctx.fillStyle = "#06060c";
+    _mosaic.ctx.fillRect(0, 0, W, H);
+  }
+  function mosaicDraw(n, w, h, buf) {
+    if (!_mosaic) return;
+    const cell = Math.max(0, Math.min(_mosaic.count - 1, (n | 0) - 1)), col = cell % _mosaic.cols, row = cell / _mosaic.cols | 0;
+    const t = _mosaic.tmp;
+    if (t.width !== w || t.height !== h) {
+      t.width = w;
+      t.height = h;
+    }
+    t.getContext("2d").putImageData(new ImageData(new Uint8ClampedArray(buf), w, h), 0, 0);
+    _mosaic.ctx.drawImage(t, col * _mosaic.cw, row * _mosaic.ch, _mosaic.cw, _mosaic.ch);
+  }
+  function mosaicHide() {
+    if (_mosaic) _mosaic.canvas.style.display = "none";
+  }
+  function runIDCWorker(ctKeys, segKeys, handlers) {
     return new Promise((resolve2, reject) => {
       const w = new Worker("idc-worker.js?t=" + Date.now());
+      let chain2 = Promise.resolve();
       w.onmessage = (e) => {
         const m = e.data;
+        if (m.t === "ctinfo") {
+          mosaicInit(m.count);
+          return;
+        }
+        if (m.t === "thumb") {
+          mosaicDraw(m.n, m.w, m.h, m.rgba);
+          return;
+        }
+        if (m.t === "seg") {
+          addSegName(m.name);
+          return;
+        }
         if (m.t === "progress") {
           setLoadProgress(m.frac, m.msg);
+          return;
+        }
+        if (m.t === "ct") {
+          const ct = { vol: new Int16Array(m.vol), dims: m.dims, ijkToRAS: m.ijkToRAS, win: m.win, lev: m.lev };
+          chain2 = chain2.then(() => handlers.onCT(ct)).catch((err2) => console.error("[IDC] onCT", err2));
+          return;
+        }
+        if (m.t === "labelmap") {
+          const seg = { lab: new Uint8Array(m.lab), colors: m.colors, names: m.names };
+          chain2 = chain2.then(() => handlers.onLabelmap(seg)).catch((err2) => console.error("[IDC] onLabelmap", err2));
           return;
         }
         if (m.t === "error") {
@@ -71217,12 +71305,10 @@ volumeActor.getProperty().${removedMethodName}()
           reject(new Error(m.error));
           return;
         }
-        if (m.t === "done") {
+        if (m.t === "alldone") {
           w.terminate();
-          resolve2({
-            ct: { vol: new Int16Array(m.ct.vol), dims: m.ct.dims, ijkToRAS: m.ct.ijkToRAS, win: m.ct.win, lev: m.ct.lev },
-            seg: m.seg ? { lab: new Uint8Array(m.seg.lab), colors: m.seg.colors, names: m.seg.names } : null
-          });
+          chain2.then(resolve2);
+          return;
         }
       };
       w.onerror = (e) => {
@@ -71232,7 +71318,7 @@ volumeActor.getProperty().${removedMethodName}()
       w.postMessage({ ctKeys, segKeys });
     });
   }
-  function buildIDCNodes(ct, seg) {
+  function buildIDCNodes(ct, hasSeg) {
     const M = ct.ijkToRAS, [nx, ny, nz] = ct.dims;
     const apply = (p) => [M[0] * p[0] + M[1] * p[1] + M[2] * p[2] + M[3], M[4] * p[0] + M[5] * p[1] + M[6] * p[2] + M[7], M[8] * p[0] + M[9] * p[1] + M[10] * p[2] + M[11]];
     const lo = [1e9, 1e9, 1e9], hi = [-1e9, -1e9, -1e9];
@@ -71255,8 +71341,13 @@ volumeActor.getProperty().${removedMethodName}()
     const prop = add7("idcVolProp", "vtkMRMLVolumePropertyNode", {
       shade: 1,
       interpolationType: 1,
-      color: [[-1e3, 0, 0, 0], [-400, 0.3, 0.1, 0.05], [40, 0.85, 0.55, 0.4], [300, 0.95, 0.85, 0.7], [1200, 1, 1, 1]],
-      scalarOpacity: [[-1e3, 0], [-300, 0], [40, 0.03], [200, 0.12], [600, 0.5], [1500, 0.85]],
+      // Slicer "CT-Chest-Contrast-Enhanced"
+      ambient: 0.1,
+      diffuse: 0.9,
+      specular: 0.2,
+      specularPower: 10,
+      color: [[-3024, 0, 0, 0], [67.0106, 0.54902, 0.25098, 0.14902], [251.105, 0.882353, 0.603922, 0.290196], [439.291, 1, 0.937033, 0.954531], [3071, 0.827451, 0.658824, 1]],
+      scalarOpacity: [[-3024, 0], [67.0106, 0], [251.105, 0.446429], [439.291, 0.625], [3071, 0.616071]],
       gradientOpacity: [[0, 1], [255, 1]]
     });
     const vrDisp = add7("idcVRDisp", "vtkMRMLGPURayCastVolumeRenderingDisplayNode", { visibility: 1, visibility3D: 1, kind: "volumeRendering", croppingEnabled: 0 }, { volumeProperty: [prop] });
@@ -71280,12 +71371,44 @@ volumeActor.getProperty().${removedMethodName}()
       });
       add7("idcComp" + name, "vtkMRMLSliceCompositeNode", { layoutName: name, backgroundVolumeID: vol, foregroundOpacity: 0, labelOpacity: 1 }, { backgroundVolume: [vol] });
     }
-    if (seg) {
+    if (hasSeg) {
       const segDisp = add7("idcSegDisp", "vtkMRMLSegmentationDisplayNode", { visibility: 1, visibility3D: 1 });
-      const segNode = add7("idcSeg", "vtkMRMLSegmentationNode", { labelmapDims: [nx, ny, nz], labelmapIjkToRAS: M, segmentColors: seg.colors, seg2DOpacity: 0.5, segments: [] }, { display: [segDisp] });
-      nodes[segNode].__labelmap = seg.lab;
+      add7("idcSeg", "vtkMRMLSegmentationNode", { labelmapDims: [nx, ny, nz], labelmapIjkToRAS: M, segmentColors: [], seg2DOpacity: 0.5, segments: [] }, { display: [segDisp] });
     }
     return nodes;
+  }
+  function setIDCCamera(ct) {
+    const M = ct.ijkToRAS, [nx, ny, nz] = ct.dims;
+    const apply = (p) => [M[0] * p[0] + M[1] * p[1] + M[2] * p[2] + M[3], M[4] * p[0] + M[5] * p[1] + M[6] * p[2] + M[7], M[8] * p[0] + M[9] * p[1] + M[10] * p[2] + M[11]];
+    const lo = [1e9, 1e9, 1e9], hi = [-1e9, -1e9, -1e9];
+    for (const i2 of [0, nx]) for (const j of [0, ny]) for (const k of [0, nz]) {
+      const w = apply([i2, j, k]);
+      for (let d = 0; d < 3; d++) {
+        lo[d] = Math.min(lo[d], w[d]);
+        hi[d] = Math.max(hi[d], w[d]);
+      }
+    }
+    const center = [(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2];
+    const maxExt = Math.max(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);
+    const D = maxExt * 2.5;
+    const cam = renderer.getActiveCamera();
+    cam.setViewUp(0, 0, 1);
+    cam.setFocalPoint(center[0], center[1], center[2]);
+    cam.setPosition(center[0], center[1] + D, center[2]);
+    cam.setClippingRange(Math.max(1, D - maxExt), D + maxExt * 1.5);
+    renderer.updateLightsGeometryToFollowCamera();
+  }
+  async function addIDCSegments(ct, seg) {
+    const segNode = mirror.get("idcSeg");
+    if (!segNode) return;
+    segNode.attrs.segmentColors = seg.colors;
+    segNode.__labelmap = seg.lab;
+    segNode.attrs.labelmapDims = ct.dims;
+    segNode.attrs.labelmapIjkToRAS = ct.ijkToRAS;
+    await syncDMs();
+    renderer.updateLightsGeometryToFollowCamera();
+    renderWindow.render();
+    markDirty();
   }
   async function loadIDCScene(ctPrefix, segPrefix) {
     try {
@@ -71293,18 +71416,39 @@ volumeActor.getProperty().${removedMethodName}()
       const ctKeys = await s3ListKeys(ctPrefix);
       const segKeys = segPrefix ? await s3ListKeys(segPrefix) : [];
       console.log("[IDC] CT", ctKeys.length, "SEG", segKeys.length);
-      const data = await runIDCWorker(ctKeys, segKeys);
-      window.__idcData = data;
-      setLoadProgress(0.97, "Building scene\u2026");
       mirror.clear();
       localBlobs.clear();
-      const nodes = buildIDCNodes(data.ct, data.seg);
-      for (const id in nodes) mirror.set(id, nodes[id]);
-      window.__slicerliveLoaded = mirror.size;
-      threeDActive = true;
-      await syncDMs();
+      let ctData = null;
+      await runIDCWorker(ctKeys, segKeys, {
+        onCT: async (ct) => {
+          ctData = ct;
+          window.__idcData = { ct };
+          const nodes = buildIDCNodes(ct, segKeys.length > 0);
+          for (const id in nodes) mirror.set(id, nodes[id]);
+          window.__slicerliveLoaded = mirror.size;
+          threeDActive = true;
+          await syncDMs();
+          mosaicHide();
+          setIDCCamera(ct);
+          renderer.updateLightsGeometryToFollowCamera();
+          renderWindow.render();
+          markDirty();
+          for (const d of [120, 400, 1e3]) setTimeout(() => {
+            try {
+              renderer.resetCameraClippingRange();
+              renderer.updateLightsGeometryToFollowCamera();
+              renderWindow.render();
+            } catch (e) {
+            }
+          }, d);
+        },
+        onLabelmap: async (seg) => {
+          await addIDCSegments(ctData, seg);
+        }
+        // 2D colored overlay on the slices
+      });
       setLoadProgress(-1);
-      renderer.resetCamera();
+      renderer.resetCameraClippingRange();
       renderer.updateLightsGeometryToFollowCamera();
       renderWindow.render();
       markDirty();
@@ -71394,9 +71538,9 @@ volumeActor.getProperty().${removedMethodName}()
       }
       positionOverlay();
       window.addEventListener("resize", positionOverlay);
+      requestAnimationFrame(composite);
       if (window.__IDC_CT) await loadIDCScene(window.__IDC_CT, window.__IDC_SEG);
       else await loadSlicerLiveScene(window.__SLICERLIVE_SCENE_URL);
-      requestAnimationFrame(composite);
       return;
     }
     if (!await pullMRML()) {
