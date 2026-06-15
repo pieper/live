@@ -70729,6 +70729,7 @@ volumeActor.getProperty().${removedMethodName}()
       }
       geom = { sx: 0, sy: 0, sw: cw2, sh: ch2, cw: cw2, ch: ch2 };
       glWindow.setSize(cw2, ch2);
+      slicesDirty = true;
       renderWindow.render();
       markDirty();
       return;
@@ -70757,6 +70758,7 @@ volumeActor.getProperty().${removedMethodName}()
     }
     geom = { sx, sy, sw, sh, cw, ch };
     glWindow.setSize(cw, ch);
+    slicesDirty = true;
     renderWindow.render();
     markDirty();
   }
