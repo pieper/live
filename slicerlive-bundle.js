@@ -66781,10 +66781,6 @@ volumeActor.getProperty().${removedMethodName}()
     vtkImageSlice(publicAPI, model);
   }
   var newInstance140 = macros_default.newInstance(extend148, "vtkImageSlice");
-  var ImageSlice_default = {
-    newInstance: newInstance140,
-    extend: extend148
-  };
 
   // node_modules/@kitware/vtk.js/Rendering/Core/ImageResliceMapper/Constants.js
   var SlabTypes = {
@@ -70112,39 +70108,42 @@ volumeActor.getProperty().${removedMethodName}()
       _fourUp[name] = { slider, index: null, maxIndex: 1, pscale: 0, pan: [0, 0, 0] };
     }
   }
-  function setImageWorldGeometry(img, ijkToRAS) {
+  function imageLocalFrame(img, ijkToRAS) {
     const M = ijkToRAS, g = (r, c) => M[r * 4 + c];
     const sp = [0, 1, 2].map((c) => Math.hypot(g(0, c), g(1, c), g(2, c)) || 1);
     img.setSpacing(sp[0], sp[1], sp[2]);
-    img.setOrigin(g(0, 3), g(1, 3), g(2, 3));
-    img.setDirection([
+    img.setOrigin(0, 0, 0);
+    img.setDirection(1, 0, 0, 0, 1, 0, 0, 0, 1);
+    const Rt = [
       g(0, 0) / sp[0],
-      g(0, 1) / sp[1],
-      g(0, 2) / sp[2],
       g(1, 0) / sp[0],
-      g(1, 1) / sp[1],
-      g(1, 2) / sp[2],
       g(2, 0) / sp[0],
+      // R^T (row-major): world vector -> local vector
+      g(0, 1) / sp[1],
+      g(1, 1) / sp[1],
       g(2, 1) / sp[1],
+      g(0, 2) / sp[2],
+      g(1, 2) / sp[2],
       g(2, 2) / sp[2]
-    ]);
+    ];
+    return { Rt, t: [g(0, 3), g(1, 3), g(2, 3)] };
   }
   var slicesDirty = false;
-  var _sliceCtx = null;
-  function ensureSliceCtx() {
-    if (_sliceCtx) return _sliceCtx;
-    const div3 = document.createElement("div");
-    div3.style.cssText = "position:absolute; left:-99999px; top:0; width:8px; height:8px; overflow:hidden;";
-    document.body.appendChild(div3);
-    const rw = RenderWindow_default.newInstance();
-    const ren = Renderer_default.newInstance({ background: [0, 0, 0] });
-    rw.addRenderer(ren);
-    const gl = RenderWindow_default2.newInstance();
-    gl.setContainer(div3);
-    gl.get3DContext({ preserveDrawingBuffer: true });
-    rw.addView(gl);
-    _sliceCtx = { rw, ren, gl, div: div3, plane: Plane_default.newInstance(), ctMapper: null, ctSlice: null, ovMapper: null, ovSlice: null, w: 0, h: 0, key: null, win: 255, lev: 128 };
-    return _sliceCtx;
+  var _sliceRens = null;
+  var _VPRECT = { threeD: [0.5, 0.5, 1, 1], Red: [0, 0.5, 0.5, 1], Green: [0, 0, 0.5, 0.5], Yellow: [0.5, 0, 1, 0.5] };
+  function ensureSliceRenderers() {
+    if (_sliceRens) return _sliceRens;
+    renderer.setViewport(..._VPRECT.threeD);
+    _sliceRens = {};
+    for (const name of ["Red", "Green", "Yellow"]) {
+      const ren = Renderer_default.newInstance({ background: [0, 0, 0] });
+      ren.setViewport(..._VPRECT[name]);
+      ren.getActiveCamera().setParallelProjection(true);
+      ren.createLight();
+      renderWindow.addRenderer(ren);
+      _sliceRens[name] = { ren, ctVol: null, ctMapper: null, ovVol: null, ovMapper: null, key: null, win: 255, lev: 128 };
+    }
+    return _sliceRens;
   }
   function setSliceIndex(slot, idx) {
     if (!slot) return;
@@ -70164,7 +70163,7 @@ volumeActor.getProperty().${removedMethodName}()
     const img = ImageData_default.newInstance();
     img.setDimensions(seg.attrs.labelmapDims);
     img.getPointData().setScalars(DataArray_default.newInstance({ numberOfComponents: 1, values: arr }));
-    setImageWorldGeometry(img, seg.attrs.labelmapIjkToRAS);
+    imageLocalFrame(img, seg.attrs.labelmapIjkToRAS);
     const ctf = ColorTransferFunction_default.newInstance();
     ctf.addRGBPoint(0, 0, 0, 0);
     for (const c of seg.attrs.segmentColors || []) ctf.addRGBPoint(c[0], c[1], c[2], c[3]);
@@ -70183,62 +70182,82 @@ volumeActor.getProperty().${removedMethodName}()
     const sliceNodes = [...mirror.values()].filter((n) => n.class === "vtkMRMLSliceNode");
     if (!sliceNodes.length) return;
     ensureFourUp();
-    const ctx = ensureSliceCtx();
+    const srs = ensureSliceRenderers();
     const segNode = [...mirror.values()].find((n) => n.class === "vtkMRMLSegmentationNode" && (n.blobs && n.blobs.labelmap || n.__labelmap));
     const lm = segNode ? await ensureLabelmapImage(segNode) : null;
     for (const sn of sliceNodes) {
-      const name = sn.attrs.layoutName, slot = _fourUp[name];
-      if (!slot || !sn.attrs.sliceToRAS) continue;
+      const name = sn.attrs.layoutName, slot = _fourUp[name], sr = srs[name];
+      if (!slot || !sr || !sn.attrs.sliceToRAS) continue;
       const comp = [...mirror.values()].find((n) => n.class === "vtkMRMLSliceCompositeNode" && n.attrs.layoutName === name);
       const vol = comp && comp.attrs.backgroundVolumeID ? mirror.get(comp.attrs.backgroundVolumeID) : null;
       if (!vol || !volScalarKey(vol) || !vol.attrs.ijkToRAS) continue;
       const scalars = await getVolumeScalars(vol);
       if (!scalars) continue;
       const ctxKey = volScalarKey(vol) + "|" + (lm ? segNode.id + ":" + (segNode.__labelmap ? "direct" : segNode.blobs.labelmap.hash) : "-");
-      if (ctx.key !== ctxKey) {
-        if (ctx.ctSlice) ctx.ren.removeActor(ctx.ctSlice);
-        if (ctx.ovSlice) ctx.ren.removeActor(ctx.ovSlice);
-        const img = ImageData_default.newInstance();
-        img.setDimensions(vol.attrs.dims);
-        img.getPointData().setScalars(DataArray_default.newInstance({ numberOfComponents: vol.attrs.comps || 1, values: scalars }));
-        setImageWorldGeometry(img, vol.attrs.ijkToRAS);
-        const ctm = ImageResliceMapper_default.newInstance();
-        ctm.setInputData(img);
-        ctm.setSlicePlane(ctx.plane);
-        const cts = ImageSlice_default.newInstance();
-        cts.setMapper(ctm);
-        ctx.ren.addActor(cts);
-        ctx.ctMapper = ctm;
-        ctx.ctSlice = cts;
-        ctx.ovSlice = null;
-        ctx.ovMapper = null;
-        if (lm) {
-          const ovm = ImageResliceMapper_default.newInstance();
-          ovm.setInputData(lm.img);
-          ovm.setSlicePlane(ctx.plane);
-          const ovs = ImageSlice_default.newInstance();
-          ovs.setMapper(ovm);
-          const p = ovs.getProperty();
-          p.setRGBTransferFunction(0, lm.ctf);
-          p.setScalarOpacity(0, lm.ofun);
-          p.setColorWindow(lm.maxLabel);
-          p.setColorLevel(lm.maxLabel / 2);
-          p.setInterpolationTypeToNearest();
-          ctx.ren.addActor(ovs);
-          ctx.ovMapper = ovm;
-          ctx.ovSlice = ovs;
+      if (sr.key !== ctxKey) {
+        if (sr.ctVol) sr.ren.removeVolume(sr.ctVol);
+        if (sr.ovVol) {
+          sr.ren.removeVolume(sr.ovVol);
+          sr.ovVol = null;
+          sr.ovMapper = null;
         }
-        ctx.key = ctxKey;
-        ctx.win = 255;
-        ctx.lev = 128;
+        sr.win = 255;
+        sr.lev = 128;
         for (const did of vol.refs.display || []) {
           const d = mirror.get(did);
           if (d && d.attrs.window != null) {
-            ctx.win = d.attrs.window;
-            ctx.lev = d.attrs.level;
+            sr.win = d.attrs.window;
+            sr.lev = d.attrs.level;
             break;
           }
         }
+        const img = ImageData_default.newInstance();
+        img.setDimensions(vol.attrs.dims);
+        img.getPointData().setScalars(DataArray_default.newInstance({ numberOfComponents: vol.attrs.comps || 1, values: scalars }));
+        const ctm = VolumeMapper_default.newInstance();
+        ctm.setInputData(img);
+        ctm.setBlendModeToComposite();
+        ctm.setSampleDistance(0.5);
+        ctm.setAutoAdjustSampleDistances(false);
+        const ctv = Volume_default.newInstance();
+        ctv.setMapper(ctm);
+        ctv.setUserMatrix(volumeGeometry(img, vol.attrs.ijkToRAS));
+        const lo = sr.lev - sr.win / 2, hi = sr.lev + sr.win / 2;
+        const cctf = ColorTransferFunction_default.newInstance();
+        cctf.addRGBPoint(lo, 0, 0, 0);
+        cctf.addRGBPoint(hi, 1, 1, 1);
+        const cofn = PiecewiseFunction_default.newInstance();
+        cofn.addPoint(lo - 1, 1);
+        cofn.addPoint(hi + 1, 1);
+        const cp = ctv.getProperty();
+        cp.setRGBTransferFunction(0, cctf);
+        cp.setScalarOpacity(0, cofn);
+        cp.setInterpolationTypeToLinear();
+        cp.setShade(false);
+        cp.setUseGradientOpacity(0, false);
+        sr.ren.addVolume(ctv);
+        sr.ctVol = ctv;
+        sr.ctMapper = ctm;
+        if (lm) {
+          const ovm = VolumeMapper_default.newInstance();
+          ovm.setInputData(lm.img);
+          ovm.setBlendModeToComposite();
+          ovm.setSampleDistance(0.5);
+          ovm.setAutoAdjustSampleDistances(false);
+          const ovv = Volume_default.newInstance();
+          ovv.setMapper(ovm);
+          ovv.setUserMatrix(volumeGeometry(lm.img, segNode.attrs.labelmapIjkToRAS));
+          const op = ovv.getProperty();
+          op.setRGBTransferFunction(0, lm.ctf);
+          op.setScalarOpacity(0, lm.ofun);
+          op.setInterpolationTypeToNearest();
+          op.setShade(false);
+          op.setUseGradientOpacity(0, false);
+          sr.ren.addVolume(ovv);
+          sr.ovVol = ovv;
+          sr.ovMapper = ovm;
+        }
+        sr.key = ctxKey;
       }
       const i2r = vol.attrs.ijkToRAS, s2r = sn.attrs.sliceToRAS, normal = _nrm3(_col(s2r, 2));
       let axis = 2, best = -1;
@@ -70270,53 +70289,22 @@ volumeActor.getProperty().${removedMethodName}()
     }
     slicesDirty = true;
   }
-  var _sliceImg = {};
-  function renderSliceTextures() {
-    const ctx = _sliceCtx;
-    if (!ctx || !ctx.ctSlice || !geom) return;
-    const qw = Math.max(1, Math.floor(geom.cw / 2)), qh = Math.max(1, Math.floor(geom.ch / 2));
-    if (ctx.w !== qw || ctx.h !== qh) {
-      ctx.gl.setSize(qw, qh);
-      ctx.w = qw;
-      ctx.h = qh;
-    }
-    ctx.ctSlice.getProperty().setColorWindow(ctx.win);
-    ctx.ctSlice.getProperty().setColorLevel(ctx.lev);
-    const cam = ctx.ren.getActiveCamera();
-    for (const name of ["Red", "Yellow", "Green"]) {
-      const slot = _fourUp[name];
-      if (!slot || !slot.normal || !slot.origin0) continue;
+  function renderSlices() {
+    if (!_sliceRens) return;
+    for (const name of ["Red", "Green", "Yellow"]) {
+      const slot = _fourUp[name], sr = _sliceRens[name];
+      if (!slot || !sr || !slot.normal || !slot.origin0) continue;
       const n = slot.normal, i2 = slot.index, s = slot.step, o = slot.origin0, p = slot.pan || [0, 0, 0];
       const orig = [o[0] + i2 * s * n[0] + p[0], o[1] + i2 * s * n[1] + p[1], o[2] + i2 * s * n[2] + p[2]];
       const co = cross32(slot.right, slot.up);
-      ctx.plane.setOrigin(orig[0] - p[0], orig[1] - p[1], orig[2] - p[2]);
-      ctx.plane.setNormal(n[0], n[1], n[2]);
-      if (ctx.ovSlice) ctx.ovSlice.setPosition(co[0] * 0.6, co[1] * 0.6, co[2] * 0.6);
+      const D = 500, t = Math.max(slot.step || 1, 1);
+      const cam = sr.ren.getActiveCamera();
       cam.setParallelProjection(true);
       cam.setFocalPoint(orig[0], orig[1], orig[2]);
-      cam.setPosition(orig[0] + co[0] * 500, orig[1] + co[1] * 500, orig[2] + co[2] * 500);
-      cam.setViewUp(...slot.up);
+      cam.setPosition(orig[0] + co[0] * D, orig[1] + co[1] * D, orig[2] + co[2] * D);
+      cam.setViewUp(slot.up[0], slot.up[1], slot.up[2]);
       cam.setParallelScale(slot.pscale || slot.fov / 2);
-      ctx.ren.resetCameraClippingRange();
-      ctx.rw.render();
-      let c = _sliceImg[name];
-      if (!c) c = _sliceImg[name] = document.createElement("canvas");
-      if (c.width !== qw || c.height !== qh) {
-        c.width = qw;
-        c.height = qh;
-      }
-      c.getContext("2d").drawImage(ctx.gl.getCanvas(), 0, 0);
-    }
-  }
-  var _QRECT = { Red: [0, 0], Green: [0, 0.5], Yellow: [0.5, 0.5] };
-  function blitSlices() {
-    if (!geom) return;
-    const qw = geom.cw / 2, qh = geom.ch / 2;
-    for (const name of ["Red", "Yellow", "Green"]) {
-      const c = _sliceImg[name];
-      if (!c) continue;
-      const r = _QRECT[name];
-      outCtx.drawImage(c, r[0] * geom.cw, r[1] * geom.ch, qw, qh);
+      cam.setClippingRange(D - 0.5, D + t);
     }
   }
   function fourUpSlotAt(clientX, clientY) {
@@ -70776,6 +70764,11 @@ volumeActor.getProperty().${removedMethodName}()
     const gl = glWindow.getCanvas && glWindow.getCanvas();
     if (!gl) return;
     if (STANDALONE) {
+      if (slicesDirty) {
+        renderSlices();
+        slicesDirty = false;
+        scene3DDirty = true;
+      }
       if (scene3DDirty || interacting || pendingRenders > 0) {
         if (scene3DDirty || pendingRenders > 0) renderer.resetCameraClippingRange();
         renderer.updateLightsGeometryToFollowCamera();
@@ -70784,12 +70777,7 @@ volumeActor.getProperty().${removedMethodName}()
         scene3DDirty = false;
         if (pendingRenders > 0) pendingRenders--;
       }
-      if (slicesDirty) {
-        renderSliceTextures();
-        slicesDirty = false;
-      }
       outCtx.clearRect(0, 0, geom.cw, geom.ch);
-      blitSlices();
       drawDecorations2D();
       return;
     }
