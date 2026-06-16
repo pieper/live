@@ -70929,6 +70929,7 @@ volumeActor.getProperty().${removedMethodName}()
   }
   window.addEventListener("pointermove", routePointer, true);
   function postCamera() {
+    if (SLICERLIVE) return;
     const c = renderer.getActiveCamera();
     const cam = {
       position: c.getPosition(),
@@ -71199,26 +71200,30 @@ volumeActor.getProperty().${removedMethodName}()
       }
     }, d);
   }
-  var IDC_S3 = "https://idc-open-data.s3.us-east-1.amazonaws.com/";
+  var idcS3 = (bucket) => "https://" + (bucket || "idc-open-data") + ".s3.us-east-1.amazonaws.com/";
   async function fetchRetry(url, opts, tries = 6) {
     let err2;
     for (let i2 = 0; i2 < tries; i2++) {
+      const ac = new AbortController(), to = setTimeout(() => ac.abort(), 2e4);
       try {
-        const r = await fetch(url, opts);
+        const r = await fetch(url, { ...opts || {}, signal: ac.signal });
         if (!r.ok && r.status !== 206) throw new Error("HTTP " + r.status);
         return r;
       } catch (e) {
         err2 = e;
         if (i2 < tries - 1) await new Promise((res) => setTimeout(res, Math.min(4e3, 250 * 2 ** i2) * (0.6 + 0.8 * Math.random())));
+      } finally {
+        clearTimeout(to);
       }
     }
     throw err2;
   }
-  async function s3ListKeys(prefix) {
+  async function s3ListKeys(prefix, bucket) {
     if (!prefix.endsWith("/")) prefix += "/";
+    const base = idcS3(bucket);
     let keys = [], token = null, more = true;
     while (more) {
-      let url = `${IDC_S3}?list-type=2&prefix=${encodeURIComponent(prefix)}`;
+      let url = `${base}?list-type=2&prefix=${encodeURIComponent(prefix)}`;
       if (token) url += `&continuation-token=${encodeURIComponent(token)}`;
       const x2 = new DOMParser().parseFromString(await fetchRetry(url).then((r) => r.text()), "application/xml");
       keys.push(...[...x2.getElementsByTagName("Key")].map((e) => e.textContent).filter(Boolean));
@@ -71261,9 +71266,18 @@ volumeActor.getProperty().${removedMethodName}()
   function mosaicHide() {
     if (_mosaic) _mosaic.canvas.style.display = "none";
   }
-  function runIDCWorker(ctKeys, segKeys, handlers) {
+  var _idcWorker = null;
+  function runIDCWorker(ctKeys, segKeys, handlers, ctBucket, segBucket) {
+    if (_idcWorker) {
+      try {
+        _idcWorker.terminate();
+      } catch (e) {
+      }
+      _idcWorker = null;
+    }
     return new Promise((resolve2, reject) => {
       const w = new Worker("idc-worker.js?t=" + Date.now());
+      _idcWorker = w;
       let chain2 = Promise.resolve();
       w.onmessage = (e) => {
         const m = e.data;
@@ -71308,7 +71322,7 @@ volumeActor.getProperty().${removedMethodName}()
         w.terminate();
         reject(new Error("worker: " + (e.message || e)));
       };
-      w.postMessage({ ctKeys, segKeys });
+      w.postMessage({ ctKeys, segKeys, ctBucket, segBucket });
     });
   }
   function vrPresetFor(modality, win, lev) {
@@ -71425,14 +71439,19 @@ volumeActor.getProperty().${removedMethodName}()
     renderWindow.render();
     markDirty();
   }
-  async function loadIDCScene(ctPrefix, segPrefix, modality) {
+  async function loadIDCScene(ctPrefix, segPrefix, modality, ctBucket, segBucket) {
     window.__slicerliveError = null;
     window.__caseSegments = null;
     try {
       setLoadProgress(0.02, "Listing IDC instances\u2026");
-      const ctKeys = await s3ListKeys(ctPrefix);
-      const segKeys = segPrefix ? await s3ListKeys(segPrefix) : [];
+      const ctKeys = await s3ListKeys(ctPrefix, ctBucket);
+      const segKeys = segPrefix ? await s3ListKeys(segPrefix, segBucket) : [];
       console.log("[IDC] CT", ctKeys.length, "SEG", segKeys.length);
+      if (!ctKeys.length) {
+        window.__slicerliveError = "No CT instances at " + (ctBucket || "idc-open-data") + "/" + ctPrefix;
+        setLoadProgress(-1);
+        return;
+      }
       mirror.clear();
       localBlobs.clear();
       let ctData = null;
@@ -71470,7 +71489,7 @@ volumeActor.getProperty().${removedMethodName}()
           await addIDCSegments(ctData, seg);
         }
         // 2D colored overlay on the slices
-      });
+      }, ctBucket, segBucket);
       setLoadProgress(-1);
       renderer.resetCameraClippingRange();
       renderer.updateLightsGeometryToFollowCamera();
@@ -71522,7 +71541,7 @@ volumeActor.getProperty().${removedMethodName}()
     const e = srPick(), mod = { CT: "CT", MR: "MR", PT: "PET" }[e.m] || e.m;
     if (_srCap) _srCap.textContent = mod + "  \xB7  " + e.col + "  \xB7  " + (e.sd || "segmentation");
     try {
-      await loadIDCScene(e.c, e.s, e.m);
+      await loadIDCScene(e.c, e.s, e.m, e.cb, e.sb);
     } catch (err2) {
       window.__slicerliveError = String(err2);
     }
@@ -71533,12 +71552,12 @@ volumeActor.getProperty().${removedMethodName}()
   function ensureSRBar() {
     if (_srBar) return;
     _srBar = document.createElement("div");
-    _srBar.style.cssText = "position:fixed; left:50%; top:10px; transform:translateX(-50%); z-index:75; display:flex; align-items:center; gap:12px; padding:7px 10px 7px 16px; max-width:94vw; border-radius:13px; background:rgba(20,23,36,0.92); border:1px solid rgba(255,255,255,0.13); box-shadow:0 8px 30px rgba(0,0,0,0.5); color:#eaf0ff; font:13px/1.4 -apple-system,system-ui,sans-serif;";
+    _srBar.style.cssText = "position:fixed; left:10px; top:10px; z-index:75; display:flex; align-items:center; gap:12px; padding:7px 10px 7px 16px; max-width:94vw; border-radius:13px; background:#141726; border:1px solid #34384a; color:#eaf0ff; font:13px/1.4 -apple-system,system-ui,sans-serif;";
     _srCap = document.createElement("div");
     _srCap.style.cssText = "white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0;";
-    _srCap.textContent = "\u{1F3B2} SEGRoulette";
+    _srCap.textContent = "SEGRoulette";
     _srBtn = document.createElement("button");
-    _srBtn.textContent = "\u{1F3B2} Spin";
+    _srBtn.textContent = "Spin";
     _srBtn.style.cssText = "flex:none; cursor:pointer; border:0; border-radius:9px; padding:8px 16px; font:600 13px system-ui; color:#04121c; background:linear-gradient(180deg,#9fe9ff,#54c6f0);";
     _srBtn.onclick = srSpin;
     _srBar.appendChild(_srCap);
@@ -71619,7 +71638,7 @@ volumeActor.getProperty().${removedMethodName}()
       window.addEventListener("resize", positionOverlay);
       requestAnimationFrame(composite);
       if (window.__SEGROULETTE) await loadSEGRoulette();
-      else if (window.__IDC_CT) await loadIDCScene(window.__IDC_CT, window.__IDC_SEG, window.__IDC_MOD || "CT");
+      else if (window.__IDC_CT) await loadIDCScene(window.__IDC_CT, window.__IDC_SEG, window.__IDC_MOD || "CT", window.__IDC_CTB, window.__IDC_SEGB);
       else await loadSlicerLiveScene(window.__SLICERLIVE_SCENE_URL);
       return;
     }
