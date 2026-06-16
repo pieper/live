@@ -68960,7 +68960,7 @@ volumeActor.getProperty().${removedMethodName}()
   }
   var SCENE = window.__OFFLOAD_BASE != null ? window.__OFFLOAD_BASE : `${location.origin}/offload`;
   var STANDALONE = !!window.__OFFLOAD_STANDALONE;
-  var SLICERLIVE = !!window.__SLICERLIVE_SCENE_URL || !!window.__IDC_CT;
+  var SLICERLIVE = !!window.__SLICERLIVE_SCENE_URL || !!window.__IDC_CT || !!window.__SEGROULETTE;
   var VIEW = 0;
   var KEY = [255, 0, 255];
   var KEY_TOL = 70;
@@ -69720,6 +69720,7 @@ volumeActor.getProperty().${removedMethodName}()
         if (!it) {
           const mapper = VolumeMapper_default.newInstance();
           mapper.setAutoAdjustSampleDistances(false);
+          mapper.setMaximumSamplesPerRay(4e3);
           const volume = Volume_default.newInstance();
           volume.setMapper(mapper);
           it = { volume, mapper, added: false, hash: null };
@@ -70219,6 +70220,7 @@ volumeActor.getProperty().${removedMethodName}()
         ctm.setBlendModeToComposite();
         ctm.setSampleDistance(0.5);
         ctm.setAutoAdjustSampleDistances(false);
+        ctm.setMaximumSamplesPerRay(4e3);
         const ctv = Volume_default.newInstance();
         ctv.setMapper(ctm);
         ctv.setUserMatrix(volumeGeometry(img, vol.attrs.ijkToRAS));
@@ -70244,6 +70246,7 @@ volumeActor.getProperty().${removedMethodName}()
           ovm.setBlendModeToComposite();
           ovm.setSampleDistance(0.5);
           ovm.setAutoAdjustSampleDistances(false);
+          ovm.setMaximumSamplesPerRay(4e3);
           const ovv = Volume_default.newInstance();
           ovv.setMapper(ovm);
           ovv.setUserMatrix(volumeGeometry(lm.img, segNode.attrs.labelmapIjkToRAS));
@@ -71308,7 +71311,39 @@ volumeActor.getProperty().${removedMethodName}()
       w.postMessage({ ctKeys, segKeys });
     });
   }
-  function buildIDCNodes(ct, hasSeg) {
+  function vrPresetFor(modality, win, lev) {
+    if (modality === "CT" || !win) return {
+      ambient: 0.1,
+      diffuse: 0.9,
+      specular: 0.2,
+      specularPower: 10,
+      color: [[-3024, 0, 0, 0], [67.0106, 0.54902, 0.25098, 0.14902], [251.105, 0.882353, 0.603922, 0.290196], [439.291, 1, 0.937033, 0.954531], [3071, 0.827451, 0.658824, 1]],
+      scalarOpacity: [[-3024, 0], [67.0106, 0], [251.105, 0.446429], [439.291, 0.625], [3071, 0.616071]],
+      gradientOpacity: [[0, 1], [255, 1]]
+    };
+    const lo = lev - win / 2, hi = lev + win / 2, q = (f) => lo + (hi - lo) * f;
+    if (modality === "PT") return {
+      // hot-metal: black -> red -> yellow -> white over the intensity range
+      ambient: 0.2,
+      diffuse: 0.8,
+      specular: 0.1,
+      specularPower: 10,
+      color: [[lo, 0, 0, 0], [q(0.4), 0.7, 0, 0], [q(0.75), 1, 0.6, 0], [hi, 1, 1, 1]],
+      scalarOpacity: [[lo, 0], [q(0.3), 0.04], [hi, 0.85]],
+      gradientOpacity: [[0, 1], [255, 1]]
+    };
+    return {
+      // MR (default): grayscale ramp on window/level
+      ambient: 0.2,
+      diffuse: 0.8,
+      specular: 0.2,
+      specularPower: 10,
+      color: [[lo, 0, 0, 0], [hi, 1, 1, 1]],
+      scalarOpacity: [[lo, 0], [q(0.35), 0.05], [hi, 0.55]],
+      gradientOpacity: [[0, 1], [255, 1]]
+    };
+  }
+  function buildIDCNodes(ct, hasSeg, modality) {
     const M = ct.ijkToRAS, [nx, ny, nz] = ct.dims;
     const apply = (p) => [M[0] * p[0] + M[1] * p[1] + M[2] * p[2] + M[3], M[4] * p[0] + M[5] * p[1] + M[6] * p[2] + M[7], M[8] * p[0] + M[9] * p[1] + M[10] * p[2] + M[11]];
     const lo = [1e9, 1e9, 1e9], hi = [-1e9, -1e9, -1e9];
@@ -71328,18 +71363,7 @@ volumeActor.getProperty().${removedMethodName}()
     };
     add7("vtkMRMLViewNode1", "vtkMRMLViewNode", { backgroundColor: [0.756, 0.764, 0.909], backgroundColor2: [0.454, 0.47, 0.745], boxVisible: 1, axisLabelsVisible: 1, orientationMarkerType: 0 });
     const volDisp = add7("idcVolDisp", "vtkMRMLScalarVolumeDisplayNode", { visibility: 1, window: ct.win, level: ct.lev, color: [1, 1, 1], opacity: 1 });
-    const prop = add7("idcVolProp", "vtkMRMLVolumePropertyNode", {
-      shade: 1,
-      interpolationType: 1,
-      // Slicer "CT-Chest-Contrast-Enhanced"
-      ambient: 0.1,
-      diffuse: 0.9,
-      specular: 0.2,
-      specularPower: 10,
-      color: [[-3024, 0, 0, 0], [67.0106, 0.54902, 0.25098, 0.14902], [251.105, 0.882353, 0.603922, 0.290196], [439.291, 1, 0.937033, 0.954531], [3071, 0.827451, 0.658824, 1]],
-      scalarOpacity: [[-3024, 0], [67.0106, 0], [251.105, 0.446429], [439.291, 0.625], [3071, 0.616071]],
-      gradientOpacity: [[0, 1], [255, 1]]
-    });
+    const prop = add7("idcVolProp", "vtkMRMLVolumePropertyNode", Object.assign({ shade: 1, interpolationType: 1 }, vrPresetFor(modality, ct.win, ct.lev)));
     const vrDisp = add7("idcVRDisp", "vtkMRMLGPURayCastVolumeRenderingDisplayNode", { visibility: 1, visibility3D: 1, kind: "volumeRendering", croppingEnabled: 0 }, { volumeProperty: [prop] });
     const vol = add7("idcVol", "vtkMRMLScalarVolumeNode", { dims: [nx, ny, nz], comps: 1, ijkToRAS: M }, { display: [volDisp, vrDisp] });
     nodes[vol].__scalars = ct.vol;
@@ -71392,6 +71416,7 @@ volumeActor.getProperty().${removedMethodName}()
     const segNode = mirror.get("idcSeg");
     if (!segNode) return;
     segNode.attrs.segmentColors = seg.colors;
+    window.__caseSegments = (seg.colors || []).map((c) => ({ n: c[0], rgb: [c[1], c[2], c[3]], name: (seg.names || {})[c[0]] || "Segment " + c[0] }));
     segNode.__labelmap = seg.lab;
     segNode.attrs.labelmapDims = ct.dims;
     segNode.attrs.labelmapIjkToRAS = ct.ijkToRAS;
@@ -71400,7 +71425,9 @@ volumeActor.getProperty().${removedMethodName}()
     renderWindow.render();
     markDirty();
   }
-  async function loadIDCScene(ctPrefix, segPrefix) {
+  async function loadIDCScene(ctPrefix, segPrefix, modality) {
+    window.__slicerliveError = null;
+    window.__caseSegments = null;
     try {
       setLoadProgress(0.02, "Listing IDC instances\u2026");
       const ctKeys = await s3ListKeys(ctPrefix);
@@ -71413,7 +71440,14 @@ volumeActor.getProperty().${removedMethodName}()
         onCT: async (ct) => {
           ctData = ct;
           window.__idcData = { ct };
-          const nodes = buildIDCNodes(ct, segKeys.length > 0);
+          const vox = ct.dims[0] * ct.dims[1] * ct.dims[2];
+          if (vox > 64e6) {
+            window.__slicerliveError = "Source too large for in-browser 3D: " + ct.dims.join("\xD7") + " (" + Math.round(vox / 1e6) + "M voxels)";
+            mosaicHide();
+            setLoadProgress(-1);
+            return;
+          }
+          const nodes = buildIDCNodes(ct, segKeys.length > 0, modality);
           for (const id in nodes) mirror.set(id, nodes[id]);
           window.__slicerliveLoaded = mirror.size;
           threeDActive = true;
@@ -71455,6 +71489,61 @@ volumeActor.getProperty().${removedMethodName}()
       window.__slicerliveError = String(e);
       setLoadProgress(-1);
     }
+  }
+  var _segByCol = null;
+  var _segStats = null;
+  var _srSpinning = false;
+  var _srBar = null;
+  var _srCap = null;
+  var _srBtn = null;
+  async function loadSEGRoulette() {
+    try {
+      const data = await fetchRetry("segroulette.json").then((r) => r.json());
+      const rows = data.rows || data;
+      _segStats = data.stats || null;
+      _segByCol = {};
+      for (const e of rows) (_segByCol[e.col] = _segByCol[e.col] || []).push(e);
+      ensureSRBar();
+      await srSpin();
+    } catch (e) {
+      console.error("[SEGRoulette]", e);
+      window.__slicerliveError = String(e);
+    }
+  }
+  function srPick() {
+    const cols = Object.keys(_segByCol);
+    const list = _segByCol[cols[Math.floor(Math.random() * cols.length)]];
+    return list[Math.floor(Math.random() * list.length)];
+  }
+  async function srSpin() {
+    if (_srSpinning || !_segByCol) return;
+    _srSpinning = true;
+    if (_srBtn) _srBtn.disabled = true;
+    const e = srPick(), mod = { CT: "CT", MR: "MR", PT: "PET" }[e.m] || e.m;
+    if (_srCap) _srCap.textContent = mod + "  \xB7  " + e.col + "  \xB7  " + (e.sd || "segmentation");
+    try {
+      await loadIDCScene(e.c, e.s, e.m);
+    } catch (err2) {
+      window.__slicerliveError = String(err2);
+    }
+    if (window.__slicerliveError && _srCap) _srCap.textContent += "  \u2014 failed (spin again)";
+    _srSpinning = false;
+    if (_srBtn) _srBtn.disabled = false;
+  }
+  function ensureSRBar() {
+    if (_srBar) return;
+    _srBar = document.createElement("div");
+    _srBar.style.cssText = "position:fixed; left:50%; top:10px; transform:translateX(-50%); z-index:75; display:flex; align-items:center; gap:12px; padding:7px 10px 7px 16px; max-width:94vw; border-radius:13px; background:rgba(20,23,36,0.92); border:1px solid rgba(255,255,255,0.13); box-shadow:0 8px 30px rgba(0,0,0,0.5); color:#eaf0ff; font:13px/1.4 -apple-system,system-ui,sans-serif;";
+    _srCap = document.createElement("div");
+    _srCap.style.cssText = "white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0;";
+    _srCap.textContent = "\u{1F3B2} SEGRoulette";
+    _srBtn = document.createElement("button");
+    _srBtn.textContent = "\u{1F3B2} Spin";
+    _srBtn.style.cssText = "flex:none; cursor:pointer; border:0; border-radius:9px; padding:8px 16px; font:600 13px system-ui; color:#04121c; background:linear-gradient(180deg,#9fe9ff,#54c6f0);";
+    _srBtn.onclick = srSpin;
+    _srBar.appendChild(_srCap);
+    _srBar.appendChild(_srBtn);
+    document.body.appendChild(_srBar);
   }
   async function loadSlicerLiveScene(sceneUrl) {
     const base = sceneUrl.slice(0, sceneUrl.lastIndexOf("/") + 1);
@@ -71529,7 +71618,8 @@ volumeActor.getProperty().${removedMethodName}()
       positionOverlay();
       window.addEventListener("resize", positionOverlay);
       requestAnimationFrame(composite);
-      if (window.__IDC_CT) await loadIDCScene(window.__IDC_CT, window.__IDC_SEG);
+      if (window.__SEGROULETTE) await loadSEGRoulette();
+      else if (window.__IDC_CT) await loadIDCScene(window.__IDC_CT, window.__IDC_SEG, window.__IDC_MOD || "CT");
       else await loadSlicerLiveScene(window.__SLICERLIVE_SCENE_URL);
       return;
     }
