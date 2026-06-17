@@ -76695,6 +76695,27 @@ volumeActor.getProperty().${removedMethodName}()
   var _srBtn = null;
   var _srInfoBtn = null;
   var _srCurrent = null;
+  var _srLic = null;
+  var _srViewer = null;
+  function ohifViewerURL(st) {
+    return st ? "https://viewer.imaging.datacommons.cancer.gov/v3/viewer/?StudyInstanceUIDs=" + encodeURIComponent(st) : null;
+  }
+  function ccDeedURL(lic) {
+    const m = /CC BY(-NC)?\s*([\d.]+)/i.exec(lic || "");
+    return m ? "https://creativecommons.org/licenses/by" + (m[1] ? "-nc" : "") + "/" + m[2] + "/" : null;
+  }
+  function setupSharedCase(caseObj) {
+    _srCurrent = caseObj;
+    ensureSRBar();
+    if (_srBtn) _srBtn.style.display = "none";
+    if (_srCap) _srCap.textContent = ({ CT: "CT", MR: "MR", PT: "PET" }[caseObj.m] || caseObj.m) + "  \xB7  " + caseObj.col + "  \xB7  " + (caseObj.sd || "segmentation");
+    if (_srLic) _srLic.textContent = caseObj.lic || "";
+    if (_srViewer) _srViewer.style.display = caseObj.st ? "inline-block" : "none";
+    if (!_segStats) fetchRetry("segroulette.json?t=" + Date.now()).then((r) => r.json()).then((d) => {
+      _segStats = d.stats || _segStats;
+    }).catch(() => {
+    });
+  }
   async function loadSEGRoulette() {
     try {
       const data = await fetchRetry("segroulette.json?t=" + Date.now()).then((r) => r.json());
@@ -76721,6 +76742,8 @@ volumeActor.getProperty().${removedMethodName}()
     _srCurrent = e;
     closeCaseInfo();
     if (_srCap) _srCap.textContent = mod + "  \xB7  " + e.col + "  \xB7  " + (e.sd || "segmentation");
+    if (_srLic) _srLic.textContent = e.lic || "";
+    if (_srViewer) _srViewer.style.display = e.st ? "inline-block" : "none";
     try {
       await loadIDCScene(e.c, e.s, e.m, e.cb, e.sb);
     } catch (err2) {
@@ -76741,11 +76764,22 @@ volumeActor.getProperty().${removedMethodName}()
     _srInfoBtn.textContent = "Details";
     _srInfoBtn.style.cssText = "flex:none; cursor:pointer; border:1px solid #34384a; border-radius:9px; padding:8px 13px; font:600 13px -apple-system,system-ui,sans-serif; color:#cfe6ff; background:#1b2030;";
     _srInfoBtn.onclick = openCaseInfo;
+    _srLic = document.createElement("span");
+    _srLic.style.cssText = "flex:none; font:600 11px system-ui; color:#9fb0c8; opacity:0.9; padding:2px 7px; border:1px solid rgba(255,255,255,0.14); border-radius:7px; white-space:nowrap;";
+    _srViewer = document.createElement("button");
+    _srViewer.textContent = "IDC viewer";
+    _srViewer.style.cssText = "flex:none; cursor:pointer; border:1px solid #34384a; border-radius:9px; padding:8px 13px; font:600 13px -apple-system,system-ui,sans-serif; color:#cfe6ff; background:#1b2030;";
+    _srViewer.onclick = () => {
+      const u = _srCurrent && ohifViewerURL(_srCurrent.st);
+      if (u) window.open(u, "_blank", "noopener");
+    };
     _srBtn = document.createElement("button");
     _srBtn.textContent = "Spin";
     _srBtn.style.cssText = "flex:none; cursor:pointer; border:0; border-radius:9px; padding:8px 16px; font:600 13px system-ui; color:#04121c; background:linear-gradient(180deg,#9fe9ff,#54c6f0);";
     _srBtn.onclick = srSpin;
     _srBar.appendChild(_srCap);
+    _srBar.appendChild(_srLic);
+    _srBar.appendChild(_srViewer);
     _srBar.appendChild(_srInfoBtn);
     _srBar.appendChild(_srBtn);
     document.body.appendChild(_srBar);
@@ -76796,7 +76830,10 @@ volumeActor.getProperty().${removedMethodName}()
     const viewerURL = e.st ? "https://viewer.imaging.datacommons.cancer.gov/v3/viewer/?StudyInstanceUIDs=" + encodeURIComponent(e.st) : null;
     const portalURL = "https://portal.imaging.datacommons.cancer.gov/explore/filters/?collection_id=" + encodeURIComponent(e.col);
     const tciaURL = meta.doi ? "https://doi.org/" + encodeURIComponent(meta.doi) : null;
+    const licURL = ccDeedURL(e.lic);
     const modName = { CT: "CT", MR: "MR", PT: "PET" }[e.m] || e.m;
+    const dlCode = 'pip install idc-index\nfrom idc_index import IDCClient\nIDCClient().download_from_selection(\n    seriesInstanceUID=["' + (e.u || "") + '", "' + (e.su || "") + '"], downloadDir="case")';
+    const citeTxt = "Data: the " + collDisplayName(e.col) + " collection via the NCI Imaging Data Commons" + (meta.doi ? " (DOI " + meta.doi + ")" : "") + ". Please cite the collection and IDC (Fedorov et al., Cancer Res 2021;81:4188\u20134193).";
     const rows = [];
     if (meta.cancer) rows.push(["Primary cancer", meta.cancer]);
     if (meta.loc) rows.push(["Body part", meta.loc]);
@@ -76815,9 +76852,22 @@ volumeActor.getProperty().${removedMethodName}()
     };
     const panel = document.createElement("div");
     panel.style.cssText = "max-width:min(680px,92vw); max-height:86vh; overflow:auto; border-radius:18px; padding:22px 24px; background:linear-gradient(135deg, rgba(58,64,88,0.55), rgba(20,24,38,0.62)); backdrop-filter:blur(26px) saturate(1.7); -webkit-backdrop-filter:blur(26px) saturate(1.7); border:1px solid rgba(255,255,255,0.22); box-shadow:0 18px 60px rgba(0,0,0,0.55), inset 0 1px 0 rgba(255,255,255,0.22);";
-    panel.innerHTML = '<div style="display:flex;align-items:baseline;gap:10px;margin-bottom:4px"><div style="font-size:19px;font-weight:700">' + esc(collDisplayName(e.col)) + '</div><div style="opacity:0.7;font-size:12px">' + esc(modName) + " \xB7 IDC " + esc(_segStats && _segStats.idcVersion || "") + "</div></div>" + (meta.desc ? '<div style="opacity:0.85;margin-bottom:12px">' + esc(meta.desc) + "</div>" : "") + '<div style="margin:6px 0 14px">' + linksHTML + "</div>" + rows.map(([k, v]) => '<div style="display:flex;gap:12px;margin:7px 0"><div style="flex:0 0 168px;opacity:0.6">' + esc(k) + '</div><div style="flex:1">' + esc(v) + "</div></div>").join("") + (segs.length ? '<div style="margin:16px 0 6px;opacity:0.6">Segments (' + segs.length + ')</div><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:4px 14px">' + segs.map((s) => '<div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis"><span style="' + swatch(s.rgb) + '"></span>' + esc(s.name) + "</div>").join("") + "</div>" : "") + '<div style="margin:16px 0 4px;opacity:0.6">Case identifiers</div><div style="font:12px/1.6 ui-monospace,Menlo,monospace;opacity:0.85;word-break:break-all">Study Instance UID: ' + esc(e.st || "\u2014") + "<br>Source series (IDC crdc): " + esc(e.c) + "<br>Segmentation (IDC crdc): " + esc(e.s) + "</div>";
+    panel.innerHTML = '<div style="display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:4px"><div style="font-size:19px;font-weight:700">' + esc(collDisplayName(e.col)) + (e.pid ? '<span style="opacity:0.7;font-weight:500;font-size:15px;margin-left:8px">' + esc(e.pid) + "</span>" : "") + '</div><div style="opacity:0.7;font-size:12px">' + esc(modName) + " \xB7 IDC " + esc(_segStats && _segStats.idcVersion || "") + (e.lic ? " \xB7 " + (licURL ? link(licURL, e.lic) : esc(e.lic)) : "") + "</div></div>" + (meta.desc ? '<div style="opacity:0.85;margin-bottom:12px">' + esc(meta.desc) + "</div>" : "") + '<div style="margin:6px 0 14px">' + linksHTML + "</div>" + rows.map(([k, v]) => '<div style="display:flex;gap:12px;margin:7px 0"><div style="flex:0 0 168px;opacity:0.6">' + esc(k) + '</div><div style="flex:1">' + esc(v) + "</div></div>").join("") + (segs.length ? '<div style="margin:16px 0 6px;opacity:0.6">Segments (' + segs.length + ')</div><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:4px 14px">' + segs.map((s) => '<div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis"><span style="' + swatch(s.rgb) + '"></span>' + esc(s.name) + "</div>").join("") + "</div>" : "") + '<div style="margin:16px 0 6px;opacity:0.6">Cite &amp; download</div><div style="opacity:0.85;margin-bottom:8px">' + esc(citeTxt) + '</div><pre style="margin:0;background:rgba(0,0,0,0.3);border:1px solid rgba(255,255,255,0.14);border-radius:8px;padding:10px 12px;overflow:auto;font:12px/1.5 ui-monospace,Menlo,monospace;color:#cfe6ff;white-space:pre">' + esc(dlCode) + "</pre>";
     const shareURL = "https://pieper.github.io/live/viewer.html?" + new URLSearchParams(
-      { ct: e.c, seg: e.s, mod: e.m, ctb: e.cb || "idc-open-data", segb: e.sb || "idc-open-data" }
+      // carry case context so the opened link can show Details
+      {
+        ct: e.c,
+        seg: e.s,
+        mod: e.m,
+        ctb: e.cb || "idc-open-data",
+        segb: e.sb || "idc-open-data",
+        col: e.col || "",
+        st: e.st || "",
+        sd: e.sd || "",
+        lic: e.lic || "",
+        su: e.su || "",
+        pid: e.pid || ""
+      }
     ).toString();
     const shareLabel = document.createElement("div");
     shareLabel.style.cssText = "margin:16px 0 6px;opacity:0.6";
@@ -76941,8 +76991,10 @@ volumeActor.getProperty().${removedMethodName}()
       window.addEventListener("resize", positionOverlay);
       requestAnimationFrame(composite);
       if (window.__SEGROULETTE) await loadSEGRoulette();
-      else if (window.__IDC_CT) await loadIDCScene(window.__IDC_CT, window.__IDC_SEG, window.__IDC_MOD || "CT", window.__IDC_CTB, window.__IDC_SEGB);
-      else await loadSlicerLiveScene(window.__SLICERLIVE_SCENE_URL);
+      else if (window.__IDC_CT) {
+        if (window.__IDC_CASE) setupSharedCase(window.__IDC_CASE);
+        await loadIDCScene(window.__IDC_CT, window.__IDC_SEG, window.__IDC_MOD || "CT", window.__IDC_CTB, window.__IDC_SEGB);
+      } else await loadSlicerLiveScene(window.__SLICERLIVE_SCENE_URL);
       return;
     }
     if (!await pullMRML()) {
