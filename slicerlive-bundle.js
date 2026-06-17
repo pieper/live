@@ -74665,6 +74665,8 @@ volumeActor.getProperty().${removedMethodName}()
       }
       const vp = mirror.get((vr.refs.volumeProperty || [])[0]);
       if (vp) applyVolumeProperty(it.volume.getProperty(), vp.attrs);
+      if (vr.attrs.blendMode === "mip") it.mapper.setBlendModeToMaximumIntensity();
+      else it.mapper.setBlendModeToComposite();
       it.volume.setVisibility(visibleOf(vr));
       it.mapper.removeAllClippingPlanes();
       const roi = mirror.get((vr.refs.roi || [])[0]);
@@ -75728,7 +75730,13 @@ volumeActor.getProperty().${removedMethodName}()
         maskCv.height = ch2;
       }
       geom = { sx: 0, sy: 0, sw: cw2, sh: ch2, cw: cw2, ch: ch2 };
-      glWindow.setSize(cw2, ch2);
+      const dpr = window.devicePixelRatio || 1;
+      glWindow.setSize(Math.round(cw2 * dpr), Math.round(ch2 * dpr));
+      const cv = glWindow.getCanvas && glWindow.getCanvas();
+      if (cv) {
+        cv.style.width = cw2 + "px";
+        cv.style.height = ch2 + "px";
+      }
       slicesDirty = true;
       renderWindow.render();
       markDirty();
@@ -76276,7 +76284,7 @@ volumeActor.getProperty().${removedMethodName}()
     if (_mosaic) _mosaic.canvas.style.display = "none";
   }
   var _idcWorker = null;
-  function runIDCWorker(ctKeys, segKeys, handlers, ctBucket, segBucket) {
+  function runIDCWorker(ctKeys, segKeys, handlers, ctBucket, segBucket, modality) {
     if (_idcWorker) {
       try {
         _idcWorker.terminate();
@@ -76331,7 +76339,7 @@ volumeActor.getProperty().${removedMethodName}()
         w.terminate();
         reject(new Error("worker: " + (e.message || e)));
       };
-      w.postMessage({ ctKeys, segKeys, ctBucket, segBucket });
+      w.postMessage({ ctKeys, segKeys, ctBucket, segBucket, modality });
     });
   }
   function vrPresetFor(modality, win, lev) {
@@ -76346,13 +76354,13 @@ volumeActor.getProperty().${removedMethodName}()
     };
     const lo = lev - win / 2, hi = lev + win / 2, q = (f) => lo + (hi - lo) * f;
     if (modality === "PT") return {
-      // hot-metal: black -> red -> yellow -> white over the intensity range
+      // PET = MIP (set on the VR node): hot-metal over the intensity range, opaque so the projected max shows
       ambient: 0.2,
       diffuse: 0.8,
       specular: 0.1,
       specularPower: 10,
       color: [[lo, 0, 0, 0], [q(0.4), 0.7, 0, 0], [q(0.75), 1, 0.6, 0], [hi, 1, 1, 1]],
-      scalarOpacity: [[lo, 0], [q(0.3), 0.04], [hi, 0.85]],
+      scalarOpacity: [[lo, 0], [q(0.2), 0.5], [hi, 1]],
       gradientOpacity: [[0, 1], [255, 1]]
     };
     return {
@@ -76387,7 +76395,7 @@ volumeActor.getProperty().${removedMethodName}()
     add7("vtkMRMLViewNode1", "vtkMRMLViewNode", { backgroundColor: [0.756, 0.764, 0.909], backgroundColor2: [0.454, 0.47, 0.745], boxVisible: 1, axisLabelsVisible: 1, orientationMarkerType: 0 });
     const volDisp = add7("idcVolDisp", "vtkMRMLScalarVolumeDisplayNode", { visibility: 1, window: ct.win, level: ct.lev, color: [1, 1, 1], opacity: 1 });
     const prop = add7("idcVolProp", "vtkMRMLVolumePropertyNode", Object.assign({ shade: 1, interpolationType: 1 }, vrPresetFor(modality, ct.win, ct.lev)));
-    const vrDisp = add7("idcVRDisp", "vtkMRMLGPURayCastVolumeRenderingDisplayNode", { visibility: 1, visibility3D: _vrOn ? 1 : 0, kind: "volumeRendering", croppingEnabled: 0 }, { volumeProperty: [prop] });
+    const vrDisp = add7("idcVRDisp", "vtkMRMLGPURayCastVolumeRenderingDisplayNode", { visibility: 1, visibility3D: _vrOn ? 1 : 0, kind: "volumeRendering", croppingEnabled: 0, blendMode: modality === "PT" ? "mip" : "composite" }, { volumeProperty: [prop] });
     const vol = add7("idcVol", "vtkMRMLScalarVolumeNode", { dims: [nx, ny, nz], comps: 1, ijkToRAS: M }, { display: [volDisp, vrDisp] });
     nodes[vol].__scalars = ct.vol;
     nodes[vol].__volKey = "idc-ct";
@@ -76446,6 +76454,7 @@ volumeActor.getProperty().${removedMethodName}()
   }
   var _vrOn = true;
   var _vrBtn = null;
+  var _idcRotCenter = null;
   function applyVR() {
     const disp = mirror.get("idcVRDisp");
     if (disp) disp.attrs.visibility3D = _vrOn ? 1 : 0;
@@ -76527,7 +76536,8 @@ volumeActor.getProperty().${removedMethodName}()
     }
     if (cn) {
       const a = ci / cn, b = cj / cn, c = ck / cn;
-      recenterRotation([M[0] * a + M[1] * b + M[2] * c + M[3], M[4] * a + M[5] * b + M[6] * c + M[7], M[8] * a + M[9] * b + M[10] * c + M[11]]);
+      _idcRotCenter = [M[0] * a + M[1] * b + M[2] * c + M[3], M[4] * a + M[5] * b + M[6] * c + M[7], M[8] * a + M[9] * b + M[10] * c + M[11]];
+      recenterRotation(_idcRotCenter);
     }
     const segs = [];
     for (const c of colors) {
@@ -76594,6 +76604,7 @@ volumeActor.getProperty().${removedMethodName}()
     if (viewBoxActor) viewBoxActor.setVisibility(false);
     window.__caseSegments = null;
     window.__idcData = null;
+    _idcRotCenter = null;
     scene3DDirty = true;
     slicesDirty = true;
     try {
@@ -76651,14 +76662,19 @@ volumeActor.getProperty().${removedMethodName}()
           await addIDCSegments(ctData, seg);
         }
         // 2D colored overlay on the slices
-      }, ctBucket, segBucket);
+      }, ctBucket, segBucket, modality);
       setLoadProgress(-1);
+      if (_idcRotCenter) {
+        recenterRotation(_idcRotCenter);
+        jumpOthersTo(_idcRotCenter, "");
+      }
       renderer.resetCameraClippingRange();
       renderer.updateLightsGeometryToFollowCamera();
       renderWindow.render();
       markDirty();
       for (const d of [120, 400, 1e3, 2200]) setTimeout(() => {
         try {
+          if (_idcRotCenter) recenterRotation(_idcRotCenter);
           renderer.resetCameraClippingRange();
           renderer.updateLightsGeometryToFollowCamera();
           renderWindow.render();
@@ -76799,11 +76815,54 @@ volumeActor.getProperty().${removedMethodName}()
     };
     const panel = document.createElement("div");
     panel.style.cssText = "max-width:min(680px,92vw); max-height:86vh; overflow:auto; border-radius:18px; padding:22px 24px; background:linear-gradient(135deg, rgba(58,64,88,0.55), rgba(20,24,38,0.62)); backdrop-filter:blur(26px) saturate(1.7); -webkit-backdrop-filter:blur(26px) saturate(1.7); border:1px solid rgba(255,255,255,0.22); box-shadow:0 18px 60px rgba(0,0,0,0.55), inset 0 1px 0 rgba(255,255,255,0.22);";
-    panel.innerHTML = '<div style="display:flex;align-items:baseline;gap:10px;margin-bottom:4px"><div style="font-size:19px;font-weight:700">' + esc(collDisplayName(e.col)) + '</div><div style="opacity:0.7;font-size:12px">' + esc(modName) + " \xB7 IDC " + esc(_segStats && _segStats.idcVersion || "") + "</div></div>" + (meta.desc ? '<div style="opacity:0.85;margin-bottom:12px">' + esc(meta.desc) + "</div>" : "") + '<div style="margin:6px 0 14px">' + linksHTML + "</div>" + rows.map(([k, v]) => '<div style="display:flex;gap:12px;margin:7px 0"><div style="flex:0 0 168px;opacity:0.6">' + esc(k) + '</div><div style="flex:1">' + esc(v) + "</div></div>").join("") + (segs.length ? '<div style="margin:16px 0 6px;opacity:0.6">Segments (' + segs.length + ')</div><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:4px 14px">' + segs.map((s) => '<div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis"><span style="' + swatch(s.rgb) + '"></span>' + esc(s.name) + "</div>").join("") + "</div>" : "");
+    panel.innerHTML = '<div style="display:flex;align-items:baseline;gap:10px;margin-bottom:4px"><div style="font-size:19px;font-weight:700">' + esc(collDisplayName(e.col)) + '</div><div style="opacity:0.7;font-size:12px">' + esc(modName) + " \xB7 IDC " + esc(_segStats && _segStats.idcVersion || "") + "</div></div>" + (meta.desc ? '<div style="opacity:0.85;margin-bottom:12px">' + esc(meta.desc) + "</div>" : "") + '<div style="margin:6px 0 14px">' + linksHTML + "</div>" + rows.map(([k, v]) => '<div style="display:flex;gap:12px;margin:7px 0"><div style="flex:0 0 168px;opacity:0.6">' + esc(k) + '</div><div style="flex:1">' + esc(v) + "</div></div>").join("") + (segs.length ? '<div style="margin:16px 0 6px;opacity:0.6">Segments (' + segs.length + ')</div><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:4px 14px">' + segs.map((s) => '<div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis"><span style="' + swatch(s.rgb) + '"></span>' + esc(s.name) + "</div>").join("") + "</div>" : "") + '<div style="margin:16px 0 4px;opacity:0.6">Case identifiers</div><div style="font:12px/1.6 ui-monospace,Menlo,monospace;opacity:0.85;word-break:break-all">Study Instance UID: ' + esc(e.st || "\u2014") + "<br>Source series (IDC crdc): " + esc(e.c) + "<br>Segmentation (IDC crdc): " + esc(e.s) + "</div>";
+    const shareURL = "https://pieper.github.io/live/viewer.html?" + new URLSearchParams(
+      { ct: e.c, seg: e.s, mod: e.m, ctb: e.cb || "idc-open-data", segb: e.sb || "idc-open-data" }
+    ).toString();
+    const shareLabel = document.createElement("div");
+    shareLabel.style.cssText = "margin:16px 0 6px;opacity:0.6";
+    shareLabel.textContent = "Link to this case";
+    const shareRow = document.createElement("div");
+    shareRow.style.cssText = "display:flex;gap:8px;align-items:center";
+    const inp = document.createElement("input");
+    inp.readOnly = true;
+    inp.value = shareURL;
+    inp.style.cssText = "flex:1;min-width:0;background:rgba(0,0,0,0.28);border:1px solid rgba(255,255,255,0.18);border-radius:8px;padding:8px 10px;color:#cfe6ff;font:12px ui-monospace,Menlo,monospace";
+    inp.onclick = () => inp.select();
+    const copyBtn = document.createElement("button");
+    copyBtn.textContent = "Copy link";
+    copyBtn.style.cssText = "flex:none;cursor:pointer;border:0;border-radius:8px;padding:8px 16px;font:600 13px system-ui;color:#04121c;background:linear-gradient(180deg,#9fe9ff,#54c6f0)";
+    copyBtn.onclick = () => {
+      inp.select();
+      const done = () => {
+        copyBtn.textContent = "Copied";
+        setTimeout(() => {
+          copyBtn.textContent = "Copy link";
+        }, 1500);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(shareURL).then(done, () => {
+        try {
+          document.execCommand("copy");
+          done();
+        } catch (e22) {
+        }
+      });
+      else {
+        try {
+          document.execCommand("copy");
+          done();
+        } catch (e22) {
+        }
+      }
+    };
+    shareRow.appendChild(inp);
+    shareRow.appendChild(copyBtn);
     const close = document.createElement("button");
     close.textContent = "Close";
     close.style.cssText = "margin-top:18px;cursor:pointer;border:1px solid rgba(255,255,255,0.22);border-radius:9px;padding:8px 18px;font:600 13px system-ui;color:#e8eeff;background:rgba(255,255,255,0.08)";
     close.onclick = closeCaseInfo;
+    panel.appendChild(shareLabel);
+    panel.appendChild(shareRow);
     panel.appendChild(close);
     _srModal.appendChild(panel);
     document.body.appendChild(_srModal);
