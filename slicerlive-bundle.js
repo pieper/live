@@ -75007,14 +75007,6 @@ volumeActor.getProperty().${removedMethodName}()
   };
   var _fourUp = null;
   var _VP = { Red: [0, 0.5, 0.5, 1], Yellow: [0.5, 0, 1, 0.5], Green: [0, 0, 0.5, 0.5] };
-  var _SLIDER_CSS = {
-    Red: "left:4px; width:calc(50% - 8px); top:calc(50% - 22px);",
-    // bottom edge of the top-left (axial) quadrant
-    Yellow: "left:calc(50% + 4px); width:calc(50% - 8px); bottom:4px;",
-    // bottom-right (sagittal)
-    Green: "left:4px; width:calc(50% - 8px); bottom:4px;"
-    // bottom-left (coronal)
-  };
   var _col = (m, c) => [m[c], m[4 + c], m[8 + c]];
   var _nrm3 = (v) => {
     const l = Math.hypot(v[0], v[1], v[2]) || 1;
@@ -75025,18 +75017,7 @@ volumeActor.getProperty().${removedMethodName}()
     if (_fourUp) return;
     renderer.setViewport(0.5, 0.5, 1, 1);
     _fourUp = {};
-    for (const name of ["Red", "Yellow", "Green"]) {
-      const slider = document.createElement("input");
-      slider.type = "range";
-      slider.min = "0";
-      slider.max = "1";
-      slider.value = "0";
-      slider.style.cssText = "position:fixed; z-index:15; height:16px; opacity:0.8; " + _SLIDER_CSS[name];
-      slider.addEventListener("input", () => setSliceIndex(_fourUp[name], +slider.value));
-      slider.addEventListener("pointerdown", (e) => e.stopPropagation(), true);
-      document.body.appendChild(slider);
-      _fourUp[name] = { slider, index: null, maxIndex: 1, pscale: 0, pan: [0, 0, 0] };
-    }
+    for (const name of ["Red", "Yellow", "Green"]) _fourUp[name] = { index: null, maxIndex: 1, pscale: 0, pan: [0, 0, 0] };
   }
   function imageLocalFrame(img, ijkToRAS) {
     const M = ijkToRAS, g = (r, c) => M[r * 4 + c];
@@ -75210,13 +75191,11 @@ volumeActor.getProperty().${removedMethodName}()
       slot.step = step;
       slot.origin0 = [center[0] - ijk[axis] * step * normal[0], center[1] - ijk[axis] * step * normal[1], center[2] - ijk[axis] * step * normal[2]];
       slot.fov = sn.attrs.fieldOfView && sn.attrs.fieldOfView[1] ? sn.attrs.fieldOfView[1] : 250;
-      slot.slider.max = String(slot.maxIndex);
       if (slot.index == null || slot._initKey !== ctxKey) {
         slot.index = Math.round(ijk[axis]);
         slot._initKey = ctxKey;
         slot.pscale = slot.fov / 2;
         slot.pan = [0, 0, 0];
-        slot.slider.value = String(slot.index);
       }
     }
     slicesDirty = true;
@@ -75239,18 +75218,89 @@ volumeActor.getProperty().${removedMethodName}()
       cam.setClippingRange(D - 0.5, D + t);
     }
   }
+  var _maxView = null;
+  function setMaxView(name) {
+    _maxView = name || null;
+    const full = [0, 0, 1, 1];
+    const set7 = (ren, rect, draw) => {
+      ren.setViewport(rect[0], rect[1], rect[2], rect[3]);
+      if (ren.setDraw) ren.setDraw(draw);
+    };
+    set7(renderer, name === "threeD" ? full : _VPRECT.threeD, !name || name === "threeD");
+    for (const n of ["Red", "Green", "Yellow"]) set7(_sliceRens[n].ren, name === n ? full : _VPRECT[n], !name || name === n);
+    if (_vrBtn) _vrBtn.style.display = name && name !== "threeD" ? "none" : "block";
+    slicesDirty = true;
+    scene3DDirty = true;
+    try {
+      renderWindow.render();
+    } catch (e) {
+    }
+    markDirty();
+  }
+  function toggleMaxAt(cx, cy) {
+    if (_maxView) {
+      setMaxView(null);
+      return;
+    }
+    const r = host.getBoundingClientRect();
+    const x2 = (cx - r.left) / r.width, y = 1 - (cy - r.top) / r.height;
+    let target = "threeD";
+    for (const n of ["Red", "Yellow", "Green"]) {
+      const v = _VP[n];
+      if (x2 >= v[0] && x2 <= v[2] && y >= v[1] && y <= v[3]) {
+        target = n;
+        break;
+      }
+    }
+    setMaxView(target);
+  }
+  function _sliceVP(name) {
+    if (_maxView === "threeD") return null;
+    if (_maxView && _maxView !== name) return null;
+    return _maxView === name ? [0, 0, 1, 1] : _VP[name];
+  }
   function fourUpSlotAt(clientX, clientY) {
-    if (!_fourUp) return null;
+    if (!_fourUp || _maxView === "threeD") return null;
     const r = host.getBoundingClientRect();
     const x2 = (clientX - r.left) / r.width, y = 1 - (clientY - r.top) / r.height;
     if (x2 < 0 || x2 > 1 || y < 0 || y > 1) return null;
     for (const name of ["Red", "Yellow", "Green"]) {
-      const v = _VP[name];
-      if (x2 >= v[0] && x2 <= v[2] && y >= v[1] && y <= v[3]) return _fourUp[name];
+      const v = _sliceVP(name);
+      if (v && x2 >= v[0] && x2 <= v[2] && y >= v[1] && y <= v[3]) return _fourUp[name];
     }
     return null;
   }
+  function sliceWorldAt(cx, cy) {
+    if (!_fourUp || _maxView === "threeD") return null;
+    const r = host.getBoundingClientRect();
+    const x2 = (cx - r.left) / r.width, y = 1 - (cy - r.top) / r.height;
+    for (const name of ["Red", "Yellow", "Green"]) {
+      const v = _sliceVP(name);
+      if (!v) continue;
+      if (x2 < v[0] || x2 > v[2] || y < v[1] || y > v[3]) continue;
+      const slot = _fourUp[name];
+      if (!slot || !slot.normal || !slot.origin0) return null;
+      const u = (x2 - v[0]) / (v[2] - v[0]), vv = (y - v[1]) / (v[3] - v[1]);
+      const qwPx = (v[2] - v[0]) * r.width, qhPx = (v[3] - v[1]) * r.height, aspect = qhPx ? qwPx / qhPx : 1;
+      const ps = slot.pscale || slot.fov / 2;
+      const sx = (u - 0.5) * 2 * ps * aspect, sy = (vv - 0.5) * 2 * ps;
+      const i2 = slot.index, s = slot.step, n = slot.normal, o = slot.origin0, p = slot.pan || [0, 0, 0], R = slot.right, U = slot.up;
+      const orig = [o[0] + i2 * s * n[0] + p[0], o[1] + i2 * s * n[1] + p[1], o[2] + i2 * s * n[2] + p[2]];
+      return { name, slot, ras: [orig[0] + R[0] * sx + U[0] * sy, orig[1] + R[1] * sx + U[1] * sy, orig[2] + R[2] * sx + U[2] * sy] };
+    }
+    return null;
+  }
+  function jumpOthersTo(ras, exceptName) {
+    for (const name of ["Red", "Yellow", "Green"]) {
+      if (name === exceptName) continue;
+      const slot = _fourUp[name];
+      if (!slot || !slot.normal || !slot.origin0 || !slot.step) continue;
+      const n = slot.normal, o = slot.origin0;
+      setSliceIndex(slot, ((ras[0] - o[0]) * n[0] + (ras[1] - o[1]) * n[1] + (ras[2] - o[2]) * n[2]) / slot.step);
+    }
+  }
   var _sliceDrag = null;
+  var _lastDown = null;
   host.addEventListener("wheel", (e) => {
     const slot = fourUpSlotAt(e.clientX, e.clientY);
     if (!slot) return;
@@ -75258,15 +75308,35 @@ volumeActor.getProperty().${removedMethodName}()
     e.preventDefault();
     setSliceIndex(slot, slot.index + (e.deltaY > 0 ? -1 : 1));
   }, true);
+  host.addEventListener("pointermove", (e) => {
+    if (!_fourUp || !e.shiftKey) return;
+    const w = sliceWorldAt(e.clientX, e.clientY);
+    if (!w) return;
+    e.stopPropagation();
+    jumpOthersTo(w.ras, w.name);
+  }, true);
   host.addEventListener("pointerdown", (e) => {
     if (!_fourUp) return;
+    const dbl = _lastDown && e.timeStamp - _lastDown.t < 350 && Math.hypot(e.clientX - _lastDown.x, e.clientY - _lastDown.y) < 6;
+    _lastDown = dbl ? null : { t: e.timeStamp, x: e.clientX, y: e.clientY };
+    if (dbl) {
+      toggleMaxAt(e.clientX, e.clientY);
+      e.stopPropagation();
+      e.preventDefault();
+      return;
+    }
     const slot = fourUpSlotAt(e.clientX, e.clientY);
     if (!slot) return;
-    const mode = e.button === 2 ? "zoom" : e.button === 1 || e.button === 0 && e.shiftKey ? "pan" : null;
     e.stopPropagation();
     e.preventDefault();
+    if (e.shiftKey) {
+      const w = sliceWorldAt(e.clientX, e.clientY);
+      if (w) jumpOthersTo(w.ras, w.name);
+      return;
+    }
+    const mode = e.button === 2 ? "zoom" : e.button === 1 ? "pan" : e.button === 0 ? "scroll" : null;
     if (!mode) return;
-    _sliceDrag = { slot, mode, x: e.clientX, y: e.clientY };
+    _sliceDrag = { slot, mode, x: e.clientX, y: e.clientY, acc: 0 };
     window.addEventListener("pointermove", onSliceDrag, true);
     window.addEventListener("pointerup", onSliceUp, true);
   }, true);
@@ -75276,6 +75346,16 @@ volumeActor.getProperty().${removedMethodName}()
     const { slot, mode } = _sliceDrag, dx = e.clientX - _sliceDrag.x, dy = e.clientY - _sliceDrag.y;
     _sliceDrag.x = e.clientX;
     _sliceDrag.y = e.clientY;
+    if (mode === "scroll") {
+      _sliceDrag.acc += dx - dy;
+      const STEP = 7;
+      while (Math.abs(_sliceDrag.acc) >= STEP) {
+        const d = _sliceDrag.acc > 0 ? 1 : -1;
+        setSliceIndex(slot, slot.index + d);
+        _sliceDrag.acc -= d * STEP;
+      }
+      return;
+    }
     const ps = slot.pscale || slot.fov / 2;
     if (mode === "zoom") {
       slot.pscale = Math.max(0.5, ps * Math.exp(-dy * 6e-3));
@@ -76355,6 +76435,15 @@ volumeActor.getProperty().${removedMethodName}()
     cam.setClippingRange(Math.max(1, D - maxExt), D + maxExt * 1.5);
     renderer.updateLightsGeometryToFollowCamera();
   }
+  function recenterRotation(c) {
+    const cam = renderer.getActiveCamera(), f = cam.getFocalPoint(), p = cam.getPosition();
+    const d = [c[0] - f[0], c[1] - f[1], c[2] - f[2]];
+    cam.setFocalPoint(c[0], c[1], c[2]);
+    cam.setPosition(p[0] + d[0], p[1] + d[1], p[2] + d[2]);
+    renderer.resetCameraClippingRange();
+    scene3DDirty = true;
+    markDirty();
+  }
   var _vrOn = true;
   var _vrBtn = null;
   function applyVR() {
@@ -76416,6 +76505,7 @@ volumeActor.getProperty().${removedMethodName}()
     const sp = probe.getSpacing();
     const bb = /* @__PURE__ */ new Map();
     for (const c of colors) bb.set(c[0], [nx, ny, nz, -1, -1, -1]);
+    let ci = 0, cj = 0, ck = 0, cn = 0;
     for (let k = 0; k < nz; k++) for (let j = 0; j < ny; j++) {
       let base = (k * ny + j) * nx;
       for (let i2 = 0; i2 < nx; i2++) {
@@ -76429,7 +76519,15 @@ volumeActor.getProperty().${removedMethodName}()
         if (i2 > b[3]) b[3] = i2;
         if (j > b[4]) b[4] = j;
         if (k > b[5]) b[5] = k;
+        ci += i2;
+        cj += j;
+        ck += k;
+        cn++;
       }
+    }
+    if (cn) {
+      const a = ci / cn, b = cj / cn, c = ck / cn;
+      recenterRotation([M[0] * a + M[1] * b + M[2] * c + M[3], M[4] * a + M[5] * b + M[6] * c + M[7], M[8] * a + M[9] * b + M[10] * c + M[11]]);
     }
     const segs = [];
     for (const c of colors) {
