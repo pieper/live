@@ -64347,10 +64347,6 @@ void main()
     vtkMouseCameraTrackballRotateManipulator(publicAPI, model);
   }
   var newInstance129 = macros_default.newInstance(extend135, "vtkMouseCameraTrackballRotateManipulator");
-  var MouseCameraTrackballRotateManipulator_default = {
-    newInstance: newInstance129,
-    extend: extend135
-  };
 
   // node_modules/@kitware/vtk.js/Interaction/Manipulators/MouseCameraTrackballPanManipulator.js
   function vtkMouseCameraTrackballPanManipulator(publicAPI, model) {
@@ -73884,11 +73880,15 @@ volumeActor.getProperty().${removedMethodName}()
   function _strokes(color2, wm, wb, wt) {
     return '<use href="#sllm" stroke="' + color2 + '" stroke-width="' + wm + '"/><use href="#sllb" stroke="' + color2 + '" stroke-width="' + wb + '"/><use href="#sllt" stroke="' + color2 + '" stroke-width="' + wt + '"/>';
   }
+  function _markStage(px, markURL) {
+    const ds1 = (px * 0.085).toFixed(1), ds2 = (px * 0.17).toFixed(1);
+    return "<style>.sll-stage{position:relative;margin:0 auto}.sll-layer{position:absolute;inset:0;overflow:visible}.sll-layer svg{position:absolute;inset:0;width:100%;height:100%;overflow:visible}.sll-layer use{fill:none;stroke-linejoin:round;stroke-linecap:round}.sll-logo{background:url(" + markURL + ") center/contain no-repeat}.sll-clip{-webkit-mask:url(" + markURL + ") center/contain no-repeat;mask:url(" + markURL + ') center/contain no-repeat}.sll-wash{background:radial-gradient(60% 60% at 48% 52%, rgba(255,205,95,.5), rgba(255,165,45,.2) 70%, rgba(255,150,35,.04));mix-blend-mode:screen;opacity:.85}.sll-xray{mix-blend-mode:screen}</style><div class="sll-stage" style="width:' + px + "px;height:" + px + 'px"><svg width="0" height="0"><defs><path id="sllm" d="' + SLL.m + '"/><path id="sllb" d="' + SLL.b + '"/><path id="sllt" d="' + SLL.t + '"/><filter id="sllaura" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="5"/></filter><filter id="sllxr" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="8"/></filter><filter id="sllxg" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="3.5"/></filter><filter id="sllxc" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="1.4"/></filter></defs></svg><div class="sll-layer"><svg viewBox="0 0 230 230"><g filter="url(#sllaura)" opacity="0.95">' + _strokes("#ffc63a", 6.5, 4, 2.4) + "</g>" + _strokes("#ffd84e", 4, 2.4, 1.4) + _strokes("#fff7d6", 2, 1.2, 0.7) + '</svg></div><div class="sll-layer sll-logo" style="filter:brightness(1.1) saturate(1.1) drop-shadow(0 0 ' + ds1 + "px rgba(255,200,80,.6)) drop-shadow(0 0 " + ds2 + 'px rgba(255,175,55,.35))"></div><div class="sll-layer sll-clip sll-wash"></div><div class="sll-layer sll-clip sll-xray"><svg viewBox="0 0 230 230"><g filter="url(#sllxr)" opacity="0.85">' + _strokes("#ff9e1e", 7, 4.4, 2.4) + '</g><g filter="url(#sllxg)" opacity="1">' + _strokes("#ffd44d", 4.2, 2.6, 1.4) + '</g><g filter="url(#sllxc)" opacity="0.95">' + _strokes("#fffae6", 2.2, 1.4, 0.8) + "</g></svg></div></div>";
+  }
   function slicerLiveLogo(px, markURL) {
     px = px || 190;
     markURL = markURL || "3D-Slicer-Mark.svg";
-    const ds1 = (px * 0.085).toFixed(0), ds2 = (px * 0.17).toFixed(0), wf = (px * 0.185).toFixed(0);
-    return "<style>.sll-stage{position:relative;width:" + px + "px;height:" + px + "px;margin:0 auto}.sll-layer{position:absolute;inset:0;overflow:visible}.sll-layer svg{position:absolute;inset:0;width:100%;height:100%;overflow:visible}.sll-layer use{fill:none;stroke-linejoin:round;stroke-linecap:round}.sll-logo{background:url(" + markURL + ") center/contain no-repeat;filter:brightness(1.1) saturate(1.1) drop-shadow(0 0 " + ds1 + "px rgba(255,200,80,.6)) drop-shadow(0 0 " + ds2 + "px rgba(255,175,55,.35))}.sll-clip{-webkit-mask:url(" + markURL + ") center/contain no-repeat;mask:url(" + markURL + ") center/contain no-repeat}.sll-wash{background:radial-gradient(60% 60% at 48% 52%, rgba(255,205,95,.5), rgba(255,165,45,.2) 70%, rgba(255,150,35,.04));mix-blend-mode:screen;opacity:.85}.sll-xray{mix-blend-mode:screen}.sll-word{font:800 " + wf + 'px/1 -apple-system,system-ui,sans-serif;letter-spacing:1px;color:#eef7ff;text-align:center;margin-top:6px;text-shadow:0 0 20px rgba(255,210,90,.45)}.sll-word b{color:#ffd34d}</style><div class="sll-stage"><svg width="0" height="0"><defs><path id="sllm" d="' + SLL.m + '"/><path id="sllb" d="' + SLL.b + '"/><path id="sllt" d="' + SLL.t + '"/><filter id="sllaura" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="5"/></filter><filter id="sllxr" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="8"/></filter><filter id="sllxg" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="3.5"/></filter><filter id="sllxc" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="1.4"/></filter></defs></svg><div class="sll-layer"><svg viewBox="0 0 230 230"><g filter="url(#sllaura)" opacity="0.95">' + _strokes("#ffc63a", 6.5, 4, 2.4) + "</g>" + _strokes("#ffd84e", 4, 2.4, 1.4) + _strokes("#fff7d6", 2, 1.2, 0.7) + '</svg></div><div class="sll-layer sll-logo"></div><div class="sll-layer sll-clip sll-wash"></div><div class="sll-layer sll-clip sll-xray"><svg viewBox="0 0 230 230"><g filter="url(#sllxr)" opacity="0.85">' + _strokes("#ff9e1e", 7, 4.4, 2.4) + '</g><g filter="url(#sllxg)" opacity="1">' + _strokes("#ffd44d", 4.2, 2.6, 1.4) + '</g><g filter="url(#sllxc)" opacity="0.95">' + _strokes("#fffae6", 2.2, 1.4, 0.8) + '</g></svg></div></div><div class="sll-word">Slicer<b>Live</b></div>';
+    const wf = (px * 0.185).toFixed(0);
+    return _markStage(px, markURL) + '<div style="font:800 ' + wf + 'px/1 -apple-system,system-ui,sans-serif;letter-spacing:1px;color:#eef7ff;text-align:center;margin-top:6px;text-shadow:0 0 20px rgba(255,210,90,.45)">Slicer<b style="color:#ffd34d">Live</b></div>';
   }
 
   // slicerlive.js
@@ -73970,9 +73970,44 @@ volumeActor.getProperty().${removedMethodName}()
       return "err:" + (e && e.message || e);
     }
   };
+  function vtkSlicerRotateManipulator(publicAPI, model) {
+    model.classHierarchy.push("vtkSlicerRotateManipulator");
+    publicAPI.onButtonDown = (interactor2, renderer2, position) => {
+      model.prev = position;
+    };
+    publicAPI.onMouseMove = (interactor2, renderer2, position) => {
+      if (!position || !model.prev) return;
+      const camera = renderer2.getActiveCamera();
+      const size = interactor2.getView().getViewportSize(renderer2);
+      const dx = position.x - model.prev.x, dy = position.y - model.prev.y;
+      if (dx === 0 && dy === 0) {
+        model.prev = position;
+        return;
+      }
+      const MotionFactor = 10;
+      const rxf = dx * (-20 / size[0]) * MotionFactor;
+      const ryf = dy * (-20 / size[1]) * MotionFactor;
+      camera.azimuth(rxf);
+      camera.elevation(ryf);
+      camera.orthogonalizeViewUp();
+      renderer2.resetCameraClippingRange();
+      if (interactor2.getLightFollowCamera()) renderer2.updateLightsGeometryToFollowCamera();
+      model.prev = position;
+      scene3DDirty = true;
+      markDirty();
+    };
+  }
+  function extendSlicerRotate(publicAPI, model, initialValues = {}) {
+    Object.assign(model, initialValues);
+    macros_default.obj(publicAPI, model);
+    CompositeMouseManipulator_default.extend(publicAPI, model, initialValues);
+    vtkSlicerRotateManipulator(publicAPI, model);
+  }
+  var newSlicerRotateManipulator = macros_default.newInstance(extendSlicerRotate, "vtkSlicerRotateManipulator");
   var istyle = InteractorStyleManipulator_default.newInstance();
   [
-    MouseCameraTrackballRotateManipulator_default.newInstance({ button: 1 }),
+    newSlicerRotateManipulator({ button: 1 }),
+    // left-drag = rotate, exactly like Slicer desktop
     MouseCameraTrackballPanManipulator_default.newInstance({ button: 2 }),
     MouseCameraTrackballPanManipulator_default.newInstance({ button: 1, shift: true }),
     MouseCameraTrackballZoomManipulator_default.newInstance({ button: 3 }),
@@ -75242,7 +75277,8 @@ volumeActor.getProperty().${removedMethodName}()
     };
     set7(renderer, name === "threeD" ? full : _VPRECT.threeD, !name || name === "threeD");
     for (const n of ["Red", "Green", "Yellow"]) set7(_sliceRens[n].ren, name === n ? full : _VPRECT[n], !name || name === n);
-    if (_vrBtn) _vrBtn.style.display = name && name !== "threeD" ? "none" : "block";
+    if (_ctrlBtn) _ctrlBtn.style.display = name && name !== "threeD" ? "none" : "flex";
+    if (name && name !== "threeD") closeCtrlMenu();
     slicesDirty = true;
     scene3DDirty = true;
     try {
@@ -76429,7 +76465,7 @@ volumeActor.getProperty().${removedMethodName}()
       add7("idcComp" + name, "vtkMRMLSliceCompositeNode", { layoutName: name, backgroundVolumeID: vol, foregroundOpacity: 0, labelOpacity: 1 }, { backgroundVolume: [vol] });
     }
     if (hasSeg) {
-      const segDisp = add7("idcSegDisp", "vtkMRMLSegmentationDisplayNode", { visibility: 1, visibility3D: 1 });
+      const segDisp = add7("idcSegDisp", "vtkMRMLSegmentationDisplayNode", { visibility: _segOn ? 1 : 0, visibility3D: _segOn ? 1 : 0 });
       add7("idcSeg", "vtkMRMLSegmentationNode", { labelmapDims: [nx, ny, nz], labelmapIjkToRAS: M, segmentColors: [], seg2DOpacity: 0.5, segments: [] }, { display: [segDisp] });
     }
     return nodes;
@@ -76464,9 +76500,44 @@ volumeActor.getProperty().${removedMethodName}()
     scene3DDirty = true;
     markDirty();
   }
+  function ctBBoxCenter(ct) {
+    const M = ct.ijkToRAS, [nx, ny, nz] = ct.dims;
+    const apply = (p) => [M[0] * p[0] + M[1] * p[1] + M[2] * p[2] + M[3], M[4] * p[0] + M[5] * p[1] + M[6] * p[2] + M[7], M[8] * p[0] + M[9] * p[1] + M[10] * p[2] + M[11]];
+    const lo = [1e9, 1e9, 1e9], hi = [-1e9, -1e9, -1e9];
+    for (const i2 of [0, nx]) for (const j of [0, ny]) for (const k of [0, nz]) {
+      const w = apply([i2, j, k]);
+      for (let d = 0; d < 3; d++) {
+        lo[d] = Math.min(lo[d], w[d]);
+        hi[d] = Math.max(hi[d], w[d]);
+      }
+    }
+    return [(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2];
+  }
+  function finalizeRotationCenter() {
+    if (_rotCenterSet) return;
+    let c = _idcRotCenter;
+    const ct = window.__idcData && window.__idcData.ct;
+    if (!c && ct) c = ctBBoxCenter(ct);
+    if (!c) return;
+    _idcRotCenter = c;
+    _rotCenterSet = true;
+    recenterRotation(c);
+    jumpOthersTo(c, "");
+    renderer.resetCameraClippingRange();
+    renderer.updateLightsGeometryToFollowCamera();
+    renderWindow.render();
+    markDirty();
+  }
   var _vrOn = true;
-  var _vrBtn = null;
+  var _segOn = true;
+  var _ctrlBtn = null;
+  var _ctrlMenu = null;
+  var _segVis = {};
+  var _rotCenterSet = false;
   var _idcRotCenter = null;
+  function segVisible(L) {
+    return _segVis[L] !== false;
+  }
   function applyVR() {
     const disp = mirror.get("idcVRDisp");
     if (disp) disp.attrs.visibility3D = _vrOn ? 1 : 0;
@@ -76476,7 +76547,7 @@ volumeActor.getProperty().${removedMethodName}()
       break;
     }
     if (it && it.volume) it.volume.setVisibility(_vrOn);
-    if (_vrBtn) _vrBtn.textContent = _vrOn ? "Volume rendering: on" : "Volume rendering: off";
+    updateCtrlSwitches();
     scene3DDirty = true;
     try {
       renderWindow.render();
@@ -76484,19 +76555,172 @@ volumeActor.getProperty().${removedMethodName}()
     }
     markDirty();
   }
-  function ensureVRToggle() {
-    if (_vrBtn) {
-      _vrBtn.textContent = _vrOn ? "Volume rendering: on" : "Volume rendering: off";
-      return;
+  function applySegVis() {
+    const disp = mirror.get("idcSegDisp");
+    if (disp) {
+      disp.attrs.visibility = _segOn ? 1 : 0;
+      disp.attrs.visibility3D = _segOn ? 1 : 0;
     }
-    _vrBtn = document.createElement("button");
-    _vrBtn.style.cssText = "position:fixed; top:14px; right:14px; z-index:75; cursor:pointer; border:1px solid rgba(255,255,255,0.16); border-radius:9px; padding:7px 13px; font:600 12px -apple-system,system-ui,sans-serif; color:#eaf0ff; background:rgba(20,23,36,0.55); backdrop-filter:blur(20px) saturate(1.5); -webkit-backdrop-filter:blur(20px) saturate(1.5);";
-    _vrBtn.textContent = _vrOn ? "Volume rendering: on" : "Volume rendering: off";
-    _vrBtn.onclick = () => {
-      _vrOn = !_vrOn;
-      applyVR();
+    for (const dm of DMS) if (dm.items && dm.items.has("idcSeg")) {
+      const it = dm.items.get("idcSeg");
+      for (const [sid, s] of it.segs) {
+        const L = parseInt(String(sid).replace(/^seg/, ""), 10);
+        s.actor.setVisibility(_segOn && segVisible(L));
+      }
+    }
+    applySeg2DOpacity();
+    updateCtrlSwitches();
+    slicesDirty = true;
+    scene3DDirty = true;
+    try {
+      renderWindow.render();
+    } catch (e) {
+    }
+    markDirty();
+  }
+  function applySeg2DOpacity() {
+    const seg = mirror.get("idcSeg");
+    if (!seg) return;
+    const op = seg.attrs.seg2DOpacity != null ? seg.attrs.seg2DOpacity : 0.5;
+    const ofun = PiecewiseFunction_default.newInstance();
+    ofun.addPoint(0, 0);
+    ofun.addPoint(0.5, 0);
+    for (const c of seg.attrs.segmentColors || []) ofun.addPoint(c[0], _segOn && segVisible(c[0]) ? op : 0);
+    for (const nm in _sliceRens) {
+      const sr = _sliceRens[nm];
+      if (sr && sr.ovVol) sr.ovVol.getProperty().setScalarOpacity(0, ofun);
+    }
+  }
+  function makeSwitch() {
+    const track = document.createElement("span");
+    track.style.cssText = "position:relative;flex:none;width:38px;height:22px;border-radius:11px;transition:background .15s;";
+    const knob = document.createElement("span");
+    knob.style.cssText = "position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.4);transition:transform .15s;";
+    track.appendChild(knob);
+    track._paint = (on) => {
+      track.style.background = on ? "linear-gradient(180deg,#9fe9ff,#54c6f0)" : "rgba(255,255,255,0.20)";
+      knob.style.transform = "translateX(" + (on ? "16px" : "0px") + ")";
     };
-    document.body.appendChild(_vrBtn);
+    return track;
+  }
+  function makeToggleRow(label, getOn, setOn, opts) {
+    opts = opts || {};
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:16px;cursor:pointer;border-radius:9px;padding:" + (opts.small ? "6px 8px" : "9px 8px") + ";" + (opts.indent ? "margin-left:10px;" : "");
+    row.onmouseenter = () => {
+      row.style.background = "rgba(255,255,255,0.07)";
+    };
+    row.onmouseleave = () => {
+      row.style.background = "transparent";
+    };
+    const left = document.createElement("span");
+    left.style.cssText = "display:flex;align-items:center;gap:9px;min-width:0;";
+    if (opts.swatch) {
+      const sw = document.createElement("span");
+      const c = opts.swatch;
+      sw.style.cssText = "flex:none;width:11px;height:11px;border-radius:3px;box-shadow:0 0 0 1px rgba(255,255,255,.25);background:rgb(" + Math.round(c[0] * 255) + "," + Math.round(c[1] * 255) + "," + Math.round(c[2] * 255) + ")";
+      left.appendChild(sw);
+    }
+    const lab = document.createElement("span");
+    lab.textContent = label;
+    lab.style.cssText = "font:" + (opts.small ? "500 12.5px" : "600 13px") + " -apple-system,system-ui,sans-serif;color:#eaf0ff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
+    left.appendChild(lab);
+    const track = makeSwitch();
+    const paint = () => {
+      const dim = opts.dim && opts.dim();
+      row.style.opacity = dim ? "0.4" : "1";
+      track._paint(!!getOn());
+    };
+    row.onclick = () => {
+      if (opts.dim && opts.dim()) return;
+      setOn(!getOn());
+      paint();
+    };
+    row.appendChild(left);
+    row.appendChild(track);
+    paint();
+    row._paint = paint;
+    return row;
+  }
+  function updateCtrlSwitches() {
+    if (_ctrlMenu && _ctrlMenu._rows) {
+      for (const r of _ctrlMenu._rows) if (r._paint) r._paint();
+    }
+  }
+  function _ctrlOutside(ev) {
+    if (_ctrlMenu && !_ctrlMenu.contains(ev.target) && _ctrlBtn && !_ctrlBtn.contains(ev.target)) closeCtrlMenu();
+  }
+  function closeCtrlMenu() {
+    if (_ctrlMenu) {
+      _ctrlMenu.remove();
+      _ctrlMenu = null;
+      document.removeEventListener("mousedown", _ctrlOutside, true);
+    }
+  }
+  function openCtrlMenu() {
+    _ctrlMenu = document.createElement("div");
+    _ctrlMenu.style.cssText = "position:fixed; top:108px; right:14px; z-index:76; min-width:248px; max-width:340px; border-radius:14px; padding:8px; font:13px/1.4 -apple-system,system-ui,sans-serif; color:#e8eeff; background:linear-gradient(135deg, rgba(58,64,88,0.55), rgba(20,24,38,0.62)); backdrop-filter:blur(26px) saturate(1.7); -webkit-backdrop-filter:blur(26px) saturate(1.7); border:1px solid rgba(255,255,255,0.22); box-shadow:0 18px 60px rgba(0,0,0,0.55), inset 0 1px 0 rgba(255,255,255,0.22);";
+    const rows = [];
+    _ctrlMenu._rows = rows;
+    const add7 = (r) => {
+      rows.push(r);
+      return r;
+    };
+    const title = document.createElement("div");
+    title.textContent = "Display";
+    title.style.cssText = "font:700 11px -apple-system,system-ui,sans-serif;letter-spacing:1px;text-transform:uppercase;opacity:0.5;padding:6px 8px 8px;";
+    _ctrlMenu.appendChild(title);
+    _ctrlMenu.appendChild(add7(makeToggleRow("Volume rendering", () => _vrOn, (v) => {
+      _vrOn = v;
+      applyVR();
+    })));
+    const segs = window.__caseSegments || [];
+    if (mirror.get("idcSeg")) {
+      _ctrlMenu.appendChild(add7(makeToggleRow("Segmentation", () => _segOn, (v) => {
+        _segOn = v;
+        applySegVis();
+      })));
+      if (segs.length) {
+        const wrap = document.createElement("div");
+        wrap.style.cssText = "margin-top:2px;border-top:1px solid rgba(255,255,255,0.12);padding-top:4px;" + (segs.length > 5 ? "max-height:184px;overflow-y:auto;" : "");
+        for (const s of segs) {
+          const L = s.n;
+          wrap.appendChild(add7(makeToggleRow(
+            s.name,
+            () => segVisible(L),
+            (v) => {
+              _segVis[L] = v;
+              applySegVis();
+            },
+            { swatch: s.rgb, indent: true, small: true, dim: () => !_segOn }
+          )));
+        }
+        _ctrlMenu.appendChild(wrap);
+      }
+    }
+    document.body.appendChild(_ctrlMenu);
+    if (_ctrlBtn) {
+      const r = _ctrlBtn.getBoundingClientRect();
+      _ctrlMenu.style.top = Math.round(r.bottom + 8) + "px";
+      _ctrlMenu.style.right = Math.round(Math.max(8, window.innerWidth - r.right)) + "px";
+    }
+    document.addEventListener("mousedown", _ctrlOutside, true);
+  }
+  function ensureControlsButton() {
+    if (_ctrlBtn) return;
+    _ctrlBtn = document.createElement("button");
+    _ctrlBtn.title = "Display options";
+    _ctrlBtn.style.cssText = "position:fixed; top:12px; right:14px; z-index:77; cursor:pointer; padding:10px 14px 9px; display:inline-flex; flex-direction:column; align-items:center; overflow:visible; border:1px solid rgba(255,255,255,0.12); border-radius:15px; background:#121826; box-shadow:0 10px 30px rgba(0,0,0,0.55), inset 0 1px 0 rgba(255,255,255,0.06);";
+    _ctrlBtn.innerHTML = slicerLiveLogo(60);
+    const openIfClosed = () => {
+      if (!_ctrlMenu) openCtrlMenu();
+    };
+    _ctrlBtn.onmouseenter = openIfClosed;
+    _ctrlBtn.onclick = (ev) => {
+      ev.stopPropagation();
+      openIfClosed();
+    };
+    document.body.appendChild(_ctrlBtn);
   }
   async function addIDCSegments(ct, seg) {
     const segNode = mirror.get("idcSeg");
@@ -76515,6 +76739,8 @@ volumeActor.getProperty().${removedMethodName}()
     } catch (e) {
       console.warn("[IDC] surfaces", e);
     }
+    applySegVis();
+    finalizeRotationCenter();
   }
   async function buildSegSurfaces(ct, seg, segNode) {
     const [nx, ny, nz] = ct.dims, lab = seg.lab, M = ct.ijkToRAS;
@@ -76549,7 +76775,6 @@ volumeActor.getProperty().${removedMethodName}()
     if (cn) {
       const a = ci / cn, b = cj / cn, c = ck / cn;
       _idcRotCenter = [M[0] * a + M[1] * b + M[2] * c + M[3], M[4] * a + M[5] * b + M[6] * c + M[7], M[8] * a + M[9] * b + M[10] * c + M[11]];
-      recenterRotation(_idcRotCenter);
     }
     const segs = [];
     for (const c of colors) {
@@ -76617,6 +76842,9 @@ volumeActor.getProperty().${removedMethodName}()
     window.__caseSegments = null;
     window.__idcData = null;
     _idcRotCenter = null;
+    _rotCenterSet = false;
+    _segVis = {};
+    closeCtrlMenu();
     scene3DDirty = true;
     slicesDirty = true;
     try {
@@ -76655,7 +76883,7 @@ volumeActor.getProperty().${removedMethodName}()
           window.__slicerliveLoaded = mirror.size;
           threeDActive = true;
           await syncDMs();
-          ensureVRToggle();
+          ensureControlsButton();
           mosaicHide();
           setIDCCamera(ct);
           renderer.updateLightsGeometryToFollowCamera();
@@ -76676,17 +76904,13 @@ volumeActor.getProperty().${removedMethodName}()
         // 2D colored overlay on the slices
       }, ctBucket, segBucket, modality);
       setLoadProgress(-1);
-      if (_idcRotCenter) {
-        recenterRotation(_idcRotCenter);
-        jumpOthersTo(_idcRotCenter, "");
-      }
+      if (segKeys.length === 0) finalizeRotationCenter();
       renderer.resetCameraClippingRange();
       renderer.updateLightsGeometryToFollowCamera();
       renderWindow.render();
       markDirty();
       for (const d of [120, 400, 1e3, 2200]) setTimeout(() => {
         try {
-          if (_idcRotCenter) recenterRotation(_idcRotCenter);
           renderer.resetCameraClippingRange();
           renderer.updateLightsGeometryToFollowCamera();
           renderWindow.render();
