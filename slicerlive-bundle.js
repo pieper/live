@@ -64490,10 +64490,6 @@ void main()
     vtkMouseCameraTrackballZoomManipulator(publicAPI, model);
   }
   var newInstance131 = macros_default.newInstance(extend137, "vtkMouseCameraTrackballZoomManipulator");
-  var MouseCameraTrackballZoomManipulator_default = {
-    newInstance: newInstance131,
-    extend: extend137
-  };
 
   // node_modules/@kitware/vtk.js/Interaction/Manipulators/CompositeGestureManipulator.js
   function vtkCompositeGestureManipulator(publicAPI, model) {
@@ -74004,14 +74000,59 @@ volumeActor.getProperty().${removedMethodName}()
     vtkSlicerRotateManipulator(publicAPI, model);
   }
   var newSlicerRotateManipulator = macros_default.newInstance(extendSlicerRotate, "vtkSlicerRotateManipulator");
+  var SLICER_MOTION_FACTOR = 10;
+  var SLICER_WHEEL_FACTOR = 1;
+  function slicerDolly(renderer2, factor) {
+    const camera = renderer2.getActiveCamera();
+    if (camera.getParallelProjection()) camera.setParallelScale(camera.getParallelScale() / factor);
+    else {
+      camera.dolly(factor);
+      renderer2.resetCameraClippingRange();
+    }
+    scene3DDirty = true;
+    markDirty();
+  }
+  function vtkSlicerZoomManipulator(publicAPI, model) {
+    model.classHierarchy.push("vtkSlicerZoomManipulator");
+    publicAPI.onButtonDown = (interactor2, renderer2, position) => {
+      model.prev = position;
+    };
+    publicAPI.onMouseMove = (interactor2, renderer2, position) => {
+      if (!position || !model.prev) return;
+      const size = interactor2.getView().getViewportSize(renderer2);
+      const dy = position.y - model.prev.y;
+      if (dy === 0) {
+        model.prev = position;
+        return;
+      }
+      const centerY = size[1] / 2;
+      const dyf = SLICER_MOTION_FACTOR * dy / centerY;
+      slicerDolly(renderer2, Math.pow(1.1, -1 * dyf));
+      model.prev = position;
+    };
+    publicAPI.onScroll = (interactor2, renderer2, delta) => {
+      if (!delta) return;
+      const dir = delta < 0 ? 1 : -1;
+      slicerDolly(renderer2, Math.pow(1.1, dir * 0.2 * SLICER_MOTION_FACTOR * SLICER_WHEEL_FACTOR));
+    };
+  }
+  function extendSlicerZoom(publicAPI, model, initialValues = {}) {
+    Object.assign(model, initialValues);
+    macros_default.obj(publicAPI, model);
+    CompositeMouseManipulator_default.extend(publicAPI, model, initialValues);
+    vtkSlicerZoomManipulator(publicAPI, model);
+  }
+  var newSlicerZoomManipulator = macros_default.newInstance(extendSlicerZoom, "vtkSlicerZoomManipulator");
   var istyle = InteractorStyleManipulator_default.newInstance();
   [
     newSlicerRotateManipulator({ button: 1 }),
     // left-drag = rotate, exactly like Slicer desktop
     MouseCameraTrackballPanManipulator_default.newInstance({ button: 2 }),
     MouseCameraTrackballPanManipulator_default.newInstance({ button: 1, shift: true }),
-    MouseCameraTrackballZoomManipulator_default.newInstance({ button: 3 }),
-    MouseCameraTrackballZoomManipulator_default.newInstance({ scrollEnabled: true, dragEnabled: false })
+    newSlicerZoomManipulator({ button: 3 }),
+    // right-drag = zoom, focal point fixed (Slicer Dolly)
+    newSlicerZoomManipulator({ scrollEnabled: true, dragEnabled: false })
+    // wheel = zoom, focal point fixed (Slicer Dolly)
   ].forEach((m) => istyle.addMouseManipulator(m));
   istyle.addGestureManipulator(GestureCameraManipulator_default.newInstance());
   interactor.setInteractorStyle(istyle);
