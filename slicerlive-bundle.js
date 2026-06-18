@@ -75388,7 +75388,13 @@ volumeActor.getProperty().${removedMethodName}()
       if (!slot || !slot.normal || !slot.origin0 || !slot.step) continue;
       const n = slot.normal, o = slot.origin0;
       setSliceIndex(slot, ((ras[0] - o[0]) * n[0] + (ras[1] - o[1]) * n[1] + (ras[2] - o[2]) * n[2]) / slot.step);
+      const i2 = slot.index, s = slot.step, R = slot.right, U = slot.up;
+      const base = [o[0] + i2 * s * n[0], o[1] + i2 * s * n[1], o[2] + i2 * s * n[2]];
+      const d = [ras[0] - base[0], ras[1] - base[1], ras[2] - base[2]];
+      const dr = d[0] * R[0] + d[1] * R[1] + d[2] * R[2], du = d[0] * U[0] + d[1] * U[1] + d[2] * U[2];
+      slot.pan = [R[0] * dr + U[0] * du, R[1] * dr + U[1] * du, R[2] * dr + U[2] * du];
     }
+    slicesDirty = true;
   }
   var _sliceDrag = null;
   var _lastDown = null;
