@@ -75301,6 +75301,9 @@ volumeActor.getProperty().${removedMethodName}()
       cam.setViewUp(slot.up[0], slot.up[1], slot.up[2]);
       cam.setParallelScale(slot.pscale || slot.fov / 2);
       cam.setClippingRange(D - t * 0.4, D + t * 0.4);
+      const sd = Math.max(0.05, t / 8);
+      if (sr.ctMapper) sr.ctMapper.setSampleDistance(sd);
+      if (sr.ovMapper) sr.ovMapper.setSampleDistance(sd);
     }
   }
   var _outGL = document.createElement("canvas");
@@ -76506,7 +76509,8 @@ volumeActor.getProperty().${removedMethodName}()
           return;
         }
         if (m.t === "ct") {
-          const ct = { vol: new Int16Array(m.vol), dims: m.dims, ijkToRAS: m.ijkToRAS, win: m.win, lev: m.lev };
+          const Ctor = m.dtype === "float32" ? Float32Array : Int16Array;
+          const ct = { vol: new Ctor(m.vol), dims: m.dims, ijkToRAS: m.ijkToRAS, win: m.win, lev: m.lev };
           chain2 = chain2.then(() => handlers.onCT(ct)).catch((err2) => console.error("[IDC] onCT", err2));
           return;
         }
@@ -76868,6 +76872,19 @@ volumeActor.getProperty().${removedMethodName}()
         _ctrlMenu.appendChild(wrap);
       }
     }
+    const about = document.createElement("div");
+    about.style.cssText = "cursor:pointer;border-radius:9px;padding:9px 8px;margin-top:4px;border-top:1px solid rgba(255,255,255,0.12);font:600 13px -apple-system,system-ui,sans-serif;color:#9fe9ff;";
+    about.textContent = "About SlicerLive";
+    about.onmouseenter = () => {
+      about.style.background = "rgba(255,255,255,0.07)";
+    };
+    about.onmouseleave = () => {
+      about.style.background = "transparent";
+    };
+    about.onclick = () => {
+      window.open("https://github.com/pieper/SlicerLive", "_blank", "noopener");
+    };
+    _ctrlMenu.appendChild(about);
     document.body.appendChild(_ctrlMenu);
     if (_ctrlBtn) {
       const r = _ctrlBtn.getBoundingClientRect();
@@ -77146,6 +77163,9 @@ volumeActor.getProperty().${removedMethodName}()
     _srSpinning = true;
     if (_srBtn) _srBtn.disabled = true;
     const e = srPick(), mod = { CT: "CT", MR: "MR", PT: "PET" }[e.m] || e.m;
+    _vrOn = true;
+    _seg3DOn = true;
+    _seg2DOn = true;
     _srCurrent = e;
     closeCaseInfo();
     if (_srCap) _srCap.textContent = mod + "  \xB7  " + e.col + "  \xB7  " + (e.sd || "segmentation");
@@ -77200,6 +77220,11 @@ volumeActor.getProperty().${removedMethodName}()
   }
   function showLanding() {
     closeLanding();
+    _vrOn = true;
+    _seg3DOn = true;
+    _seg2DOn = true;
+    _segFill = true;
+    _segOutline = true;
     const s = _segStats || {}, bm = s.byMod || {}, n = (x2) => x2 == null ? "\u2013" : x2.toLocaleString();
     _srLanding = document.createElement("div");
     _srLanding.style.cssText = "position:fixed; inset:0; z-index:95; display:flex; align-items:center; justify-content:center; background:rgba(6,8,14,0.45); font:14px/1.5 -apple-system,system-ui,sans-serif; color:#e8eeff;";
