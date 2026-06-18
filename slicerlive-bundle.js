@@ -75300,19 +75300,57 @@ volumeActor.getProperty().${removedMethodName}()
       cam.setPosition(orig[0] + co[0] * D, orig[1] + co[1] * D, orig[2] + co[2] * D);
       cam.setViewUp(slot.up[0], slot.up[1], slot.up[2]);
       cam.setParallelScale(slot.pscale || slot.fov / 2);
-      cam.setClippingRange(D - 0.5, D + t);
+      cam.setClippingRange(D - t * 0.4, D + t * 0.4);
     }
   }
-  var _segScratch = document.createElement("canvas");
-  var _segScratchCtx = _segScratch.getContext("2d", { willReadFrequently: true });
-  var _outlineCanvas = document.createElement("canvas");
-  var _outlineCtx = _outlineCanvas.getContext("2d");
+  var _outGL = document.createElement("canvas");
+  _outGL.id = "offload3d-outline";
+  _outGL.style.cssText = "position:fixed; z-index:6; display:none; pointer-events:none;";
+  document.body.appendChild(_outGL);
+  var _ogl = null;
+  var _oglProg = null;
+  var _oglTex = null;
+  var _oglU = {};
   var _segOutlineDirty = true;
   var _outlineReady = false;
+  function setupOutlineGL() {
+    if (_ogl) return _ogl;
+    _ogl = _outGL.getContext("webgl2", { premultipliedAlpha: false, alpha: true, antialias: false });
+    if (!_ogl) return null;
+    const gl = _ogl;
+    const VS = "#version 300 es\nin vec2 aPos; out vec2 vUV; void main(){ vUV=aPos*0.5+0.5; gl_Position=vec4(aPos,0.0,1.0); }";
+    const FS = "#version 300 es\nprecision highp float;\nuniform sampler2D uSeg; uniform vec2 uTexel; uniform vec4 u3D; uniform float uHas;\nin vec2 vUV; out vec4 frag;\nbool sg(vec4 c){ return max(c.r,max(c.g,c.b))>0.07; }\nvoid main(){ frag=vec4(0.0); if(uHas<0.5) return; if(vUV.x>=u3D.x&&vUV.x<=u3D.z&&vUV.y>=u3D.y&&vUV.y<=u3D.w) return; vec4 c=texture(uSeg,vUV); if(!sg(c)) return; bool b=false; for(int dy=-2;dy<=2;dy++){ for(int dx=-2;dx<=2;dx++){ if(dx==0&&dy==0) continue; if(abs(dx)+abs(dy)>2) continue; vec4 n=texture(uSeg, vUV+vec2(float(dx),float(dy))*uTexel); if(!sg(n)||distance(n.rgb,c.rgb)>0.23) b=true; } } if(b) frag=vec4(c.rgb,1.0); }";
+    const mk = (t, src) => {
+      const s = gl.createShader(t);
+      gl.shaderSource(s, src);
+      gl.compileShader(s);
+      return s;
+    };
+    const p = gl.createProgram();
+    gl.attachShader(p, mk(gl.VERTEX_SHADER, VS));
+    gl.attachShader(p, mk(gl.FRAGMENT_SHADER, FS));
+    gl.bindAttribLocation(p, 0, "aPos");
+    gl.linkProgram(p);
+    _oglProg = p;
+    _oglU = { uSeg: gl.getUniformLocation(p, "uSeg"), uTexel: gl.getUniformLocation(p, "uTexel"), u3D: gl.getUniformLocation(p, "u3D"), uHas: gl.getUniformLocation(p, "uHas") };
+    const quad = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    _oglTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, _oglTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    return _ogl;
+  }
   function computeSegOutlines() {
     const glc = glWindow.getCanvas && glWindow.getCanvas();
     if (!glc) return;
-    if (!mirror.get("idcSeg")) return;
+    if (!mirror.get("idcSeg") || !setupOutlineGL()) return;
     const draw3D = renderer.getDraw ? renderer.getDraw() : true;
     const ctVis = [];
     renderer.setDraw(false);
@@ -75329,62 +75367,36 @@ volumeActor.getProperty().${removedMethodName}()
       renderWindow.render();
     } catch (e) {
     }
-    const W = out.width, H = out.height;
-    if (!W || !H) {
-      renderer.setDraw(draw3D);
-      for (const [v, vis] of ctVis) v.setVisibility(vis);
-      _segOutOpaque = false;
-      applySeg2DOpacity();
-      return;
-    }
-    if (_segScratch.width !== W || _segScratch.height !== H) {
-      _segScratch.width = W;
-      _segScratch.height = H;
-      _outlineCanvas.width = W;
-      _outlineCanvas.height = H;
-    }
-    let src = null;
-    try {
-      _segScratchCtx.clearRect(0, 0, W, H);
-      _segScratchCtx.drawImage(glc, 0, 0, W, H);
-      src = _segScratchCtx.getImageData(0, 0, W, H);
-    } catch (e) {
-    }
+    drawOutlineGL(glc);
     renderer.setDraw(draw3D);
     for (const [v, vis] of ctVis) v.setVisibility(vis);
     _segOutOpaque = false;
     applySeg2DOpacity();
-    if (src) {
-      edgeDetectOutline(src, W, H);
-      _outlineReady = true;
-    }
   }
-  function edgeDetectOutline(src, W, H) {
-    const s = src.data, dst = _outlineCtx.createImageData(W, H), d = dst.data;
-    const skip3D = !(_maxView && _maxView !== "threeD");
-    const noSlices = _maxView === "threeD";
-    const halfW = W >> 1, halfH = H >> 1, row = W * 4;
-    const isSeg = (p) => s[p] > 18 || s[p + 1] > 18 || s[p + 2] > 18;
-    const diff = (a, b) => Math.abs(s[a] - s[b]) + Math.abs(s[a + 1] - s[b + 1]) + Math.abs(s[a + 2] - s[b + 2]) > 60;
-    const stamp = (q, p) => {
-      d[q] = s[p];
-      d[q + 1] = s[p + 1];
-      d[q + 2] = s[p + 2];
-      d[q + 3] = 255;
-    };
-    if (!noSlices) for (let y = 0; y < H; y++) for (let x2 = 0; x2 < W; x2++) {
-      if (skip3D && x2 >= halfW && y < halfH) continue;
-      const p = (y * W + x2) * 4;
-      if (!isSeg(p)) continue;
-      const border = x2 > 0 && (!isSeg(p - 4) || diff(p, p - 4)) || x2 < W - 1 && (!isSeg(p + 4) || diff(p, p + 4)) || y > 0 && (!isSeg(p - row) || diff(p, p - row)) || y < H - 1 && (!isSeg(p + row) || diff(p, p + row));
-      if (!border) continue;
-      stamp(p, p);
-      if (x2 > 0 && isSeg(p - 4) && !diff(p, p - 4)) stamp(p - 4, p);
-      if (x2 < W - 1 && isSeg(p + 4) && !diff(p, p + 4)) stamp(p + 4, p);
-      if (y > 0 && isSeg(p - row) && !diff(p, p - row)) stamp(p - row, p);
-      if (y < H - 1 && isSeg(p + row) && !diff(p, p + row)) stamp(p + row, p);
+  function drawOutlineGL(glc) {
+    const gl = _ogl, W = glc.width, H = glc.height;
+    if (!gl || !W || !H) return;
+    if (_outGL.width !== W || _outGL.height !== H) {
+      _outGL.width = W;
+      _outGL.height = H;
     }
-    _outlineCtx.putImageData(dst, 0, 0);
+    gl.bindTexture(gl.TEXTURE_2D, _oglTex);
+    try {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, glc);
+    } catch (e) {
+      return;
+    }
+    gl.viewport(0, 0, W, H);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.useProgram(_oglProg);
+    gl.uniform1i(_oglU.uSeg, 0);
+    gl.uniform2f(_oglU.uTexel, 1 / W, 1 / H);
+    gl.uniform1f(_oglU.uHas, _maxView === "threeD" ? 0 : 1);
+    if (_maxView && _maxView !== "threeD") gl.uniform4f(_oglU.u3D, 2, 2, 2, 2);
+    else gl.uniform4f(_oglU.u3D, 0.5, 0.5, 1, 1);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    _outlineReady = true;
   }
   var _maxView = null;
   function setMaxView(name) {
@@ -75398,6 +75410,7 @@ volumeActor.getProperty().${removedMethodName}()
     for (const n of ["Red", "Green", "Yellow"]) set7(_sliceRens[n].ren, name === n ? full : _VPRECT[n], !name || name === n);
     if (_ctrlBtn) _ctrlBtn.style.display = name && name !== "threeD" ? "none" : "flex";
     if (name && name !== "threeD") closeCtrlMenu();
+    _segOutlineDirty = true;
     slicesDirty = true;
     scene3DDirty = true;
     try {
@@ -75886,14 +75899,15 @@ volumeActor.getProperty().${removedMethodName}()
   function positionOverlay() {
     if (STANDALONE) {
       const cw2 = window.innerWidth, ch2 = window.innerHeight;
-      for (const el of [host, out]) {
+      for (const el of [host, out, _outGL]) {
         el.style.left = "0px";
         el.style.top = "0px";
         el.style.width = cw2 + "px";
         el.style.height = ch2 + "px";
-        el.style.display = "block";
       }
+      for (const el of [host, out]) el.style.display = "block";
       host.style.opacity = "1";
+      _segOutlineDirty = true;
       if (out.width !== cw2 || out.height !== ch2) {
         out.width = cw2;
         out.height = ch2;
@@ -75973,8 +75987,8 @@ volumeActor.getProperty().${removedMethodName}()
         scene3DDirty = false;
         if (pendingRenders > 0) pendingRenders--;
       }
+      _outGL.style.display = _seg2DOn && _segOutline && _outlineReady && mirror.get("idcSeg") ? "block" : "none";
       outCtx.clearRect(0, 0, geom.cw, geom.ch);
-      if (_seg2DOn && _segOutline && _outlineReady && mirror.get("idcSeg")) outCtx.drawImage(_outlineCanvas, 0, 0);
       drawDecorations2D();
       return;
     }
