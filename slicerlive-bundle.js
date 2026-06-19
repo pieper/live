@@ -75370,6 +75370,11 @@ volumeActor.getProperty().${removedMethodName}()
       renderWindow.render();
     } catch (e) {
     }
+    try {
+      const vgl = glWindow.get3DContext && glWindow.get3DContext();
+      if (vgl) vgl.finish();
+    } catch (e) {
+    }
     drawOutlineGL(glc);
     renderer.setDraw(draw3D);
     for (const [v, vis] of ctVis) v.setVisibility(vis);
