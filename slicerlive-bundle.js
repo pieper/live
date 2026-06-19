@@ -75511,7 +75511,9 @@ volumeActor.getProperty().${removedMethodName}()
     }
     return null;
   }
+  var _xhairRAS = null;
   function jumpOthersTo(ras, exceptName) {
+    _xhairRAS = [ras[0], ras[1], ras[2]];
     for (const name of ["Red", "Yellow", "Green"]) {
       if (name === exceptName) continue;
       const slot = _fourUp[name];
@@ -75526,8 +75528,25 @@ volumeActor.getProperty().${removedMethodName}()
     }
     slicesDirty = true;
   }
+  function resetAllViews() {
+    const ct = window.__idcData && window.__idcData.ct;
+    if (!ct || !_fourUp) return;
+    const center = ctBBoxCenter(ct);
+    for (const name of ["Red", "Yellow", "Green"]) {
+      const slot = _fourUp[name];
+      if (slot) slot.pscale = slot.fov / 2;
+    }
+    jumpOthersTo(center, "");
+    setIDCCamera(ct);
+    slicesDirty = true;
+    scene3DDirty = true;
+    renderer.resetCameraClippingRange();
+    renderWindow.render();
+    markDirty();
+  }
   var _sliceDrag = null;
   var _lastDown = null;
+  if (SLICERLIVE) host.addEventListener("contextmenu", (e) => e.preventDefault());
   host.addEventListener("wheel", (e) => {
     const slot = fourUpSlotAt(e.clientX, e.clientY);
     if (!slot) return;
@@ -75548,9 +75567,10 @@ volumeActor.getProperty().${removedMethodName}()
     const dbl = _lastDown && e.timeStamp - _lastDown.t < 350 && Math.hypot(e.clientX - _lastDown.x, e.clientY - _lastDown.y) < 6;
     _lastDown = dbl ? null : { t: e.timeStamp, x: e.clientX, y: e.clientY };
     if (dbl) {
-      toggleMaxAt(e.clientX, e.clientY);
       e.stopPropagation();
       e.preventDefault();
+      if (e.button === 2) resetAllViews();
+      else toggleMaxAt(e.clientX, e.clientY);
       return;
     }
     if (e.shiftKey && (e.button === 0 || e.button === 2)) {
@@ -76052,6 +76072,7 @@ volumeActor.getProperty().${removedMethodName}()
       _outGL.style.display = _seg2DOn && _segOutline && _outlineReady && mirror.get("idcSeg") ? "block" : "none";
       outCtx.clearRect(0, 0, geom.cw, geom.ch);
       drawDecorations2D();
+      drawCrosshair();
       return;
     }
     const v = document.getElementById("v");
@@ -76084,6 +76105,60 @@ volumeActor.getProperty().${removedMethodName}()
     }
     outCtx.clearRect(0, 0, cw, ch);
     drawDecorations2D();
+  }
+  function drawCrosshair() {
+    if (!_fourUp || !_shiftDown || !_xhairRAS || !geom) return;
+    const cw = geom.cw, ch = geom.ch, P = _xhairRAS, GAP = 3, LEN = 8;
+    const ticks2 = (cx, cy, perMM) => {
+      const a = GAP * perMM, b = LEN * perMM;
+      outCtx.beginPath();
+      outCtx.moveTo(cx, cy - a);
+      outCtx.lineTo(cx, cy - b);
+      outCtx.moveTo(cx, cy + a);
+      outCtx.lineTo(cx, cy + b);
+      outCtx.moveTo(cx - a, cy);
+      outCtx.lineTo(cx - b, cy);
+      outCtx.moveTo(cx + a, cy);
+      outCtx.lineTo(cx + b, cy);
+      outCtx.stroke();
+    };
+    const clipTo = (v) => {
+      outCtx.beginPath();
+      outCtx.rect(v[0] * cw, (1 - v[3]) * ch, (v[2] - v[0]) * cw, (v[3] - v[1]) * ch);
+      outCtx.clip();
+    };
+    outCtx.save();
+    outCtx.strokeStyle = "rgba(150,225,255,0.95)";
+    outCtx.lineWidth = 1.5;
+    outCtx.shadowColor = "rgba(0,0,0,0.6)";
+    outCtx.shadowBlur = 2;
+    for (const name of ["Red", "Yellow", "Green"]) {
+      const v = _sliceVP(name);
+      if (!v) continue;
+      const slot = _fourUp[name];
+      if (!slot || !slot.normal || !slot.origin0) continue;
+      const i2 = slot.index, s = slot.step, n = slot.normal, o = slot.origin0, p = slot.pan || [0, 0, 0], R = slot.right, U = slot.up;
+      const orig = [o[0] + i2 * s * n[0] + p[0], o[1] + i2 * s * n[1] + p[1], o[2] + i2 * s * n[2] + p[2]];
+      const d = [P[0] - orig[0], P[1] - orig[1], P[2] - orig[2]];
+      const sx = d[0] * R[0] + d[1] * R[1] + d[2] * R[2], sy = d[0] * U[0] + d[1] * U[1] + d[2] * U[2];
+      const ps = slot.pscale || slot.fov / 2, qwPx = (v[2] - v[0]) * cw, qhPx = (v[3] - v[1]) * ch, aspect = qhPx ? qwPx / qhPx : 1;
+      const u = sx / (2 * ps * aspect) + 0.5, vv = sy / (2 * ps) + 0.5;
+      outCtx.save();
+      clipTo(v);
+      ticks2((v[0] + u * (v[2] - v[0])) * cw, (1 - (v[1] + vv * (v[3] - v[1]))) * ch, qhPx / (2 * ps));
+      outCtx.restore();
+    }
+    if (!_maxView || _maxView === "threeD") {
+      const v3 = _maxView === "threeD" ? [0, 0, 1, 1] : _VPRECT.threeD;
+      const cam = renderer.getActiveCamera(), camR = norm3(cross32(cam.getDirectionOfProjection(), cam.getViewUp()));
+      const s0 = worldToScreen(P), s1 = worldToScreen([P[0] + camR[0], P[1] + camR[1], P[2] + camR[2]]);
+      const perMM = Math.hypot(s1.x - s0.x, s1.y - s0.y) || 4;
+      outCtx.save();
+      clipTo(v3);
+      ticks2(s0.x, s0.y, perMM);
+      outCtx.restore();
+    }
+    outCtx.restore();
   }
   var viewBounds = null;
   var axisLabelsOn = false;
