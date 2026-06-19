@@ -75096,7 +75096,10 @@ volumeActor.getProperty().${removedMethodName}()
     });
   };
   var _fourUp = null;
-  window.__fourUpDbg = () => _fourUp ? Object.fromEntries(["Red", "Green", "Yellow"].map((n) => [n, _fourUp[n] ? { index: _fourUp[n].index, pscale: Math.round(_fourUp[n].pscale || 0) } : null])) : null;
+  window.__fourUpDbg = () => {
+    const c = renderer.getActiveCamera();
+    return _fourUp ? Object.assign(Object.fromEntries(["Red", "Green", "Yellow"].map((n) => [n, _fourUp[n] ? { index: _fourUp[n].index, pscale: Math.round(_fourUp[n].pscale || 0) } : null])), { threeD: { dist: Math.round(c.getDistance()), pscale: Math.round(c.getParallelScale()), fp: c.getFocalPoint().map((v) => Math.round(v)) } }) : null;
+  };
   var _VP = { Red: [0, 0.5, 0.5, 1], Yellow: [0.5, 0, 1, 0.5], Green: [0, 0, 0.5, 0.5] };
   var _col = (m, c) => [m[c], m[4 + c], m[8 + c]];
   var _nrm3 = (v) => {
@@ -75481,6 +75484,33 @@ volumeActor.getProperty().${removedMethodName}()
     }
     return null;
   }
+  function inThreeDQuadrant(cx, cy) {
+    if (!_fourUp) return false;
+    if (_maxView === "threeD") return true;
+    if (_maxView) return false;
+    const r = host.getBoundingClientRect();
+    const x2 = (cx - r.left) / r.width, y = 1 - (cy - r.top) / r.height;
+    const v = _VPRECT.threeD;
+    return x2 >= v[0] && x2 <= v[2] && y >= v[1] && y <= v[3];
+  }
+  function world3DAt(cx, cy) {
+    if (!geom) return null;
+    const r = host.getBoundingClientRect();
+    const px = (cx - r.left) * (geom.cw / r.width), py = (cy - r.top) * (geom.ch / r.height);
+    const aspect = geom.cw / geom.ch, F = renderer.getActiveCamera().getFocalPoint();
+    const Fn = renderer.worldToNormalizedDisplay(F[0], F[1], F[2], aspect);
+    const W = renderer.normalizedDisplayToWorld(px / geom.cw, 1 - py / geom.ch, Fn[2], aspect);
+    return W && isFinite(W[0]) ? [W[0], W[1], W[2]] : null;
+  }
+  function shiftWorldAt(cx, cy) {
+    const w = sliceWorldAt(cx, cy);
+    if (w) return w;
+    if (inThreeDQuadrant(cx, cy)) {
+      const ras = world3DAt(cx, cy);
+      if (ras) return { name: null, ras };
+    }
+    return null;
+  }
   function jumpOthersTo(ras, exceptName) {
     for (const name of ["Red", "Yellow", "Green"]) {
       if (name === exceptName) continue;
@@ -75508,7 +75538,7 @@ volumeActor.getProperty().${removedMethodName}()
   host.addEventListener("pointermove", (e) => {
     if (!_fourUp || !e.shiftKey) return;
     if (_sliceDrag) return;
-    const w = sliceWorldAt(e.clientX, e.clientY);
+    const w = shiftWorldAt(e.clientX, e.clientY);
     if (!w) return;
     e.stopPropagation();
     jumpOthersTo(w.ras, w.name);
@@ -75523,21 +75553,26 @@ volumeActor.getProperty().${removedMethodName}()
       e.preventDefault();
       return;
     }
+    if (e.shiftKey && (e.button === 0 || e.button === 2)) {
+      const over = !!fourUpSlotAt(e.clientX, e.clientY) || inThreeDQuadrant(e.clientX, e.clientY);
+      if (over) {
+        e.stopPropagation();
+        e.preventDefault();
+        if (e.button === 2) {
+          _sliceDrag = { mode: "zoomAll", x: e.clientX, y: e.clientY, acc: 0 };
+          window.addEventListener("pointermove", onSliceDrag, true);
+          window.addEventListener("pointerup", onSliceUp, true);
+        } else {
+          const w = shiftWorldAt(e.clientX, e.clientY);
+          if (w) jumpOthersTo(w.ras, w.name);
+        }
+        return;
+      }
+    }
     const slot = fourUpSlotAt(e.clientX, e.clientY);
     if (!slot) return;
     e.stopPropagation();
     e.preventDefault();
-    if (e.shiftKey) {
-      if (e.button === 2) {
-        _sliceDrag = { slot, mode: "zoomAll", x: e.clientX, y: e.clientY, acc: 0 };
-        window.addEventListener("pointermove", onSliceDrag, true);
-        window.addEventListener("pointerup", onSliceUp, true);
-        return;
-      }
-      const w = sliceWorldAt(e.clientX, e.clientY);
-      if (w) jumpOthersTo(w.ras, w.name);
-      return;
-    }
     const mode = e.button === 2 ? "zoom" : e.button === 1 ? "pan" : e.button === 0 ? "scroll" : null;
     if (!mode) return;
     _sliceDrag = { slot, mode, x: e.clientX, y: e.clientY, acc: 0 };
@@ -75560,14 +75595,20 @@ volumeActor.getProperty().${removedMethodName}()
       }
       return;
     }
-    const ps = slot.pscale || slot.fov / 2;
-    if (mode === "zoom" || mode === "zoomAll") {
+    if (mode === "zoomAll") {
       const f = Math.exp(-dy * 6e-3);
-      if (mode === "zoomAll") for (const nm of ["Red", "Green", "Yellow"]) {
+      for (const nm of ["Red", "Green", "Yellow"]) {
         const so = _fourUp[nm];
         if (so) so.pscale = Math.max(0.5, (so.pscale || so.fov / 2) * f);
       }
-      else slot.pscale = Math.max(0.5, ps * f);
+      slicerDolly(renderer, 1 / f);
+      slicesDirty = true;
+      scene3DDirty = true;
+      return;
+    }
+    const ps = slot.pscale || slot.fov / 2;
+    if (mode === "zoom") {
+      slot.pscale = Math.max(0.5, ps * Math.exp(-dy * 6e-3));
     } else {
       const qh = (geom ? geom.ch : 1e3) / 2, worldPerPx = ps * 2 / qh;
       const mvx = -dx * worldPerPx, mvy = dy * worldPerPx, p = slot.pan || [0, 0, 0];
