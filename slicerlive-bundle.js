@@ -76961,7 +76961,13 @@ volumeActor.getProperty().${removedMethodName}()
     const openIfClosed = () => {
       if (!_ctrlMenu) openCtrlMenu();
     };
-    _ctrlBtn.onmouseenter = openIfClosed;
+    _ctrlBtn.onmouseenter = (ev) => {
+      if (ev && ev.shiftKey) return;
+      openIfClosed();
+    };
+    _ctrlBtn.onmousemove = (ev) => {
+      if (ev && ev.shiftKey && _ctrlMenu) closeCtrlMenu();
+    };
     _ctrlBtn.onclick = (ev) => {
       ev.stopPropagation();
       openIfClosed();
