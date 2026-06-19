@@ -76741,6 +76741,19 @@ volumeActor.getProperty().${removedMethodName}()
   var _segOutline = true;
   var _ctrlBtn = null;
   var _ctrlMenu = null;
+  var _shiftDown = false;
+  var _trackShift = (e) => {
+    _shiftDown = !!e.shiftKey;
+    if (_shiftDown && _ctrlMenu && _ctrlBtn && _ctrlBtn.matches(":hover")) closeCtrlMenu();
+  };
+  window.addEventListener("pointermove", _trackShift, true);
+  window.addEventListener("pointerdown", _trackShift, true);
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "Shift") _shiftDown = true;
+  }, true);
+  window.addEventListener("keyup", (e) => {
+    if (e.key === "Shift") _shiftDown = false;
+  }, true);
   var _segVis = {};
   var _rotCenterSet = false;
   var _idcRotCenter = null;
@@ -76962,11 +76975,11 @@ volumeActor.getProperty().${removedMethodName}()
       if (!_ctrlMenu) openCtrlMenu();
     };
     _ctrlBtn.onmouseenter = (ev) => {
-      if (ev && ev.shiftKey) return;
+      if (ev && ev.shiftKey || _shiftDown) return;
       openIfClosed();
     };
     _ctrlBtn.onmousemove = (ev) => {
-      if (ev && ev.shiftKey && _ctrlMenu) closeCtrlMenu();
+      if ((ev && ev.shiftKey || _shiftDown) && _ctrlMenu) closeCtrlMenu();
     };
     _ctrlBtn.onclick = (ev) => {
       ev.stopPropagation();
