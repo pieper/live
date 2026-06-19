@@ -75096,6 +75096,7 @@ volumeActor.getProperty().${removedMethodName}()
     });
   };
   var _fourUp = null;
+  window.__fourUpDbg = () => _fourUp ? Object.fromEntries(["Red", "Green", "Yellow"].map((n) => [n, _fourUp[n] ? { index: _fourUp[n].index, pscale: Math.round(_fourUp[n].pscale || 0) } : null])) : null;
   var _VP = { Red: [0, 0.5, 0.5, 1], Yellow: [0.5, 0, 1, 0.5], Green: [0, 0, 0.5, 0.5] };
   var _col = (m, c) => [m[c], m[4 + c], m[8 + c]];
   var _nrm3 = (v) => {
@@ -75506,6 +75507,7 @@ volumeActor.getProperty().${removedMethodName}()
   }, true);
   host.addEventListener("pointermove", (e) => {
     if (!_fourUp || !e.shiftKey) return;
+    if (_sliceDrag) return;
     const w = sliceWorldAt(e.clientX, e.clientY);
     if (!w) return;
     e.stopPropagation();
@@ -75526,6 +75528,12 @@ volumeActor.getProperty().${removedMethodName}()
     e.stopPropagation();
     e.preventDefault();
     if (e.shiftKey) {
+      if (e.button === 2) {
+        _sliceDrag = { slot, mode: "zoomAll", x: e.clientX, y: e.clientY, acc: 0 };
+        window.addEventListener("pointermove", onSliceDrag, true);
+        window.addEventListener("pointerup", onSliceUp, true);
+        return;
+      }
       const w = sliceWorldAt(e.clientX, e.clientY);
       if (w) jumpOthersTo(w.ras, w.name);
       return;
@@ -75553,8 +75561,13 @@ volumeActor.getProperty().${removedMethodName}()
       return;
     }
     const ps = slot.pscale || slot.fov / 2;
-    if (mode === "zoom") {
-      slot.pscale = Math.max(0.5, ps * Math.exp(-dy * 6e-3));
+    if (mode === "zoom" || mode === "zoomAll") {
+      const f = Math.exp(-dy * 6e-3);
+      if (mode === "zoomAll") for (const nm of ["Red", "Green", "Yellow"]) {
+        const so = _fourUp[nm];
+        if (so) so.pscale = Math.max(0.5, (so.pscale || so.fov / 2) * f);
+      }
+      else slot.pscale = Math.max(0.5, ps * f);
     } else {
       const qh = (geom ? geom.ch : 1e3) / 2, worldPerPx = ps * 2 / qh;
       const mvx = -dx * worldPerPx, mvy = dy * worldPerPx, p = slot.pan || [0, 0, 0];
