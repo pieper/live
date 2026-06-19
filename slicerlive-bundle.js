@@ -75238,7 +75238,7 @@ volumeActor.getProperty().${removedMethodName}()
         if (lm) {
           const ovm = VolumeMapper_default.newInstance();
           ovm.setInputData(lm.img);
-          ovm.setBlendModeToComposite();
+          ovm.setBlendModeToMaximumIntensity();
           ovm.setSampleDistance(0.5);
           ovm.setAutoAdjustSampleDistances(false);
           ovm.setMaximumSamplesPerRay(4e3);
