@@ -53,6 +53,10 @@
   // load the bundle cache-busted so a fresh build is always picked up (dev loop) and a Pages/CDN deploy
   // never serves a stale cached copy. The globals above are already set, so the bundle reads them on eval.
   (function () { var s = document.createElement('script'); s.src = 'slicerlive-bundle.js?t=' + Date.now(); document.body.appendChild(s); })();
+  // Self-contained help overlay: "?" button in the upper-left opens a cheat sheet
+  // of mouse / trackpad / keyboard bindings. Adds no integration with the bundle
+  // -- the script self-installs on DOMContentLoaded. Same cache-bust as above.
+  (function () { var s = document.createElement('script'); s.src = 'help-overlay.js?t=' + Date.now(); document.body.appendChild(s); })();
 </script>
 </body>
 </html>
