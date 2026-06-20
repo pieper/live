@@ -131,7 +131,18 @@ async function buildVolume(ctKeys) {
 // Map each SEG frame pixel (col,row) -> CT IJK using the SEG's OWN ImageOrientation/Position (per frame, oblique-
 // safe) -- the SEG may be stored flipped vs the CT (here colDir is negated), so a naive (col,row)->(i,j) is wrong.
 function buildLabelmap(ds, bits, ct) {
-  const [nx, ny, nz] = ct.dims, frameBytes = (nx * ny) >> 3;
+  // The SEG may be authored at a DIFFERENT grid from the reference volume
+  // (e.g. ReMIND-049 cerebrum SEG is 336x268x224 at 0.488 mm while the
+  // reference T1+contrast is 256x224x192 at 0.977 mm). So iterate over the
+  // SEG's OWN (Rows, Columns) for byte indexing -- the world-space-to-ref-IJK
+  // mapping below already uses the SEG's IOP/PixelSpacing, so the geometry is
+  // correct; only the byte iteration was wrong (it used ct.dims, which
+  // misindexes a different-resolution SEG and reads scrambled bits, producing
+  // a bbox-shaped block in the rendered surface).
+  const [nx, ny, nz] = ct.dims;                              // REFERENCE volume dims (target labelmap shape)
+  const segCols = Number(ds.Columns) || nx;                  // SEG's own grid (x direction inside a frame)
+  const segRows = Number(ds.Rows)    || ny;                  // SEG's own grid (y direction inside a frame)
+  const frameBytes = (segCols * segRows + 7) >> 3;           // bitpacked SEG frame size, round up
   const lab = new Uint8Array(nx * ny * nz);
   const M = ct.ijkToRAS, inv = invAffine(M);
   const toIJK = (lps) => { const r = lps2ras(lps); return [
@@ -152,8 +163,8 @@ function buildLabelmap(ds, bits, ct) {
   const seenSeg = new Set();
   const perFrame = ds.PerFrameFunctionalGroupsSequence || [];
   const ref = (perFrame[0]?.PlanePositionSequence?.[0]?.ImagePositionPatient || [0, 0, 0]).map(Number), o0 = toIJK(ref);
-  const diCol = sub(toIJK([ref[0] + colW[0], ref[1] + colW[1], ref[2] + colW[2]]), o0);   // IJK step per +1 column
-  const diRow = sub(toIJK([ref[0] + rowW[0], ref[1] + rowW[1], ref[2] + rowW[2]]), o0);   // IJK step per +1 row
+  const diCol = sub(toIJK([ref[0] + colW[0], ref[1] + colW[1], ref[2] + colW[2]]), o0);   // ref-IJK step per +1 SEG column
+  const diRow = sub(toIJK([ref[0] + rowW[0], ref[1] + rowW[1], ref[2] + rowW[2]]), o0);   // ref-IJK step per +1 SEG row
   for (let f = 0; f < perFrame.length; f++) {
     const fg = perFrame[f];
     const segNum = fg.SegmentIdentificationSequence?.[0]?.ReferencedSegmentNumber;
@@ -161,9 +172,9 @@ function buildLabelmap(ds, bits, ct) {
     if (!segNum || !ippLps) continue;
     if (!seenSeg.has(segNum)) { seenSeg.add(segNum); post({ t: 'seg', name: names[segNum] || ('Segment ' + segNum) }); }
     const o = toIJK(ippLps), fb = f * frameBytes;
-    for (let row = 0; row < ny; row++) {
-      const bi = o[0] + row * diRow[0], bj = o[1] + row * diRow[1], bk = o[2] + row * diRow[2], rb = row * nx;
-      for (let col = 0; col < nx; col++) {
+    for (let row = 0; row < segRows; row++) {
+      const bi = o[0] + row * diRow[0], bj = o[1] + row * diRow[1], bk = o[2] + row * diRow[2], rb = row * segCols;
+      for (let col = 0; col < segCols; col++) {
         const p = rb + col;
         if (!((bits[fb + (p >> 3)] >> (p & 7)) & 1)) continue;
         const i = Math.round(bi + col * diCol[0]), j = Math.round(bj + col * diCol[1]), k = Math.round(bk + col * diCol[2]);
