@@ -12,6 +12,12 @@
   "desc": "Native multivolume — two independent volumes composited in one ray-march via the field-based SceneRenderer (generated WGSL, per-sample OVER). The field spine that will carry segmentation + ColorizeVolume next. Drag to orbit."
  },
  {
+  "name": "WebGPU: ColorizeVolume (segmentation)",
+  "page": "webgpu/colorize.html",
+  "thumb": "colorize.png",
+  "desc": "A segmentation labelmap baked on the GPU into a smooth colored volume (palette → separable Gaussian → rgba16float) and ray-marched — the native replacement for surface models, and the exact path an interactive nnLive mask will take. Drag to orbit."
+ },
+ {
   "name": "TotalSegmentator-CT",
   "scene": "TotalSegmentator-CT.json",
   "thumb": "TotalSegmentator-CT.png",
