@@ -1,5 +1,11 @@
 [
  {
+  "name": "WebGPU LiveRenderer (preview)",
+  "page": "webgpu/dvr-sphere.html",
+  "thumb": "dvr-sphere.png",
+  "desc": "NEW rendering backbone — a step-based volume ray-marcher in TypeScript/WebGPU, ported from slicer-wgpu, running the same code in the browser and natively under Deno. Drag to orbit. (Synthetic volume; the future replacement for the vtk.js path.)"
+ },
+ {
   "name": "TotalSegmentator-CT",
   "scene": "TotalSegmentator-CT.json",
   "thumb": "TotalSegmentator-CT.png",

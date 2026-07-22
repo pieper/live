@@ -34,7 +34,9 @@
     for (const s of scenes) {
       const a = document.createElement('a');
       a.className = 'card'; a.target = '_blank';
-      a.href = s.url ? ('viewer.html?' + s.url) : ('viewer.html?scene=scenes/' + encodeURIComponent(s.scene));
+      a.href = s.page ? s.page
+        : s.url ? ('viewer.html?' + s.url)
+        : ('viewer.html?scene=scenes/' + encodeURIComponent(s.scene));
       const img = document.createElement('img'); img.src = 'scenes/' + s.thumb; img.onerror = () => { img.style.display = 'none'; };
       const t = document.createElement('div'); t.className = 't';
       t.innerHTML = '<div class="n"></div><div class="d"></div>';
