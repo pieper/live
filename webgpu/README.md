@@ -19,6 +19,10 @@ deno run -A npm:esbuild render/demos/real-browser.ts \
 ```
 
 ## Demos
+- `nnlive.html` — **interactive segmentation**: a real CT in the 4-up where each click runs nnLive's ONNX model
+  (ORT-Web WebGPU, via `nnlive-worker.js`) on a 64³ patch → mask → ColorizeVolume overlay. The model loads from its
+  weights host; `?model=<url>` overrides, and a region-grow stub (`SyntheticSegmenter`) is the fallback. The
+  SlicerLive-side encode/splat/bake/render is in `render/live-segmenter.ts` (headless-tested via `test/render-nnlive.ts`).
 - `real.html` — **real data**: a live SlicerLive scene (MRHead) whose chunked OME-Zarr volume is
   streamed from the Jetstream2 bucket and gunzipped in-browser, then rendered as 3 MPR planes + a 3D
   volume render using the scene's transfer function and true rotated IJK→RAS geometry. `?scene=<url>`

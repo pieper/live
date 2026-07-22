@@ -1,5 +1,11 @@
 [
  {
+  "name": "nnLive — interactive segmentation (4-up)",
+  "page": "webgpu/nnlive.html",
+  "thumb": "nnlive.png",
+  "desc": "The payoff: a real CT in the SlicerLive 4-up where each click runs nnLive's interactive segmentation (a distilled nnInteractive ONNX net on a 64³ GPU patch) → mask → ColorizeVolume, shown live as a colored 3D volume + MPR overlay with a pushpin per click. Shift-click adds a background point. The SlicerLive pipeline is all here; the nnLive model loads from its weights host (?model=), with a region-grow stub fallback."
+ },
+ {
   "name": "WebGPU real scene — MRHead (MPR + 3D VR)",
   "page": "webgpu/real.html",
   "thumb": "real-mrhead.png",
