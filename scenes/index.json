@@ -25,20 +25,23 @@
  },
  {
   "name": "TotalSegmentator-CT",
-  "scene": "TotalSegmentator-CT.json",
+  "page": "legacy/viewer.html?scene=scenes/TotalSegmentator-CT.json",
   "thumb": "TotalSegmentator-CT.png",
+  "legacy": true,
   "desc": "NLST chest CT with 73 TotalSegmentator organ & bone segmentations (IDC) \u2014 3D surfaces + colored MPR overlays"
  },
  {
   "name": "IDC: TotalSegmentator",
-  "url": "ct=74eb30a8-27ff-442e-8a38-22b57c52cadd&seg=ff9a3d4f-c4e6-4403-9cd5-d7bc517dc488",
+  "page": "legacy/viewer.html?ct=74eb30a8-27ff-442e-8a38-22b57c52cadd&seg=ff9a3d4f-c4e6-4403-9cd5-d7bc517dc488",
   "thumb": "IDC-TotalSegmentator.png",
+  "legacy": true,
   "desc": "Streamed LIVE from the NCI IDC AWS bucket + parsed in your browser with dcmjs \u2014 NLST chest CT + 73 TotalSegmentator organ/bone segments. No server, no pre-processing (~150 MB, give it a moment)."
  },
  {
   "name": "MRHead",
-  "scene": "MRHead.json",
+  "page": "legacy/viewer.html?scene=scenes/MRHead.json",
   "thumb": "MRHead.png",
+  "legacy": true,
   "desc": "MR head \u2014 volume rendering + 4-up (axial / sagittal / coronal)"
  }
 ]

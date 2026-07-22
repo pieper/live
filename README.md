@@ -18,7 +18,12 @@ That exports the scene (node-state JSON + blobs) via the offload serializer, upl
 bucket, writes `scenes/MyScene.json` + a thumbnail + a gallery entry, and commits + pushes.
 
 ## Layout
-- `index.html` — the thumbnail gallery.
-- `viewer.html` + `slicerlive-bundle.js` — the SlicerLive viewer (committed so Pages can serve it).
-- `scenes/` — `<name>.json` (scene wrapper) + `<name>.png` (thumbnail) + `index.json` (gallery manifest).
-- `publish.py` — the one-command publisher.
+- `index.html` — the thumbnail gallery (two sections: **WebGPU LiveRenderer** and **Legacy**).
+- `webgpu/` — the new WebGPU LiveRenderer demos (TS ported from [slicer-wgpu](https://github.com/pieper/slicer-wgpu);
+  source lives in the SlicerLive repo under `render/`, committed here as bundled `.js`). See `webgpu/README.md`.
+- `legacy/` — the vtk.js viewer (`viewer.html` + `slicerlive-bundle.js` + `idc-worker.js` + `help-overlay.js` +
+  `segroulette.json` + its `scenes/*.json`), kept servable while the WebGPU path reaches parity.
+- `scenes/` — `<name>.png` (thumbnails) + `index.json` (gallery manifest; `legacy:true` marks a Legacy card,
+  `page` is the target URL).
+- `publish.py` — the one-command publisher for the **legacy** vtk.js flow (writes into `legacy/scenes/` — update
+  paths if reused).

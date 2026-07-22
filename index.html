@@ -2,13 +2,15 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>SlicerLive — scene gallery</title>
+<title>SlicerLive — gallery</title>
 <style>
   body { margin: 0; background: #14141c; color: #d8d8e0; font-family: -apple-system, system-ui, sans-serif; }
   header { padding: 18px 24px; border-bottom: 1px solid #2a2a3a; }
   h1 { margin: 0; font-size: 21px; letter-spacing: .2px; }
   .sub { opacity: .6; font-size: 13px; margin-top: 5px; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 16px; padding: 24px; }
+  h2 { font-size: 14px; letter-spacing: .3px; text-transform: uppercase; color: #9fb3d0; margin: 26px 24px 0; }
+  h2 .n { opacity: .55; text-transform: none; font-weight: 400; margin-left: 8px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 16px; padding: 14px 24px 8px; }
   a.card { display: block; background: #1e1e2a; border: 1px solid #2a2a3a; border-radius: 8px; overflow: hidden;
            text-decoration: none; color: inherit; transition: .15s; }
   a.card:hover { border-color: #4a90d9; transform: translateY(-2px); }
@@ -16,6 +18,9 @@
   .card .t { padding: 11px 13px; }
   .card .n { font-weight: 600; }
   .card .d { opacity: .6; font-size: 12px; margin-top: 3px; }
+  .badge { display: inline-block; font-size: 10px; color: #04121c; background: linear-gradient(180deg, #9fe9ff, #54c6f0);
+           font-weight: 700; border-radius: 4px; padding: 0 5px; vertical-align: middle; margin-left: 6px; }
+  #legacy-wrap .grid { opacity: .82; }
   .empty { padding: 44px; opacity: .55; }
   a.gh { color: #7fa8e0; font-size: 12px; text-decoration: none; }
 </style>
@@ -23,27 +28,41 @@
 <body>
 <header>
   <h1>SlicerLive</h1>
-  <div class="sub">Live 3D Slicer scenes — rendered in your browser on your own GPU, no install. Click a scene to open it.
+  <div class="sub">Live 3D Slicer scenes — rendered in your browser on your own GPU, no install. Click a card to open it.
     &nbsp;·&nbsp; <a class="gh" href="https://github.com/pieper/SlicerLive" target="_blank">github.com/pieper/SlicerLive</a></div>
 </header>
-<div class="grid" id="grid"><div class="empty">loading…</div></div>
+
+<h2>WebGPU LiveRenderer <span class="n">the new native rendering backbone (browser + Deno)</span></h2>
+<div class="grid" id="grid-webgpu"><div class="empty">loading…</div></div>
+
+<div id="legacy-wrap" style="display:none">
+  <h2>Legacy <span class="n">vtk.js viewer — kept servable while the WebGPU path reaches parity</span></h2>
+  <div class="grid" id="grid-legacy"></div>
+</div>
+
 <script>
+  function card(s) {
+    const a = document.createElement('a');
+    a.className = 'card'; a.target = '_blank'; a.href = s.page;
+    const img = document.createElement('img'); img.src = 'scenes/' + s.thumb; img.onerror = () => { img.style.display = 'none'; };
+    const t = document.createElement('div'); t.className = 't';
+    t.innerHTML = '<div class="n"></div><div class="d"></div>';
+    t.querySelector('.n').textContent = s.name;
+    if (!s.legacy) t.querySelector('.n').innerHTML += '<span class="badge">WebGPU</span>';
+    t.querySelector('.d').textContent = s.desc || '';
+    a.appendChild(img); a.appendChild(t); return a;
+  }
   fetch('scenes/index.json').then((r) => r.json()).then((scenes) => {
-    const g = document.getElementById('grid'); g.innerHTML = '';
-    if (!scenes.length) { g.innerHTML = '<div class="empty">No scenes yet — publish one with <code>publish.py</code>.</div>'; return; }
-    for (const s of scenes) {
-      const a = document.createElement('a');
-      a.className = 'card'; a.target = '_blank';
-      a.href = s.page ? s.page
-        : s.url ? ('viewer.html?' + s.url)
-        : ('viewer.html?scene=scenes/' + encodeURIComponent(s.scene));
-      const img = document.createElement('img'); img.src = 'scenes/' + s.thumb; img.onerror = () => { img.style.display = 'none'; };
-      const t = document.createElement('div'); t.className = 't';
-      t.innerHTML = '<div class="n"></div><div class="d"></div>';
-      t.querySelector('.n').textContent = s.name; t.querySelector('.d').textContent = s.desc || '';
-      a.appendChild(img); a.appendChild(t); g.appendChild(a);
+    const gw = document.getElementById('grid-webgpu'), gl = document.getElementById('grid-legacy');
+    gw.innerHTML = '';
+    const webgpu = scenes.filter((s) => !s.legacy), legacy = scenes.filter((s) => s.legacy);
+    if (!webgpu.length) gw.innerHTML = '<div class="empty">No demos yet.</div>';
+    for (const s of webgpu) gw.appendChild(card(s));
+    if (legacy.length) {
+      document.getElementById('legacy-wrap').style.display = '';
+      for (const s of legacy) gl.appendChild(card(s));
     }
-  }).catch(() => { document.getElementById('grid').innerHTML = '<div class="empty">No scenes index yet.</div>'; });
+  }).catch(() => { document.getElementById('grid-webgpu').innerHTML = '<div class="empty">No scenes index yet.</div>'; });
 </script>
 </body>
 </html>
