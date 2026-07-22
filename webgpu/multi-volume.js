@@ -159,7 +159,8 @@ var SceneRenderer = class {
     for (const p of this.placed) entries.push(...p.field.bindEntries(p.slot, p.bbase));
     this.bind = this.dev.createBindGroup({ layout: this.pipeline.getBindGroupLayout(0), entries });
     this.setBackground(0.07, 0.08, 0.12);
-    this.setSampleStep(1);
+    const step = this.placed.length ? Math.min(...this.placed.map((p) => p.field.sampleStep())) : 1;
+    this.setSampleStep(step * 0.7);
     this.recomputeBounds();
     for (const p of this.placed) p.field.fillUniforms(this.mat, p.uoff);
   }
@@ -197,6 +198,7 @@ fn srgb2physical(c : vec3<f32>) -> vec3<f32> {
   return select(lo, hi, c > vec3<f32>(0.04045));
 }
 fn ndc_to_world(ndc : vec4<f32>) -> vec3<f32> { let w = u_cam.inv_view_proj * ndc; return w.xyz / w.w; }
+fn ign(p : vec2<f32>) -> f32 { return fract(52.9829189 * fract(dot(p, vec2<f32>(0.06711056, 0.00583715)))); }
 ${fns}
 
 @fragment
@@ -220,14 +222,14 @@ fn fs_main(v : Varyings) -> @location(0) vec4<f32> {
   t_near = max(t_near + step, 0.0);
   t_far  = t_far - step;
   if (t_far <= t_near) { return vec4<f32>(bg, 1.0); }
-  let seed = fract(sin(dot(vec3<f32>(v.position.xy, 0.0), vec3<f32>(12.9898, 78.233, 37.719))) * 43758.5453);
-  var t = t_near + seed * step;
-
+  let seed = ign(v.position.xy);
+  var t = t_near;
   var integrated = vec4<f32>(0.0);
   var safety : i32 = 0;
   loop {
     if (t >= t_far || safety >= 5000 || integrated.a >= 0.99) { break; }
-    let wp = ro + rd * t;
+    let js = fract(sin(dot(v.position.xy + vec2<f32>(f32(safety) * 0.7548, f32(safety) * 0.5698), vec2<f32>(12.9898, 78.233))) * 43758.5453) - 0.5; // per-(pixel,sample) jitter
+    let wp = ro + rd * (t + js * step);
     var sum = vec4<f32>(0.0);
 ${dispatch}
     if (sum.a > 0.0) { integrated = integrated + (1.0 - integrated.a) * vec4<f32>(sum.rgb, clamp(sum.a, 0.0, 1.0)); }
@@ -323,6 +325,7 @@ var ImageField = class {
   clim;
   shade;
   unit;
+  stepMm;
   box;
   constructor(dev, data, dims, spacing, lut, opts) {
     const center = opts.center ?? [0, 0, 0];
@@ -334,7 +337,8 @@ var ImageField = class {
     this.box = volumeAABB(dims, spacing, center);
     this.clim = opts.clim;
     this.shade = opts.shade ?? [0.35, 0.75, 0.35, 20];
-    this.unit = opts.opacityUnitDistance ?? Math.min(...spacing);
+    this.stepMm = Math.min(...spacing);
+    this.unit = opts.opacityUnitDistance ?? this.stepMm;
   }
   uniformFloats() {
     return 28;
@@ -342,6 +346,9 @@ var ImageField = class {
   // mat4(16) + clim(4) + shade(4) + params(4)
   aabb() {
     return this.box;
+  }
+  sampleStep() {
+    return this.stepMm;
   }
   structMembers(s) {
     return [
@@ -379,7 +386,7 @@ fn sample_field_img${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
   let unit = max(u_material.img${s}_params.x, 1e-3);
   let opacity = clamp(1.0 - pow(1.0 - clamp(tf.a, 0.0, 1.0), step / unit), 0.0, 1.0);
   if (opacity <= 0.001) { return vec4<f32>(0.0); }
-  let h = step;
+  let h = step * 2.0;   // wider central difference -> smoother normals (less shading aliasing on coarse volumes)
   let g = vec3<f32>(
     sampc_img${s}(wp + vec3<f32>(h,0,0)) - sampc_img${s}(wp - vec3<f32>(h,0,0)),
     sampc_img${s}(wp + vec3<f32>(0,h,0)) - sampc_img${s}(wp - vec3<f32>(0,h,0)),

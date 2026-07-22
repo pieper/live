@@ -1,5 +1,11 @@
 [
  {
+  "name": "WebGPU 4-up (MPR + 3D)",
+  "page": "webgpu/fourup.html",
+  "thumb": "fourup.png",
+  "desc": "The Slicer-style 4-up, native in WebGPU — three MPR planes (windowed CT + colored segmentation overlay) + a 3D ColorizeVolume view, all from the same GPU textures. The replacement for the vtk.js 4-up. Scroll a slice to scrub; drag 3D to orbit."
+ },
+ {
   "name": "WebGPU LiveRenderer (preview)",
   "page": "webgpu/dvr-sphere.html",
   "thumb": "dvr-sphere.png",

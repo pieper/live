@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SlicerLive — WebGPU 4-up (MPR + 3D)</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #0e0e16; color: #d8d8e0; font-family: -apple-system, system-ui, sans-serif; }
+  header { padding: 16px 22px; border-bottom: 1px solid #2a2a3a; }
+  h1 { margin: 0; font-size: 19px; }
+  .sub { opacity: .65; font-size: 13px; margin-top: 5px; max-width: 820px; line-height: 1.5; }
+  .badge { display: inline-block; font-size: 11px; color: #04121c; background: linear-gradient(180deg, #9fe9ff, #54c6f0);
+           font-weight: 700; border-radius: 5px; padding: 1px 7px; vertical-align: middle; margin-left: 6px; }
+  a { color: #7fa8e0; }
+  main { display: flex; flex-direction: column; align-items: center; padding: 18px; gap: 10px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; width: min(760px, 94vw); }
+  .cell { position: relative; aspect-ratio: 1; }
+  .cell canvas { width: 100%; height: 100%; display: block; border-radius: 6px; background: #000; touch-action: none; }
+  .cell .lab { position: absolute; top: 6px; left: 8px; font-size: 11px; font-weight: 700; letter-spacing: .3px; opacity: .9; }
+  #c-axial { cursor: ns-resize; } #c-coronal { cursor: ns-resize; } #c-sagittal { cursor: ns-resize; } #c-threeD { cursor: grab; }
+  .lab.red { color: #f05a5a; } .lab.green { color: #5ad07a; } .lab.yellow { color: #e8c85a; } .lab.d3 { color: #9fe9ff; }
+  #status { font-size: 12px; color: #9fb3d0; min-height: 1.4em; font-family: ui-monospace, monospace; }
+</style>
+</head>
+<body>
+<header>
+  <h1>WebGPU 4-up — MPR + 3D <span class="badge">preview</span></h1>
+  <div class="sub">The Slicer-style 4-up, natively in WebGPU: three orthogonal MPR planes (windowed grayscale +
+    colored segmentation overlay) and a 3D ColorizeVolume view — all from the same GPU textures via the field-based
+    renderer. This is the replacement for the vtk.js 4-up. Scroll a slice to scrub through it; drag the 3D view to
+    orbit. &nbsp;·&nbsp; <a href="https://github.com/pieper/SlicerLive" target="_blank">SlicerLive</a></div>
+</header>
+<main>
+  <div class="grid">
+    <div class="cell"><span class="lab red">AXIAL</span><canvas id="c-axial"></canvas></div>
+    <div class="cell"><span class="lab d3">3D</span><canvas id="c-threeD"></canvas></div>
+    <div class="cell"><span class="lab green">CORONAL</span><canvas id="c-coronal"></canvas></div>
+    <div class="cell"><span class="lab yellow">SAGITTAL</span><canvas id="c-sagittal"></canvas></div>
+  </div>
+  <div id="status">loading…</div>
+</main>
+<script type="module" src="./fourup.js"></script>
+</body>
+</html>

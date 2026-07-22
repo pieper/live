@@ -314,6 +314,170 @@ ${dispatch}
   }
 };
 
+// render/slice-renderer.ts
+var DEFAULT_FORMAT2 = "rgba8unorm-srgb";
+var SHADER = (
+  /* wgsl */
+  `
+struct U { a : vec4<f32>, b : vec4<f32> };  // a: axis, offset, win, lev ; b: overlayOpacity, sizeX, sizeY, _
+@group(0) @binding(0) var<uniform> u : U;
+@group(0) @binding(1) var s_lin : sampler;
+@group(0) @binding(2) var t_scalar : texture_3d<f32>;
+@group(0) @binding(3) var t_overlay : texture_3d<f32>;
+
+struct V { @builtin(position) position : vec4<f32> };
+@vertex
+fn vs_main(@builtin(vertex_index) vi : u32) -> V {
+  let x = select(-1.0, 3.0, vi == 1u);
+  let y = select(-1.0, 3.0, vi == 2u);
+  var o : V; o.position = vec4<f32>(x, y, 0.0, 1.0); return o;
+}
+fn srgb2physical(c : vec3<f32>) -> vec3<f32> {
+  let lo = c / 12.92; let hi = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+  return select(lo, hi, c > vec3<f32>(0.04045));
+}
+@fragment
+fn fs_main(v : V) -> @location(0) vec4<f32> {
+  let uv = v.position.xy / vec2<f32>(u.b.y, u.b.z);      // [0,1] within this view
+  let s = u.a.y;
+  let axis = u32(u.a.x);
+  var tex : vec3<f32>;
+  if (axis == 0u) { tex = vec3<f32>(s, uv.x, uv.y); }        // sagittal (fix X)
+  else if (axis == 1u) { tex = vec3<f32>(uv.x, s, uv.y); }   // coronal  (fix Y)
+  else { tex = vec3<f32>(uv.x, uv.y, s); }                    // axial    (fix Z)
+  let val = textureSampleLevel(t_scalar, s_lin, tex, 0.0).r;
+  let win = max(u.a.z, 1e-6);
+  let g = clamp((val - (u.a.w - win * 0.5)) / win, 0.0, 1.0);
+  var col = vec3<f32>(g);
+  let ov = textureSampleLevel(t_overlay, s_lin, tex, 0.0);
+  col = mix(col, ov.rgb, clamp(ov.a * u.b.x, 0.0, 1.0));
+  return vec4<f32>(srgb2physical(col), 1.0);
+}
+`
+);
+var SliceRenderer = class {
+  dev;
+  format;
+  pipeline;
+  sampler;
+  ubuf;
+  u = new Float32Array(8);
+  // a(4) + b(4)
+  bind;
+  scalar;
+  overlay;
+  constructor(gpu, format = DEFAULT_FORMAT2) {
+    this.dev = gpu.device;
+    this.format = format;
+    const m = this.dev.createShaderModule({ code: SHADER });
+    this.pipeline = this.dev.createRenderPipeline({
+      layout: "auto",
+      vertex: { module: m, entryPoint: "vs_main" },
+      fragment: { module: m, entryPoint: "fs_main", targets: [{ format }] },
+      primitive: { topology: "triangle-list", cullMode: "none" }
+    });
+    this.sampler = this.dev.createSampler({ magFilter: "linear", minFilter: "linear", addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge", addressModeW: "clamp-to-edge" });
+    this.ubuf = this.dev.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.setWindowLevel(255, 127);
+    this.setSlice(2, 0.5);
+    this.setOverlayOpacity(0.55);
+  }
+  setTextures(scalar, overlay) {
+    this.scalar = scalar;
+    this.overlay = overlay;
+    this.bind = this.dev.createBindGroup({
+      layout: this.pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.ubuf } },
+        { binding: 1, resource: this.sampler },
+        { binding: 2, resource: scalar.createView() },
+        { binding: 3, resource: overlay.createView() }
+      ]
+    });
+  }
+  setSlice(axis, offset01) {
+    this.u[0] = axis;
+    this.u[1] = Math.max(0, Math.min(1, offset01));
+  }
+  setWindowLevel(win, lev) {
+    this.u[2] = win;
+    this.u[3] = lev;
+  }
+  setOverlayOpacity(o) {
+    this.u[4] = o;
+  }
+  drawInto(view, w, h) {
+    this.u[5] = w;
+    this.u[6] = h;
+    this.dev.queue.writeBuffer(this.ubuf, 0, this.u);
+    const enc = this.dev.createCommandEncoder();
+    const pass = enc.beginRenderPass({ colorAttachments: [{ view, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }] });
+    pass.setPipeline(this.pipeline);
+    pass.setBindGroup(0, this.bind);
+    pass.draw(3);
+    pass.end();
+    this.dev.queue.submit([enc.finish()]);
+  }
+  renderToView(view, w, h) {
+    this.drawInto(view, w, h);
+  }
+  async renderToRGBA(w, h) {
+    const target = this.dev.createTexture({ size: [w, h], format: this.format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+    this.drawInto(target.createView(), w, h);
+    const bpr = Math.ceil(w * 4 / 256) * 256;
+    const buf = this.dev.createBuffer({ size: bpr * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const enc = this.dev.createCommandEncoder();
+    enc.copyTextureToBuffer({ texture: target }, { buffer: buf, bytesPerRow: bpr, rowsPerImage: h }, [w, h]);
+    this.dev.queue.submit([enc.finish()]);
+    await buf.mapAsync(GPUMapMode.READ);
+    const padded = new Uint8Array(buf.getMappedRange());
+    const out = new Uint8Array(w * h * 4);
+    for (let y = 0; y < h; y++) out.set(padded.subarray(y * bpr, y * bpr + w * 4), y * w * 4);
+    buf.unmap();
+    target.destroy();
+    buf.destroy();
+    return out;
+  }
+};
+
+// render/demos/sphere-scene.ts
+var N = 128;
+var SPACING = [1.5, 1.5, 1.5];
+var clamp01 = (v) => Math.max(0, Math.min(1, v));
+function syntheticVolume() {
+  const data = new Float32Array(N * N * N);
+  const c = (N - 1) / 2;
+  const ic = [c + 16, c, c + 12];
+  for (let z = 0; z < N; z++) {
+    for (let y = 0; y < N; y++) {
+      for (let x = 0; x < N; x++) {
+        const ro = Math.hypot(x - c, y - c, z - c);
+        const ri = Math.hypot(x - ic[0], y - ic[1], z - ic[2]);
+        const soft = 45 * clamp01((44 - ro) / 3);
+        const dense = 210 * clamp01((20 - ri) / 3);
+        data[(z * N + y) * N + x] = Math.max(soft, dense);
+      }
+    }
+  }
+  return data;
+}
+function orbitEye(azimuth, elevation, distance) {
+  const ce = Math.cos(elevation);
+  return [
+    distance * ce * Math.sin(azimuth),
+    -distance * ce * Math.cos(azimuth),
+    distance * Math.sin(elevation)
+  ];
+}
+
+// render/textures.ts
+function createScalarTexture(dev, data, dims) {
+  const [dx, dy, dz] = dims;
+  const tex = dev.createTexture({ size: [dx, dy, dz], dimension: "3d", format: "r32float", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+  dev.queue.writeTexture({ texture: tex }, data, { bytesPerRow: dx * 4, rowsPerImage: dy }, [dx, dy, dz]);
+  return tex;
+}
+
 // render/bake.ts
 var INIT_WGSL = (
   /* wgsl */
@@ -371,7 +535,7 @@ function gaussHalfKernel(sigma) {
   for (let i = 0; i <= radius; i++) w[i] = raw[i] / total;
   return { radius, w };
 }
-function bakeColorizeRGBA(dev, labelmap, dims, palette2, sigmaVoxels = 1.5) {
+function bakeColorizeRGBA(dev, labelmap, dims, palette, sigmaVoxels = 1.5) {
   const [dx, dy, dz] = dims;
   const storageUsage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING;
   const labelTex = dev.createTexture({ size: dims, dimension: "3d", format: "r8uint", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
@@ -380,7 +544,7 @@ function bakeColorizeRGBA(dev, labelmap, dims, palette2, sigmaVoxels = 1.5) {
   const texB = dev.createTexture({ size: dims, dimension: "3d", format: "rgba16float", usage: storageUsage });
   const palBuf = dev.createBuffer({ size: 256 * 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const palData = new Float32Array(256 * 4);
-  palData.set(palette2.subarray(0, Math.min(palette2.length, 256 * 4)));
+  palData.set(palette.subarray(0, Math.min(palette.length, 256 * 4)));
   dev.queue.writeBuffer(palBuf, 0, palData);
   const dimsBuf = dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   dev.queue.writeBuffer(dimsBuf, 0, new Uint32Array([dx, dy, dz, 0]));
@@ -521,120 +685,122 @@ fn sample_field_rgba${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
   }
 };
 
-// render/demos/colorize-scene.ts
-var D = 200;
-var SP = 0.85;
-var DIST = 440;
-function makeLabelmap() {
-  const lab = new Uint8Array(D * D * D);
-  const c = (D - 1) / 2;
-  const blobs = [
-    [[c - 54, c, c], 40, 1],
-    [[c + 54, c, c], 40, 2],
-    [[c, c + 12, c + 54], 33, 3]
-  ];
-  for (let z = 0; z < D; z++) for (let y = 0; y < D; y++) for (let x = 0; x < D; x++) {
-    for (const [ctr, r, label] of blobs) {
-      if (Math.hypot(x - ctr[0], y - ctr[1], z - ctr[2]) <= r) {
-        lab[(z * D + y) * D + x] = label;
-        break;
-      }
-    }
+// render/demos/fourup-scene.ts
+function buildFourUpScene(dev) {
+  const dims = [N, N, N], spacing = [SPACING[0], SPACING[1], SPACING[2]];
+  const data = syntheticVolume();
+  const lab = new Uint8Array(N * N * N);
+  for (let i = 0; i < lab.length; i++) {
+    const v = data[i];
+    lab[i] = v >= 150 ? 1 : v >= 20 ? 2 : 0;
   }
-  return lab;
-}
-function palette() {
-  const p = new Float32Array(256 * 4);
+  const pal = new Float32Array(256 * 4);
   const set = (i, r, g, b, a) => {
-    p[i * 4] = r;
-    p[i * 4 + 1] = g;
-    p[i * 4 + 2] = b;
-    p[i * 4 + 3] = a;
+    pal[i * 4] = r;
+    pal[i * 4 + 1] = g;
+    pal[i * 4 + 2] = b;
+    pal[i * 4 + 3] = a;
   };
-  set(1, 0.9, 0.3, 0.26, 0.95);
-  set(2, 0.35, 0.8, 0.42, 0.95);
-  set(3, 0.35, 0.68, 0.95, 0.95);
-  return p;
-}
-function buildColorizeField(dev) {
-  const dims = [D, D, D], sp = [SP, SP, SP];
-  const tex = bakeColorizeRGBA(dev, makeLabelmap(), dims, palette(), 3);
-  return new RGBAVolumeField(tex, dims, sp, { opacityUnitDistance: SP, shade: [0.3, 0.78, 0.5, 28] });
+  set(1, 0.95, 0.8, 0.35, 0.95);
+  set(2, 0.3, 0.62, 0.72, 0.55);
+  const scalarTex = createScalarTexture(dev, data, dims);
+  const colorizeTex = bakeColorizeRGBA(dev, lab, dims, pal, 1.5);
+  const field3d = new RGBAVolumeField(colorizeTex, dims, spacing, { opacityUnitDistance: SPACING[0], shade: [0.3, 0.78, 0.5, 28] });
+  return { scalarTex, colorizeTex, dims, spacing, win: 240, lev: 110, field3d };
 }
 
-// render/demos/sphere-scene.ts
-function orbitEye(azimuth, elevation, distance) {
-  const ce = Math.cos(elevation);
-  return [
-    distance * ce * Math.sin(azimuth),
-    -distance * ce * Math.cos(azimuth),
-    distance * Math.sin(elevation)
-  ];
-}
-
-// render/demos/colorize-browser.ts
+// render/demos/fourup-browser.ts
 var status = (msg, err = false) => {
-  const el = document.getElementById("status");
-  if (el) {
-    el.textContent = msg;
-    el.style.color = err ? "#ff6b74" : "#9fb3d0";
+  const el2 = document.getElementById("status");
+  if (el2) {
+    el2.textContent = msg;
+    el2.style.color = err ? "#ff6b74" : "#9fb3d0";
   }
 };
+var el = (id) => document.getElementById(id);
 async function main() {
-  const canvas = document.getElementById("gpu");
   if (!navigator.gpu) {
     status("WebGPU not available \u2014 try Chrome/Edge 113+ or Safari 18+.", true);
     return;
   }
   status("initializing WebGPU\u2026");
   const gpu = await initDevice();
-  const ctx = canvas.getContext("webgpu");
   const preferred = navigator.gpu.getPreferredCanvasFormat();
   const srgb = preferred + "-srgb";
-  ctx.configure({ device: gpu.device, format: preferred, viewFormats: [srgb], alphaMode: "opaque" });
+  const names = ["axial", "coronal", "sagittal", "threeD"];
+  const cv = {}, cx = {};
+  for (const n of names) {
+    cv[n] = el("c-" + n);
+    cx[n] = cv[n].getContext("webgpu");
+    cx[n].configure({ device: gpu.device, format: preferred, viewFormats: [srgb], alphaMode: "opaque" });
+  }
+  status("baking segmentation\u2026");
+  const sc = buildFourUpScene(gpu.device);
   const scene = new SceneRenderer(gpu, srgb);
-  status("baking segmentation \u2192 RGBA volume\u2026");
-  scene.build([buildColorizeField(gpu.device)]);
-  scene.setBackground(0.06, 0.07, 0.1);
-  let az = 0.1, el = 0.22, dist = DIST;
-  const draw = () => {
-    const w = canvas.width, h = canvas.height;
-    scene.setCamera(orbitEye(az, el, dist), [0, 0, 0], [0, 0, 1], 30, w, h);
-    const t0 = performance.now();
-    scene.renderToView(ctx.getCurrentTexture().createView({ format: srgb }), w, h);
-    status(`ColorizeVolume \xB7 3-label segmentation baked on GPU \xB7 ${w}\xD7${h} \xB7 ${(performance.now() - t0).toFixed(0)} ms/frame \xB7 drag to orbit`);
+  scene.build([sc.field3d]);
+  scene.setBackground(0.05, 0.06, 0.09);
+  const slice = new SliceRenderer(gpu, srgb);
+  slice.setTextures(sc.scalarTex, sc.colorizeTex);
+  slice.setWindowLevel(sc.win, sc.lev);
+  slice.setOverlayOpacity(0.6);
+  const off = { axial: 0.5, coronal: 0.5, sagittal: 0.55 };
+  const axisOf = { axial: 2, coronal: 1, sagittal: 0 };
+  let az = 0.5, elev = 0.3, dist = 430;
+  const drawSlice = (n) => {
+    slice.setSlice(axisOf[n], off[n]);
+    slice.renderToView(cx[n].getCurrentTexture().createView({ format: srgb }), cv[n].width, cv[n].height);
+  };
+  const draw3d = () => {
+    scene.setCamera(orbitEye(az, elev, dist), [0, 0, 0], [0, 0, 1], 28, cv.threeD.width, cv.threeD.height);
+    scene.renderToView(cx.threeD.getCurrentTexture().createView({ format: srgb }), cv.threeD.width, cv.threeD.height);
+  };
+  const drawAll = () => {
+    drawSlice("axial");
+    drawSlice("coronal");
+    drawSlice("sagittal");
+    draw3d();
+    status("4-up \xB7 3 MPR + 3D ColorizeVolume \xB7 scroll a slice to scrub, drag 3D to orbit");
   };
   const resize = () => {
     const dpr = Math.min(2, globalThis.devicePixelRatio || 1);
-    const size = Math.min(720, Math.floor(canvas.clientWidth * dpr));
-    canvas.width = size;
-    canvas.height = size;
-    draw();
+    for (const n of names) {
+      const s = Math.floor(cv[n].clientWidth * dpr);
+      cv[n].width = s;
+      cv[n].height = s;
+    }
+    drawAll();
   };
   globalThis.addEventListener("resize", resize);
+  for (const n of ["axial", "coronal", "sagittal"]) {
+    cv[n].addEventListener("wheel", (e) => {
+      e.preventDefault();
+      off[n] = Math.max(0, Math.min(1, off[n] + (e.deltaY > 0 ? 0.02 : -0.02)));
+      drawSlice(n);
+    }, { passive: false });
+  }
   let dragging = false, lx = 0, ly = 0;
-  canvas.addEventListener("pointerdown", (e) => {
+  cv.threeD.addEventListener("pointerdown", (e) => {
     dragging = true;
     lx = e.clientX;
     ly = e.clientY;
-    canvas.setPointerCapture(e.pointerId);
+    cv.threeD.setPointerCapture(e.pointerId);
   });
-  canvas.addEventListener("pointerup", (e) => {
+  cv.threeD.addEventListener("pointerup", (e) => {
     dragging = false;
-    canvas.releasePointerCapture(e.pointerId);
+    cv.threeD.releasePointerCapture(e.pointerId);
   });
-  canvas.addEventListener("pointermove", (e) => {
+  cv.threeD.addEventListener("pointermove", (e) => {
     if (!dragging) return;
     az += (e.clientX - lx) * 8e-3;
-    el = Math.max(-1.4, Math.min(1.4, el - (e.clientY - ly) * 8e-3));
+    elev = Math.max(-1.4, Math.min(1.4, elev - (e.clientY - ly) * 8e-3));
     lx = e.clientX;
     ly = e.clientY;
-    draw();
+    draw3d();
   });
-  canvas.addEventListener("wheel", (e) => {
+  cv.threeD.addEventListener("wheel", (e) => {
     e.preventDefault();
-    dist = Math.max(220, Math.min(1100, dist * (e.deltaY > 0 ? 1.08 : 0.93)));
-    draw();
+    dist = Math.max(200, Math.min(1100, dist * (e.deltaY > 0 ? 1.08 : 0.93)));
+    draw3d();
   }, { passive: false });
   resize();
 }
