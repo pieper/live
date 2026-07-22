@@ -1,5 +1,11 @@
 [
  {
+  "name": "WebGPU real scene — MRHead (MPR + 3D VR)",
+  "page": "webgpu/real.html",
+  "thumb": "real-mrhead.png",
+  "desc": "A REAL SlicerLive scene, live: the chunked OME-Zarr volume is streamed from the Jetstream2 bucket and gunzipped in your browser, then rendered by the TS/WebGPU backbone — 3 orthogonal MPR planes + a 3D volume render using the scene's own transfer function and true rotated IJK→RAS geometry. The direct replacement for the legacy vtk.js MRHead. Scroll a slice to scrub; drag 3D to orbit."
+ },
+ {
   "name": "WebGPU 4-up (MPR + 3D)",
   "page": "webgpu/fourup.html",
   "thumb": "fourup.png",
