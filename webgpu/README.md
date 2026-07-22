@@ -24,6 +24,7 @@ deno run -A npm:esbuild render/demos/real-browser.ts \
   volume render using the scene's transfer function and true rotated IJK→RAS geometry. `?scene=<url>`
   loads a different scene json. The direct replacement for the legacy vtk.js MRHead.
 - `fourup.html` — synthetic Slicer-style 4-up (3 MPR + 3D ColorizeVolume).
+- `fiducials.html` — selftest port: markup control points as procedural SDF spheres composited in the DVR.
 - `colorize.html` — a segmentation labelmap baked (palette → separable Gaussian → rgba16float) and ray-marched.
 - `multi-volume.html` — two volumes composited in one ray-march via the field SceneRenderer.
 - `dvr-sphere.html` — single-volume DVR of a synthetic volume (drag to orbit, scroll to zoom).
