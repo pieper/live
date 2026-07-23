@@ -829,111 +829,121 @@ fn sample_field_img${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
     ];
   }
 };
-var RGBAVolumeField = class {
-  kind = "rgba";
+var SegmentField = class {
+  kind = "seg";
   bindingCount = 1;
-  // baked rgba texture (sampler shared)
+  // smoothed-presence texture (sampler shared)
   tex;
   p2t;
-  shade;
-  unit;
-  stepMm;
   box;
-  constructor(tex, dims, spacing, opts = {}) {
-    const center = opts.center ?? [0, 0, 0];
+  color;
+  opacity;
+  shade;
+  bandMm;
+  stepMm;
+  constructor(tex, dims, spacing, opts) {
     this.tex = tex;
+    const center = opts.center ?? [0, 0, 0];
+    let voxelMm;
     if (opts.ijkToRAS) {
       this.p2t = patientToTextureFromIjkToRAS(opts.ijkToRAS, dims);
       this.box = volumeAABBFromIjkToRAS(opts.ijkToRAS, dims);
-      this.stepMm = Math.min(...spacingFromIjkToRAS(opts.ijkToRAS));
+      voxelMm = Math.min(...spacingFromIjkToRAS(opts.ijkToRAS));
     } else {
       this.p2t = patientToTexture(dims, spacing, center);
       this.box = volumeAABB(dims, spacing, center);
-      this.stepMm = Math.min(...spacing);
+      voxelMm = Math.min(...spacing);
     }
-    this.shade = opts.shade ?? [0.3, 0.75, 0.45, 24];
-    this.unit = opts.opacityUnitDistance ?? this.stepMm;
+    this.color = opts.color;
+    this.opacity = opts.opacity ?? 1;
+    this.shade = opts.shade ?? [0.2, 0.85, 0.3, 32];
+    this.bandMm = opts.bandMm ?? voxelMm;
+    this.stepMm = opts.sampleStepMm ?? Math.max(0.5 * voxelMm, 0.1);
   }
   uniformFloats() {
-    return 24;
+    return 28;
   }
-  // mat4(16) + params(4) + shade(4)
+  // mat4(16) + color(4) + shade(4) + params(4)
   aabb() {
     return this.box;
   }
   sampleStep() {
     return this.stepMm;
   }
-  /** Swap the baked texture in place (e.g. after re-baking an updated mask). The
-   *  geometry is unchanged; the caller refreshes the SceneRenderer bind group. */
   setTexture(tex, destroyPrev = true) {
     if (destroyPrev && this.tex !== tex) this.tex.destroy();
     this.tex = tex;
   }
-  get texture() {
-    return this.tex;
-  }
   structMembers(s) {
     return [
-      `  rgba${s}_p2t : mat4x4<f32>,`,
-      `  rgba${s}_params : vec4<f32>,`,
-      // opacity_unit_distance, _, _, _
-      `  rgba${s}_shade : vec4<f32>,`
+      `  seg${s}_p2t : mat4x4<f32>,`,
+      `  seg${s}_color : vec4<f32>,`,
+      // rgb, opacity
+      `  seg${s}_shade : vec4<f32>,`,
       // ka, kd, ks, shininess
+      `  seg${s}_params : vec4<f32>,`
+      // band_mm, _, _, _
     ].join("\n");
   }
   declareBindings(s, base) {
-    return `@group(0) @binding(${base}) var t_rgba${s} : texture_3d<f32>;`;
+    return `@group(0) @binding(${base}) var t_seg${s} : texture_3d<f32>;`;
   }
   samplingWGSL(s) {
     return (
       /* wgsl */
       `
-fn alpha_rgba${s}(wp : vec3<f32>) -> f32 {
-  let t4 = u_material.rgba${s}_p2t * vec4<f32>(transform_point_rgba${s}(wp), 1.0);
-  return textureSampleLevel(t_rgba${s}, s_lin, clamp(t4.xyz, vec3<f32>(0.0), vec3<f32>(1.0)), 0.0).a;
+fn v_seg${s}(wp : vec3<f32>) -> f32 {
+  let t4 = u_material.seg${s}_p2t * vec4<f32>(transform_point_seg${s}(wp), 1.0);
+  let t = t4.xyz;
+  if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { return 0.0; }
+  return textureSampleLevel(t_seg${s}, s_lin, t, 0.0).a;   // Gaussian-smoothed presence in .a
 }
-fn sample_field_rgba${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
-  let t4 = u_material.rgba${s}_p2t * vec4<f32>(transform_point_rgba${s}(wp), 1.0);
-  let tex = t4.xyz;
-  if (any(tex < vec3<f32>(0.0)) || any(tex > vec3<f32>(1.0))) { return vec4<f32>(0.0); }
-  let c = textureSampleLevel(t_rgba${s}, s_lin, tex, 0.0);
-  let step = u_material.scene.x;
-  let unit = max(u_material.rgba${s}_params.x, 1e-3);
-  let opacity = clamp(1.0 - pow(1.0 - clamp(c.a, 0.0, 1.0), step / unit), 0.0, 1.0);
-  if (opacity <= 0.001) { return vec4<f32>(0.0); }
-  let h = step * 2.0;   // wider central difference -> smoother normals (less shading aliasing on coarse volumes)
+fn sample_field_seg${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
+  let op0 = u_material.seg${s}_color.a;
+  if (op0 <= 0.0) { return vec4<f32>(0.0); }
+  let v = v_seg${s}(wp);
+  // Skip deep interior / exterior: |grad| ~ 0 there so no shell to emit.
+  if (v <= 0.02 || v >= 0.98) { return vec4<f32>(0.0); }
+  let h = max(u_material.scene.x, 1e-3);
   let g = vec3<f32>(
-    alpha_rgba${s}(wp + vec3<f32>(h,0,0)) - alpha_rgba${s}(wp - vec3<f32>(h,0,0)),
-    alpha_rgba${s}(wp + vec3<f32>(0,h,0)) - alpha_rgba${s}(wp - vec3<f32>(0,h,0)),
-    alpha_rgba${s}(wp + vec3<f32>(0,0,h)) - alpha_rgba${s}(wp - vec3<f32>(0,0,h))) / (2.0 * h);
+    v_seg${s}(wp + vec3<f32>(h,0,0)) - v_seg${s}(wp - vec3<f32>(h,0,0)),
+    v_seg${s}(wp + vec3<f32>(0,h,0)) - v_seg${s}(wp - vec3<f32>(0,h,0)),
+    v_seg${s}(wp + vec3<f32>(0,0,h)) - v_seg${s}(wp - vec3<f32>(0,0,h))) / (2.0 * h);
   let glen = length(g);
-  let ka = u_material.rgba${s}_shade.x; let kd = u_material.rgba${s}_shade.y;
-  let ks = u_material.rgba${s}_shade.z; let sh = u_material.rgba${s}_shade.w;
-  var lit_srgb = c.rgb * ka;
-  if (glen > 1e-6) {
-    var n = g / glen;
-    if (dot(n, -rd) < 0.0) { n = -n; }
-    let view_dir = normalize(-rd);
-    let ldotn = dot(view_dir, n);
-    if (ldotn > 0.0) {
-      let refl = normalize(2.0 * ldotn * n - view_dir);
-      let rdotv = max(0.0, dot(refl, view_dir));
-      lit_srgb = c.rgb * (ka + kd * ldotn) + vec3<f32>(ks * pow(rdotv, sh));
-    }
-  }
-  let lit = srgb2physical(clamp(lit_srgb, vec3<f32>(0.0), vec3<f32>(1.0)));
-  return vec4<f32>(lit * opacity, opacity);
+  if (glen < 1e-5) { return vec4<f32>(0.0); }
+  // Local first-order signed distance to the v=0.5 isosurface (mm), then a
+  // 1-voxel opacity band around it: crisp opaque shell, sub-voxel anti-aliased.
+  let d_mm = abs((v - 0.5) / glen);
+  let band = max(u_material.seg${s}_params.x, 1e-3);
+  let a = 1.0 - clamp(d_mm / band, 0.0, 1.0);
+  if (a <= 0.0) { return vec4<f32>(0.0); }
+  let op = clamp(a * op0, 0.0, 1.0);
+  // Phong from the same gradient, normal flipped to face the camera.
+  var n = g / glen;
+  if (dot(n, -rd) < 0.0) { n = -n; }
+  let ka = u_material.seg${s}_shade.x; let kd = u_material.seg${s}_shade.y;
+  let ks = u_material.seg${s}_shade.z; let sh = u_material.seg${s}_shade.w;
+  let ldn = max(dot(-rd, n), 0.0);
+  let refl = normalize(2.0 * ldn * n + rd);
+  let rdv = max(dot(refl, -rd), 0.0);
+  let col = u_material.seg${s}_color.rgb;
+  var lit = col * ka + col * (kd * ldn) + vec3<f32>(ks * pow(rdv, max(sh, 1.0)));
+  lit = srgb2physical(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)));
+  return vec4<f32>(lit * op, op);
 }`
     );
   }
   fillUniforms(out, off) {
     out.set(this.p2t, off);
-    out[off + 16] = this.unit;
+    out[off + 16] = this.color[0];
+    out[off + 17] = this.color[1];
+    out[off + 18] = this.color[2];
+    out[off + 19] = this.opacity;
     out[off + 20] = this.shade[0];
     out[off + 21] = this.shade[1];
     out[off + 22] = this.shade[2];
     out[off + 23] = this.shade[3];
+    out[off + 24] = this.bandMm;
   }
   bindEntries(_s, base) {
     return [{ binding: base, resource: this.tex.createView() }];
@@ -1318,6 +1328,11 @@ function bakeColorizeRGBA(dev, labelmap, dims, palette, sigmaVoxels = 1.5) {
   texA.destroy();
   return texB;
 }
+function bakeSegmentPresence(dev, mask, dims, sigmaVoxels = 1.5) {
+  const palette = new Float32Array(256 * 4);
+  palette.set([1, 1, 1, 1], 4);
+  return bakeColorizeRGBA(dev, mask, dims, palette, sigmaVoxels);
+}
 
 // render/demos/selftest-scenes.ts
 var SCENES = {
@@ -1378,26 +1393,26 @@ var SEGMENTS = [
 async function buildSegmentation(dev, onBytes) {
   const sv = await loadSceneVolumeField(dev, SCENES.MRHead, onBytes);
   const v = sv.voxels;
-  const labelmap = new Uint8Array(v.length);
-  const counts = [0, 0];
-  for (let i = 0; i < v.length; i++) {
-    const x = v[i];
-    if (SEGMENTS[0].test(x)) {
-      labelmap[i] = 1;
-      counts[0]++;
-    } else if (SEGMENTS[1].test(x)) {
-      labelmap[i] = 2;
-      counts[1]++;
+  const counts = [];
+  const segments = [];
+  for (const seg of SEGMENTS) {
+    const mask = new Uint8Array(v.length);
+    let n = 0;
+    for (let i = 0; i < v.length; i++) {
+      if (seg.test(v[i])) {
+        mask[i] = 1;
+        n++;
+      }
     }
+    counts.push(n);
+    const tex = bakeSegmentPresence(dev, mask, sv.dims, 1.5);
+    segments.push(new SegmentField(tex, sv.dims, [1, 1, 1], {
+      color: seg.color,
+      opacity: 1,
+      ijkToRAS: sv.ijkToRAS
+    }));
   }
-  const palette = new Float32Array(256 * 4);
-  SEGMENTS.forEach((s, i) => palette.set([s.color[0], s.color[1], s.color[2], 1], (i + 1) * 4));
-  const colorizeTex = bakeColorizeRGBA(dev, labelmap, sv.dims, palette, 1.2);
-  const field3d = new RGBAVolumeField(colorizeTex, sv.dims, [1, 1, 1], {
-    ijkToRAS: sv.ijkToRAS,
-    shade: [0.28, 0.8, 0.5, 28]
-  });
-  return { sv, labelmap, colorizeTex, field3d, counts };
+  return { sv, segments, counts };
 }
 
 // render/demos/selftest-browser.ts
@@ -1453,7 +1468,7 @@ async function main() {
     label = `${sc.cta.name} + ${sc.pano.name} (+200 mm R)`;
   } else if (which === "seg") {
     const sc = await buildSegmentation(gpu.device, prog);
-    fields = [sc.field3d];
+    fields = sc.segments;
     center = sc.sv.center;
     radius = sc.sv.radius;
     label = `${sc.sv.name} \xB7 Brain ${sc.counts[0].toLocaleString()} + High ${sc.counts[1].toLocaleString()} voxels`;

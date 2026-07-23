@@ -23,7 +23,7 @@
 <body>
 <header>
   <h1>Segmentation — MRHead thresholds <span class="badge">selftest · real data</span></h1>
-  <div class="sub">A port of the slicer-wgpu <em>Segmentation</em> selftest: two segments thresholded straight out of <strong>MRHead</strong> intensities — Brain (40 &lt; v &lt; 120) and High (v &gt; 120) — baked through ColorizeVolume and ray-marched, the native replacement for surface models. Camera and mouse bindings match Slicer's <code>vtkMRMLCameraWidget</code>:
+  <div class="sub">A port of the slicer-wgpu <em>Segmentation</em> selftest: two segments thresholded straight out of <strong>MRHead</strong> intensities — Brain (40 &lt; v &lt; 120) and High (v &gt; 120). Each binary mask is Gaussian-smoothed (σ 1.5 voxels) and ray-marched as a crisp opaque <strong>isosurface shell</strong> — slicer-wgpu's <code>SegmentField</code> <code>iso</code> mode, the native replacement for surface models (no polygons/marching-cubes). Camera and mouse bindings match Slicer's <code>vtkMRMLCameraWidget</code>:
     drag = rotate, shift/middle = pan, right = zoom, wheel = dolly.
     &nbsp;·&nbsp; <a href="https://github.com/pieper/SlicerLive" target="_blank">SlicerLive</a></div>
 </header>
