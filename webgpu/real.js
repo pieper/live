@@ -418,6 +418,28 @@ var BASES = {
   coronal: { uDir: [-1, 0, 0], vDir: [0, 0, 1], uAxis: 0, vAxis: 2, nAxis: 1 },
   sagittal: { uDir: [0, -1, 0], vDir: [0, 0, 1], uAxis: 1, vAxis: 2, nAxis: 0 }
 };
+function ijkAxisForRasAxis(ijkToRAS, rasAxis) {
+  let best = 0, bestMag = -1;
+  for (let c = 0; c < 3; c++) {
+    const mag = Math.abs(ijkToRAS[rasAxis * 4 + c]);
+    if (mag > bestMag) {
+      bestMag = mag;
+      best = c;
+    }
+  }
+  return best;
+}
+function slicerDefaultOffset01(orient, dims, ijkToRAS, rasLo, rasHi) {
+  const b = BASES[orient];
+  const n = b.nAxis;
+  const a = ijkAxisForRasAxis(ijkToRAS, n);
+  const m = Math.floor((dims[a] - 1) / 2);
+  const ijk = [(dims[0] - 1) / 2, (dims[1] - 1) / 2, (dims[2] - 1) / 2];
+  ijk[a] = m;
+  const ras = ijkToRAS[n * 4 + 0] * ijk[0] + ijkToRAS[n * 4 + 1] * ijk[1] + ijkToRAS[n * 4 + 2] * ijk[2] + ijkToRAS[n * 4 + 3];
+  const span = rasHi[n] - rasLo[n];
+  return span === 0 ? 0.5 : (ras - rasLo[n]) / span;
+}
 var SliceRenderer = class {
   dev;
   format;
@@ -493,12 +515,25 @@ var SliceRenderer = class {
   setOverlayOpacity(o) {
     this.u[30] = o;
   }
-  /** Physical size (mm) of the square view for the current plane (isotropic, letterboxed). */
+  /** Physical size (mm) of the square view for the current plane (isotropic, letterboxed).
+   *  Matches Slicer's FitSliceToBackground: the field of view is exactly the volume's
+   *  extent along the limiting in-plane axis — NO extra margin. (Verified against
+   *  Slicer: Red FOV=[891.78,256] at viewport 634x182 -> vertical FOV == the 256mm
+   *  A-extent, horizontal follows viewport aspect.) */
   viewSpanMm() {
     const b = BASES[this.orient];
     const uExt = this.rasHi[b.uAxis] - this.rasLo[b.uAxis];
     const vExt = this.rasHi[b.vAxis] - this.rasLo[b.vAxis];
-    return Math.max(uExt, vExt) * 1.02;
+    return Math.max(uExt, vExt);
+  }
+  /** The fitted in-plane extent (mm) used for a given orientation — the value directly
+   *  comparable to a Slicer slice node's fitted fieldOfView. */
+  spanMmFor(orient) {
+    const prev = this.orient;
+    this.orient = orient;
+    const s = this.viewSpanMm();
+    this.orient = prev;
+    return s;
   }
   /** Plane center in RAS for the current scrub offset. */
   planeCenter() {
@@ -952,9 +987,16 @@ async function main() {
     { cell: "coronal", orient: "coronal" },
     { cell: "sagittal", orient: "sagittal" }
   ];
-  const off = { axial: 0.5, coronal: 0.5, sagittal: 0.5 };
-  const { center, radius } = rs.sv;
-  let az = Math.PI, elev = 0.12, dist = radius * 3;
+  const [rasLo0, rasHi0] = rs.sv.field.aabb();
+  const off = {
+    axial: slicerDefaultOffset01("axial", rs.sv.dims, rs.sv.ijkToRAS, rasLo0, rasHi0),
+    coronal: slicerDefaultOffset01("coronal", rs.sv.dims, rs.sv.ijkToRAS, rasLo0, rasHi0),
+    sagittal: slicerDefaultOffset01("sagittal", rs.sv.dims, rs.sv.ijkToRAS, rasLo0, rasHi0)
+  };
+  const { radius } = rs.sv;
+  const center = [0, 0, 0];
+  const FOVY = 30;
+  let az = Math.PI, elev = 0, dist = 500;
   const eyeAt = () => {
     const o = orbitEye(az, elev, dist);
     return [center[0] + o[0], center[1] + o[1], center[2] + o[2]];
@@ -964,7 +1006,7 @@ async function main() {
     rs.slice.renderToView(cx[p.cell].getCurrentTexture().createView({ format: srgb }), cv[p.cell].width, cv[p.cell].height);
   };
   const draw3d = () => {
-    rs.scene.setCamera(eyeAt(), center, [0, 0, 1], 26, cv.threeD.width, cv.threeD.height);
+    rs.scene.setCamera(eyeAt(), center, [0, 0, 1], FOVY, cv.threeD.width, cv.threeD.height);
     rs.scene.renderToView(cx.threeD.getCurrentTexture().createView({ format: srgb }), cv.threeD.width, cv.threeD.height);
   };
   const drawAll = () => {
@@ -1010,7 +1052,7 @@ async function main() {
   });
   cv.threeD.addEventListener("wheel", (e) => {
     e.preventDefault();
-    dist = Math.max(radius * 1.2, Math.min(radius * 8, dist * (e.deltaY > 0 ? 1.08 : 0.93)));
+    dist = Math.max(50, Math.min(3e3, dist * (e.deltaY > 0 ? 1.08 : 0.93)));
     draw3d();
   }, { passive: false });
   const [rasLo, rasHi] = rs.sv.field.aabb();
@@ -1022,7 +1064,7 @@ async function main() {
       position: eyeAt(),
       focalPoint: [...center],
       viewUp: [0, 0, 1],
-      viewAngle: 26
+      viewAngle: FOVY
     }),
     setCamera: (p) => {
       if (p.azimuth !== void 0) az = p.azimuth;
@@ -1035,7 +1077,7 @@ async function main() {
       const nAxis = { axial: 2, coronal: 1, sagittal: 0 };
       for (const p of planes) {
         const a = nAxis[p.orient];
-        out[p.cell] = { orient: p.orient, offset01: off[p.cell], offsetMm: rasLo[a] + off[p.cell] * (rasHi[a] - rasLo[a]) };
+        out[p.cell] = { orient: p.orient, offset01: off[p.cell], offsetMm: rasLo[a] + off[p.cell] * (rasHi[a] - rasLo[a]), spanMm: rs.slice.spanMmFor(p.orient) };
       }
       return out;
     },
