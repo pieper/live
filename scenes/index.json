@@ -1,45 +1,51 @@
 [
  {
-  "name": "nnLive — interactive segmentation (4-up)",
+  "name": "nnLive \u2014 interactive segmentation (4-up)",
   "page": "webgpu/nnlive.html",
   "thumb": "nnlive.png",
-  "desc": "The payoff: a real CT in the SlicerLive 4-up where each click runs nnLive's FAITHFUL 192³ interactive segmentation (distilled nnInteractive: trunk encode + perclick decode, EDT-ball prompts, prev-mask feedback, auto-zoom) → mask → ColorizeVolume, live as a colored 3D volume + MPR overlay with a pushpin per click. Shift-click = background point. Coordinates correct end-to-end (RAS reslice + view→RAS→voxel). 188 MB weights stream from the public bucket."
+  "desc": "The payoff: a real CT in the SlicerLive 4-up where each click runs nnLive's FAITHFUL 192\u00b3 interactive segmentation (distilled nnInteractive: trunk encode + perclick decode, EDT-ball prompts, prev-mask feedback, auto-zoom) \u2192 mask \u2192 ColorizeVolume, live as a colored 3D volume + MPR overlay with a pushpin per click. Shift-click = background point. Coordinates correct end-to-end (RAS reslice + view\u2192RAS\u2192voxel). 188 MB weights stream from the public bucket."
  },
  {
-  "name": "WebGPU real scene — MRHead (MPR + 3D VR)",
+  "name": "WebGPU real scene \u2014 MRHead (MPR + 3D VR)",
   "page": "webgpu/real.html",
   "thumb": "real-mrhead.png",
-  "desc": "A REAL SlicerLive scene, live: the chunked OME-Zarr volume is streamed from the Jetstream2 bucket and gunzipped in your browser, then rendered by the TS/WebGPU backbone — 3 orthogonal MPR planes + a 3D volume render using the scene's own transfer function and true rotated IJK→RAS geometry. The direct replacement for the legacy vtk.js MRHead. Scroll a slice to scrub; drag 3D to orbit."
+  "desc": "A REAL SlicerLive scene, live: the chunked OME-Zarr volume is streamed from the Jetstream2 bucket and gunzipped in your browser, then rendered by the TS/WebGPU backbone \u2014 3 orthogonal MPR planes + a 3D volume render using the scene's own transfer function and true rotated IJK\u2192RAS geometry. The direct replacement for the legacy vtk.js MRHead. Scroll a slice to scrub; drag 3D to orbit."
  },
  {
   "name": "WebGPU 4-up (MPR + 3D)",
   "page": "webgpu/fourup.html",
   "thumb": "fourup.png",
-  "desc": "The Slicer-style 4-up, native in WebGPU — three MPR planes (windowed CT + colored segmentation overlay) + a 3D ColorizeVolume view, all from the same GPU textures. The replacement for the vtk.js 4-up. Scroll a slice to scrub; drag 3D to orbit."
+  "desc": "The Slicer-style 4-up, native in WebGPU \u2014 three MPR planes (windowed CT + colored segmentation overlay) + a 3D ColorizeVolume view, all from the same GPU textures. The replacement for the vtk.js 4-up. Scroll a slice to scrub; drag 3D to orbit."
  },
  {
   "name": "WebGPU LiveRenderer (preview)",
   "page": "webgpu/dvr-sphere.html",
   "thumb": "dvr-sphere.png",
-  "desc": "NEW rendering backbone — a step-based volume ray-marcher in TypeScript/WebGPU, ported from slicer-wgpu, running the same code in the browser and natively under Deno. Drag to orbit. (Synthetic volume; the future replacement for the vtk.js path.)"
+  "desc": "NEW rendering backbone \u2014 a step-based volume ray-marcher in TypeScript/WebGPU, ported from slicer-wgpu, running the same code in the browser and natively under Deno. Drag to orbit. (Synthetic volume; the future replacement for the vtk.js path.)"
  },
  {
   "name": "WebGPU: Volume + Fiducials",
   "page": "webgpu/fiducials.html",
   "thumb": "fiducials.png",
-  "desc": "A port of the slicer-wgpu Volume + Fiducials selftest — markup control points rendered as procedural SDF spheres (no geometry, plastic-Phong highlights) composited inside the same DVR ray-march, so pushpins occlude and are occluded by tissue. The field nnLive click-points will use. Drag to orbit."
+  "desc": "A port of the slicer-wgpu Volume + Fiducials selftest \u2014 markup control points rendered as procedural SDF spheres (no geometry, plastic-Phong highlights) composited inside the same DVR ray-march, so pushpins occlude and are occluded by tissue. The field nnLive click-points will use. Drag to orbit."
+ },
+ {
+  "name": "WebGPU: Landmark Deform (TPS)",
+  "page": "webgpu/deform.html",
+  "thumb": "deform.png",
+  "desc": "A port of the slicer-wgpu Landmark Deform selftest \u2014 a NONLINEAR thin-plate-spline transform applied during the ray march. The TransformField is a modifier: the volume samples through transform_point(), so the warp deforms its apparent shape (and would equally move fiducials or a segmentation). Cyan = source landmarks, magenta = targets. Slide gain from identity to full warp."
  },
  {
   "name": "WebGPU: multi-volume",
   "page": "webgpu/multi-volume.html",
   "thumb": "multi-volume.png",
-  "desc": "Native multivolume — two independent volumes composited in one ray-march via the field-based SceneRenderer (generated WGSL, per-sample OVER). The field spine that will carry segmentation + ColorizeVolume next. Drag to orbit."
+  "desc": "Native multivolume \u2014 two independent volumes composited in one ray-march via the field-based SceneRenderer (generated WGSL, per-sample OVER). The field spine that will carry segmentation + ColorizeVolume next. Drag to orbit."
  },
  {
   "name": "WebGPU: ColorizeVolume (segmentation)",
   "page": "webgpu/colorize.html",
   "thumb": "colorize.png",
-  "desc": "A segmentation labelmap baked on the GPU into a smooth colored volume (palette → separable Gaussian → rgba16float) and ray-marched — the native replacement for surface models, and the exact path an interactive nnLive mask will take. Drag to orbit."
+  "desc": "A segmentation labelmap baked on the GPU into a smooth colored volume (palette \u2192 separable Gaussian \u2192 rgba16float) and ray-marched \u2014 the native replacement for surface models, and the exact path an interactive nnLive mask will take. Drag to orbit."
  },
  {
   "name": "TotalSegmentator-CT",
