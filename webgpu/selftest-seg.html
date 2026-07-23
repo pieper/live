@@ -3,36 +3,38 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SlicerLive — WebGPU LiveRenderer (DVR sphere)</title>
+<title>SlicerLive — Segmentation — MRHead thresholds</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
   body { margin: 0; background: #0e0e16; color: #d8d8e0; font-family: -apple-system, system-ui, sans-serif; }
   header { padding: 16px 22px; border-bottom: 1px solid #2a2a3a; }
   h1 { margin: 0; font-size: 19px; }
-  .sub { opacity: .65; font-size: 13px; margin-top: 5px; max-width: 760px; line-height: 1.5; }
+  .sub { opacity: .65; font-size: 13px; margin-top: 5px; max-width: 860px; line-height: 1.5; }
   .badge { display: inline-block; font-size: 11px; color: #04121c; background: linear-gradient(180deg, #9fe9ff, #54c6f0);
            font-weight: 700; border-radius: 5px; padding: 1px 7px; vertical-align: middle; margin-left: 6px; }
   a { color: #7fa8e0; }
   main { display: flex; flex-direction: column; align-items: center; padding: 22px; gap: 12px; }
-  canvas { width: min(720px, 92vw); aspect-ratio: 1; border: 1px solid #232a3b; border-radius: 8px; background: #000; cursor: grab; touch-action: none; }
+  canvas { width: min(760px, 92vw); aspect-ratio: 1; border: 1px solid #232a3b; border-radius: 8px; background: #000; cursor: grab; touch-action: none; }
   canvas:active { cursor: grabbing; }
   #status { font-size: 12px; color: #9fb3d0; min-height: 1.4em; font-family: ui-monospace, monospace; }
 </style>
 </head>
 <body>
 <header>
-  <h1>WebGPU LiveRenderer <span class="badge">preview</span></h1>
-  <div class="sub">A step-based volume ray-marcher written in TypeScript and running on your GPU via WebGPU —
-    a browser port of the <a href="https://github.com/pieper/slicer-wgpu" target="_blank">slicer-wgpu</a> renderer,
-    the same code that runs natively under Deno. This is the future rendering backbone for SlicerLive (replacing
-    vtk.js); this preview shows a synthetic volume (a translucent soft-tissue shell with a dense inner blob).
+  <h1>Segmentation — MRHead thresholds <span class="badge">selftest · real data</span></h1>
+  <div class="sub">A port of the slicer-wgpu <em>Segmentation</em> selftest: two segments thresholded straight out of <strong>MRHead</strong> intensities — Brain (40 &lt; v &lt; 120) and High (v &gt; 120) — baked through ColorizeVolume and ray-marched, the native replacement for surface models. Camera and mouse bindings match Slicer's <code>vtkMRMLCameraWidget</code>:
+    drag = rotate, shift/middle = pan, right = zoom, wheel = dolly.
     &nbsp;·&nbsp; <a href="https://github.com/pieper/SlicerLive" target="_blank">SlicerLive</a></div>
 </header>
 <main>
-  <canvas id="gpu" width="720" height="720"></canvas>
+  <canvas id="gpu" width="760" height="760"></canvas>
   <div id="status">loading…</div>
 </main>
-<script type="module" src="./dvr-sphere.js"></script>
+<script type="module">
+  const p = new URLSearchParams(location.search);
+  if (!p.get("demo")) { p.set("demo", "seg"); location.search = p.toString(); }
+</script>
+<script type="module" src="./selftest.js"></script>
 </body>
 </html>

@@ -18,34 +18,34 @@
   "desc": "The Slicer-style 4-up, native in WebGPU \u2014 three MPR planes (windowed CT + colored segmentation overlay) + a 3D ColorizeVolume view, all from the same GPU textures. The replacement for the vtk.js 4-up. Scroll a slice to scrub; drag 3D to orbit."
  },
  {
-  "name": "WebGPU LiveRenderer (preview)",
-  "page": "webgpu/dvr-sphere.html",
-  "thumb": "dvr-sphere.png",
-  "desc": "NEW rendering backbone \u2014 a step-based volume ray-marcher in TypeScript/WebGPU, ported from slicer-wgpu, running the same code in the browser and natively under Deno. Drag to orbit. (Synthetic volume; the future replacement for the vtk.js path.)"
- },
- {
-  "name": "WebGPU: Volume + Fiducials",
-  "page": "webgpu/fiducials.html",
-  "thumb": "fiducials.png",
-  "desc": "A port of the slicer-wgpu Volume + Fiducials selftest \u2014 markup control points rendered as procedural SDF spheres (no geometry, plastic-Phong highlights) composited inside the same DVR ray-march, so pushpins occlude and are occluded by tissue. The field nnLive click-points will use. Drag to orbit."
- },
- {
   "name": "WebGPU: Landmark Deform (TPS)",
   "page": "webgpu/deform.html",
   "thumb": "deform.png",
   "desc": "A port of the slicer-wgpu Landmark Deform selftest \u2014 a NONLINEAR thin-plate-spline transform applied during the ray march. The TransformField is a modifier: the volume samples through transform_point(), so the warp deforms its apparent shape (and would equally move fiducials or a segmentation). Cyan = source landmarks, magenta = targets. Slide gain from identity to full warp."
  },
  {
-  "name": "WebGPU: multi-volume",
-  "page": "webgpu/multi-volume.html",
-  "thumb": "multi-volume.png",
-  "desc": "Native multivolume \u2014 two independent volumes composited in one ray-march via the field-based SceneRenderer (generated WGSL, per-sample OVER). The field spine that will carry segmentation + ColorizeVolume next. Drag to orbit."
+  "name": "Selftest: Single Volume (CTACardio)",
+  "page": "webgpu/selftest-single.html",
+  "thumb": "selftest-single.png",
+  "desc": "SlicerWGPU Single Volume selftest, on the data it actually loads \u2014 CTACardio (512\u00d7512\u00d7321) streamed from the Jetstream2 bucket and ray-marched with the volume's own transfer function carried over from Slicer. Slicer-faithful camera bindings."
  },
  {
-  "name": "WebGPU: ColorizeVolume (segmentation)",
-  "page": "webgpu/colorize.html",
-  "thumb": "colorize.png",
-  "desc": "A segmentation labelmap baked on the GPU into a smooth colored volume (palette \u2192 separable Gaussian \u2192 rgba16float) and ray-marched \u2014 the native replacement for surface models, and the exact path an interactive nnLive mask will take. Drag to orbit."
+  "name": "Selftest: Volume + Fiducials (CTACardio)",
+  "page": "webgpu/selftest-fiducials.html",
+  "thumb": "selftest-fiducials.png",
+  "desc": "SlicerWGPU Volume + Fiducials selftest \u2014 CTACardio with four markup lists of 25 control points, drawn as procedural SDF spheres composited inside the same ray-march so glyphs occlude and are occluded by anatomy."
+ },
+ {
+  "name": "Selftest: Multi-Volume (CTACardio + Panoramix)",
+  "page": "webgpu/selftest-multi.html",
+  "thumb": "selftest-multi.png",
+  "desc": "SlicerWGPU Multi-Volume selftest \u2014 CTACardio and CTAAbdomenPanoramix, each with its own transfer function, composited in one ray-march with Panoramix offset +200 mm along R exactly as the selftest places it."
+ },
+ {
+  "name": "Selftest: Segmentation (MRHead)",
+  "page": "webgpu/selftest-seg.html",
+  "thumb": "selftest-seg.png",
+  "desc": "SlicerWGPU Segmentation selftest \u2014 two segments thresholded straight out of MRHead intensities (Brain 40<v<120, High v>120), baked through ColorizeVolume and ray-marched: the native replacement for surface models."
  },
  {
   "name": "TotalSegmentator-CT",
