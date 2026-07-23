@@ -4,7 +4,7 @@ async function initDevice() {
   if (!gpu) throw new Error("WebGPU not available (need Chrome/Edge/Safari or Deno --unstable-webgpu)");
   const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
   if (!adapter) throw new Error("no WebGPU adapter");
-  const want = ["float32-filterable"].filter((f) => adapter.features.has(f));
+  const want = ["float32-filterable", "timestamp-query"].filter((f) => adapter.features.has(f));
   const lim = adapter.limits;
   const requiredLimits = {};
   const raise = (k) => {
@@ -169,9 +169,11 @@ var SceneRenderer = class {
   matBuf;
   mat;
   bind;
+  canTime;
   constructor(gpu, format = DEFAULT_FORMAT) {
     this.dev = gpu.device;
     this.format = format;
+    this.canTime = gpu.features.has("timestamp-query");
     this.sampler = this.dev.createSampler({ magFilter: "linear", minFilter: "linear", addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge", addressModeW: "clamp-to-edge" });
     this.camBuf = this.dev.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   }
@@ -195,13 +197,7 @@ var SceneRenderer = class {
       fragment: { module: this.dev.createShaderModule({ code: this.wgsl() }), entryPoint: "fs_main", targets: [{ format: this.format }] },
       primitive: { topology: "triangle-list", cullMode: "none" }
     });
-    const entries = [
-      { binding: 0, resource: { buffer: this.camBuf } },
-      { binding: 1, resource: { buffer: this.matBuf } },
-      { binding: 2, resource: this.sampler }
-    ];
-    for (const p of this.placed) entries.push(...p.field.bindEntries(p.slot, p.bbase));
-    this.bind = this.dev.createBindGroup({ layout: this.pipeline.getBindGroupLayout(0), entries });
+    this.bind = this.dev.createBindGroup({ layout: this.pipeline.getBindGroupLayout(0), entries: this.bindGroupEntries() });
     this.setBackground(0.07, 0.08, 0.12);
     const step = this.placed.length ? Math.min(...this.placed.map((p) => p.field.sampleStep())) : 1;
     this.setSampleStep(step * 0.7);
@@ -224,8 +220,23 @@ ${body}
 }`;
     }).join("\n");
     const fieldFns = receivers.map((p) => p.field.samplingWGSL(p.slot)).join("\n");
-    const fns = [modFns, tpFns, fieldFns].filter((s) => s.trim()).join("\n");
-    const dispatch = receivers.map((p) => `    { let c = sample_field_${p.field.kind}${p.slot}(wp, rd); sum += c; }`).join("\n");
+    const skippers = receivers.filter((p) => p.field.providesSkip && p.field.skipWGSL && !p.field.transform);
+    const canSkip = new Set(skippers.map((p) => p.field));
+    const skipFns = skippers.map((p) => p.field.skipWGSL(p.slot)).join("\n");
+    const fns = [modFns, tpFns, fieldFns, skipFns].filter((s) => s.trim()).join("\n");
+    const skipInit = skippers.map((p) => `  var resume_${p.field.kind}${p.slot} : f32 = -1.0e30;`).join("\n");
+    const dispatch = receivers.map((p) => {
+      const nm = `${p.field.kind}${p.slot}`;
+      if (!canSkip.has(p.field)) {
+        return `    { let c = sample_field_${nm}(wp, rd); sum += c; all_defer = false; }`;
+      }
+      return `    if (t >= resume_${nm}) {
+      let d_${nm} = max(skip_${nm}(wp) - step, 0.0);
+      if (d_${nm} > 0.0) { resume_${nm} = t + d_${nm}; }
+      else { let c = sample_field_${nm}(wp, rd); sum += c; }
+    }
+    if (t < resume_${nm}) { jump_t = min(jump_t, resume_${nm}); } else { all_defer = false; }`;
+    }).join("\n");
     return (
       /* wgsl */
       `
@@ -239,7 +250,7 @@ ${members}
 };
 @group(0) @binding(0) var<uniform> u_cam : Camera;
 @group(0) @binding(1) var<uniform> u_material : Material;
-@group(0) @binding(2) var s_lin : sampler;
+${this.usesSampler() ? "@group(0) @binding(2) var s_lin : sampler;" : ""}
 ${decls}
 
 struct Varyings { @builtin(position) position : vec4<f32> };
@@ -283,14 +294,19 @@ fn fs_main(v : Varyings) -> @location(0) vec4<f32> {
   var t = t_near;
   var integrated = vec4<f32>(0.0);
   var safety : i32 = 0;
+${skipInit}
   loop {
     if (t >= t_far || safety >= 5000 || integrated.a >= 0.99) { break; }
     let js = fract(sin(dot(v.position.xy + vec2<f32>(f32(safety) * 0.7548, f32(safety) * 0.5698), vec2<f32>(12.9898, 78.233))) * 43758.5453) - 0.5; // per-(pixel,sample) jitter
     let wp = ro + rd * (t + js * step);
     var sum = vec4<f32>(0.0);
+    var all_defer = true;        // every field guarantees emptiness here -> we may leap
+    var jump_t = 1.0e30;         // nearest field horizon
 ${dispatch}
     if (sum.a > 0.0) { integrated = integrated + (1.0 - integrated.a) * vec4<f32>(sum.rgb, clamp(sum.a, 0.0, 1.0)); }
-    t = t + step;
+    // Leap only across space EVERY field proved empty, so no sampled segment ever
+    // changes length and the fixed-step opacity integration stays exact.
+    if (all_defer && jump_t > t + step) { t = jump_t; } else { t = t + step; }
     safety = safety + 1;
   }
   return vec4<f32>(mix(bg, integrated.rgb, integrated.a), 1.0);
@@ -327,13 +343,24 @@ ${dispatch}
   /** Rebuild the bind group from the fields' current resources (e.g. after a field
    *  swapped a texture) without recompiling the pipeline. Field set/structure must be unchanged. */
   refreshBindings() {
+    this.bind = this.dev.createBindGroup({ layout: this.pipeline.getBindGroupLayout(0), entries: this.bindGroupEntries() });
+  }
+  /** Only fields with texture bindings use the shared sampler. `layout: "auto"` derives the
+   *  layout from what the shader ACTUALLY references, so in a scene of purely procedural
+   *  fields (e.g. fiducials/markups only) binding 2 is absent from the layout — supplying it
+   *  anyway fails validation and the whole view silently renders nothing. Emit the sampler
+   *  declaration and its bind entry under the SAME condition so the two can't drift. */
+  usesSampler() {
+    return this.placed.some((p) => p.field.bindingCount > 0);
+  }
+  bindGroupEntries() {
     const entries = [
       { binding: 0, resource: { buffer: this.camBuf } },
-      { binding: 1, resource: { buffer: this.matBuf } },
-      { binding: 2, resource: this.sampler }
+      { binding: 1, resource: { buffer: this.matBuf } }
     ];
+    if (this.usesSampler()) entries.push({ binding: 2, resource: this.sampler });
     for (const p of this.placed) entries.push(...p.field.bindEntries(p.slot, p.bbase));
-    this.bind = this.dev.createBindGroup({ layout: this.pipeline.getBindGroupLayout(0), entries });
+    return entries;
   }
   setCamera(eye, center, up, fovyDeg, width, height) {
     const view = lookAt(eye, center, up);
@@ -357,6 +384,46 @@ ${dispatch}
     pass.draw(3);
     pass.end();
     this.dev.queue.submit([enc.finish()]);
+  }
+  /** Exact GPU time of the ray-march pass (median ms over `iters`), via timestamp-query.
+   *  Times ONLY the render pass — no texture copy/readback — so it reflects shader cost.
+   *  Returns NaN if the device lacks timestamp-query. Deno gives full-resolution timestamps;
+   *  Chrome quantizes them unless cross-origin isolated, so profile headless for sharp numbers. */
+  async timePass(width, height, iters = 40) {
+    if (!this.canTime) return NaN;
+    this.flush();
+    const target = this.dev.createTexture({ size: [width, height], format: this.format, usage: GPUTextureUsage.RENDER_ATTACHMENT });
+    const view = target.createView();
+    const qs = this.dev.createQuerySet({ type: "timestamp", count: 2 });
+    const resolve = this.dev.createBuffer({ size: 16, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
+    const read = this.dev.createBuffer({ size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const samples = [];
+    for (let i = 0; i < iters; i++) {
+      const enc = this.dev.createCommandEncoder();
+      const pass = enc.beginRenderPass({
+        colorAttachments: [{ view, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
+        timestampWrites: { querySet: qs, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 }
+      });
+      pass.setPipeline(this.pipeline);
+      pass.setBindGroup(0, this.bind);
+      pass.draw(3);
+      pass.end();
+      enc.resolveQuerySet(qs, 0, 2, resolve, 0);
+      enc.copyBufferToBuffer(resolve, 0, read, 0, 16);
+      this.dev.queue.submit([enc.finish()]);
+      await read.mapAsync(GPUMapMode.READ);
+      const t = new BigUint64Array(read.getMappedRange());
+      const ms = Number(t[1] - t[0]) / 1e6;
+      read.unmap();
+      if (ms > 0 && Number.isFinite(ms)) samples.push(ms);
+    }
+    target.destroy();
+    qs.destroy();
+    resolve.destroy();
+    read.destroy();
+    if (!samples.length) return NaN;
+    samples.sort((a, b) => a - b);
+    return samples[samples.length >> 1];
   }
   async renderToRGBA(width, height) {
     this.flush();
@@ -1101,6 +1168,8 @@ var FiducialField = class {
   colors = new Float32Array(MAX * 4);
   // (r,g,b,a)
   n = 0;
+  maxR = 0;
+  // largest radius in this field (for the skip bound)
   sh;
   ka;
   kd;
@@ -1118,10 +1187,12 @@ var FiducialField = class {
     this.n = Math.min(list.length, MAX);
     this.spheres.fill(0);
     this.colors.fill(0);
+    this.maxR = 0;
     for (let i = 0; i < this.n; i++) {
       const s = list[i];
       this.spheres.set([s.center[0], s.center[1], s.center[2], s.radius], i * 4);
       this.colors.set(s.color, i * 4);
+      this.maxR = Math.max(this.maxR, s.radius);
     }
   }
   get count() {
@@ -1151,7 +1222,7 @@ var FiducialField = class {
       `  fid${s}_params : vec4<f32>,`,
       // n_spheres, visible, shininess, k_ambient
       `  fid${s}_params2 : vec4<f32>,`,
-      // k_diffuse, k_specular, _, _
+      // k_diffuse, k_specular, max_radius, _
       `  fid${s}_light : vec4<f32>,`,
       // light_color.rgb, _
       `  fid${s}_spheres : array<vec4<f32>, ${MAX}>,`,
@@ -1163,6 +1234,31 @@ var FiducialField = class {
   }
   bindEntries(_s, _base) {
     return [];
+  }
+  // --- empty-space skipping -------------------------------------------------
+  // The spheres are an exact SDF, so we can hand the ray-marcher a real distance to
+  // leap. Conservative form: nearest-CENTRE distance minus the field's LARGEST radius.
+  // Since min_j(d_j) <= d_k and max_r >= r_k for every k, this never exceeds the true
+  // min_k(d_k - r_k) — so it can't skip over a sphere — and it costs only squared
+  // distances in the loop plus ONE sqrt at the end (cheaper than the sampling loop).
+  providesSkip = true;
+  skipWGSL(s) {
+    return (
+      /* wgsl */
+      `
+fn skip_fid${s}(wp : vec3<f32>) -> f32 {
+  let n = i32(u_material.fid${s}_params.x);
+  if (n <= 0) { return 1.0e6; }        // nothing here: unbounded empty space
+  var min_d2 = 1.0e12;
+  for (var k = 0; k < n; k = k + 1) {
+    let sp = u_material.fid${s}_spheres[k];
+    if (sp.w <= 0.0) { continue; }
+    let dv = wp - sp.xyz;
+    min_d2 = min(min_d2, dot(dv, dv));
+  }
+  return max(sqrt(min_d2) - u_material.fid${s}_params2.z, 0.0);
+}`
+    );
   }
   samplingWGSL(s) {
     return (
@@ -1211,6 +1307,7 @@ fn sample_field_fid${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
     out[off + 3] = this.ka;
     out[off + 4] = this.kd;
     out[off + 5] = this.ks;
+    out[off + 6] = this.maxR;
     out[off + 8] = this.light[0];
     out[off + 9] = this.light[1];
     out[off + 10] = this.light[2];
