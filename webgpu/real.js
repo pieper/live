@@ -1136,6 +1136,102 @@ var CameraInteractor = class _CameraInteractor {
   }
 };
 
+// render/slice-interactor.ts
+var NORMAL = {
+  axial: { axis: 2, sign: 1 },
+  // sliceToRAS col2 = +S
+  coronal: { axis: 1, sign: 1 },
+  // sliceToRAS col2 = +A
+  sagittal: { axis: 0, sign: -1 }
+  // sliceToRAS col2 = -R
+};
+function ijkAxisForRasAxis2(ijkToRAS, rasAxis) {
+  let best = 0, bestMag = -1;
+  for (let c = 0; c < 3; c++) {
+    const mag = Math.abs(ijkToRAS[rasAxis * 4 + c]);
+    if (mag > bestMag) {
+      bestMag = mag;
+      best = c;
+    }
+  }
+  return best;
+}
+function sliceSpacingFor(orient, ijkToRAS) {
+  const n = NORMAL[orient].axis;
+  const a = ijkAxisForRasAxis2(ijkToRAS, n);
+  return Math.hypot(ijkToRAS[a], ijkToRAS[4 + a], ijkToRAS[8 + a]);
+}
+function sliceBoundsFor(orient, rasLo, rasHi) {
+  const { axis, sign } = NORMAL[orient];
+  return sign > 0 ? [rasLo[axis], rasHi[axis]] : [-rasHi[axis], -rasLo[axis]];
+}
+function offset01ToMm(orient, offset01, rasLo, rasHi) {
+  const { axis, sign } = NORMAL[orient];
+  return sign * (rasLo[axis] + offset01 * (rasHi[axis] - rasLo[axis]));
+}
+function mmToOffset01(orient, mm, rasLo, rasHi) {
+  const { axis, sign } = NORMAL[orient];
+  const ras = sign * mm;
+  const span = rasHi[axis] - rasLo[axis];
+  return span === 0 ? 0.5 : (ras - rasLo[axis]) / span;
+}
+var SliceInteractor = class {
+  constructor(geom) {
+    this.geom = geom;
+  }
+  setGeometry(g) {
+    this.geom = g;
+  }
+  spacing(orient) {
+    return sliceSpacingFor(orient, this.geom.ijkToRAS);
+  }
+  bounds(orient) {
+    return sliceBoundsFor(orient, this.geom.rasLo, this.geom.rasHi);
+  }
+  /** vtkMRMLSliceIntersectionWidget::MoveSlice — returns the NEW offset01, or the
+   *  unchanged one if the step would leave the slice bounds (Slicer rejects, not clamps). */
+  moveSlice(orient, offset01, deltaMm) {
+    const { rasLo, rasHi } = this.geom;
+    const cur = offset01ToMm(orient, offset01, rasLo, rasHi);
+    const next = cur + deltaMm;
+    const [lo, hi] = this.bounds(orient);
+    if (next < lo || next > hi) return offset01;
+    return mmToOffset01(orient, next, rasLo, rasHi);
+  }
+  incrementSlice(orient, offset01) {
+    return this.moveSlice(orient, offset01, this.spacing(orient));
+  }
+  decrementSlice(orient, offset01) {
+    return this.moveSlice(orient, offset01, -this.spacing(orient));
+  }
+  /** Map a wheel event to a step. Returns the new offset01. */
+  wheel(orient, offset01, forward) {
+    return forward ? this.incrementSlice(orient, offset01) : this.decrementSlice(orient, offset01);
+  }
+  /** Slicer's slice-view keyboard bindings. Returns the new offset01 (unchanged if the
+   *  key isn't a stepping key). `key` is a DOM KeyboardEvent.key value. */
+  key(orient, offset01, key) {
+    switch (key) {
+      case "f":
+      case "F":
+      case "ArrowRight":
+      case "ArrowUp":
+        return this.incrementSlice(orient, offset01);
+      case "b":
+      case "B":
+      case "ArrowLeft":
+      case "ArrowDown":
+        return this.decrementSlice(orient, offset01);
+      default:
+        return offset01;
+    }
+  }
+  /** True if this key is one Slicer's slice view consumes for stepping. */
+  static isStepKey(key) {
+    return ["f", "F", "b", "B", "ArrowRight", "ArrowLeft", "ArrowUp", "ArrowDown"].includes(key);
+  }
+};
+
 // render/introspect.ts
 var LOG_MAX = 500;
 function installIntrospection(api) {
@@ -1244,13 +1340,31 @@ async function main() {
     drawAll();
   };
   globalThis.addEventListener("resize", resize);
+  const sliceIx = new SliceInteractor({ ijkToRAS: rs.sv.ijkToRAS, rasLo: rasLo0, rasHi: rasHi0 });
+  let focusedCell = null;
   for (const p of planes) {
     cv[p.cell].addEventListener("wheel", (e) => {
       e.preventDefault();
-      off[p.cell] = Math.max(0, Math.min(1, off[p.cell] + (e.deltaY > 0 ? 0.02 : -0.02)));
+      off[p.cell] = sliceIx.wheel(p.orient, off[p.cell], e.deltaY < 0);
       drawPlane(p);
+      hook?.logEvent("sliceStep", { cell: p.cell, via: "wheel", forward: e.deltaY < 0, offsetMm: offset01ToMm(p.orient, off[p.cell], rasLo0, rasHi0) });
     }, { passive: false });
+    cv[p.cell].addEventListener("pointerenter", () => {
+      focusedCell = p.cell;
+    });
+    cv[p.cell].addEventListener("pointerleave", () => {
+      if (focusedCell === p.cell) focusedCell = null;
+    });
   }
+  globalThis.addEventListener("keydown", (e) => {
+    if (!focusedCell || !SliceInteractor.isStepKey(e.key)) return;
+    const p = planes.find((q) => q.cell === focusedCell);
+    if (!p) return;
+    e.preventDefault();
+    off[p.cell] = sliceIx.key(p.orient, off[p.cell], e.key);
+    drawPlane(p);
+    hook?.logEvent("sliceStep", { cell: p.cell, via: "key", key: e.key, offsetMm: offset01ToMm(p.orient, off[p.cell], rasLo0, rasHi0) });
+  });
   const viewSize = () => ({ w: cv.threeD.clientWidth, h: cv.threeD.clientHeight });
   const localXY = (e) => {
     const r = cv.threeD.getBoundingClientRect();
@@ -1301,7 +1415,7 @@ async function main() {
       const nAxis = { axial: 2, coronal: 1, sagittal: 0 };
       for (const p of planes) {
         const a = nAxis[p.orient];
-        out[p.cell] = { orient: p.orient, offset01: off[p.cell], offsetMm: rasLo[a] + off[p.cell] * (rasHi[a] - rasLo[a]), spanMm: rs.slice.spanMmFor(p.orient) };
+        out[p.cell] = { orient: p.orient, offset01: off[p.cell], offsetMm: offset01ToMm(p.orient, off[p.cell], rasLo, rasHi), rasMm: rasLo[a] + off[p.cell] * (rasHi[a] - rasLo[a]), spanMm: rs.slice.spanMmFor(p.orient), spacing: sliceIx.spacing(p.orient), bounds: sliceIx.bounds(p.orient) };
       }
       return out;
     },
@@ -1330,6 +1444,27 @@ async function main() {
         Math.max(0, Math.min(Y - 1, Math.round(t[1] * Y - 0.5))),
         Math.max(0, Math.min(Z - 1, Math.round(t[2] * Z - 0.5)))
       ];
+    },
+    stepSlice: (cell, forward) => {
+      const p = planes.find((q) => q.cell === cell);
+      if (!p) throw new Error("unknown cell " + cell);
+      off[p.cell] = sliceIx.wheel(p.orient, off[p.cell], forward);
+      drawPlane(p);
+      return offset01ToMm(p.orient, off[p.cell], rasLo, rasHi);
+    },
+    keySlice: (cell, key) => {
+      const p = planes.find((q) => q.cell === cell);
+      if (!p) throw new Error("unknown cell " + cell);
+      off[p.cell] = sliceIx.key(p.orient, off[p.cell], key);
+      drawPlane(p);
+      return offset01ToMm(p.orient, off[p.cell], rasLo, rasHi);
+    },
+    setSliceOffsetMm: (cell, mm) => {
+      const p = planes.find((q) => q.cell === cell);
+      if (!p) throw new Error("unknown cell " + cell);
+      off[p.cell] = mmToOffset01(p.orient, mm, rasLo, rasHi);
+      drawPlane(p);
+      return offset01ToMm(p.orient, off[p.cell], rasLo, rasHi);
     },
     render: () => drawAll()
   });
