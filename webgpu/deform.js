@@ -373,135 +373,6 @@ ${dispatch}
   }
 };
 
-// render/fields.ts
-var ImageField = class {
-  kind = "img";
-  bindingCount = 2;
-  // volume (3d) + lut (2d)
-  volTex;
-  lutTex;
-  p2t;
-  clim;
-  shade;
-  unit;
-  stepMm;
-  box;
-  constructor(dev, data, dims, spacing, lut, opts) {
-    const center = opts.center ?? [0, 0, 0];
-    this.volTex = dev.createTexture({ size: dims, dimension: "3d", format: "r32float", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
-    dev.queue.writeTexture({ texture: this.volTex }, data, { bytesPerRow: dims[0] * 4, rowsPerImage: dims[1] }, dims);
-    this.lutTex = dev.createTexture({ size: [256, 1], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
-    dev.queue.writeTexture({ texture: this.lutTex }, lut, { bytesPerRow: 256 * 4 }, [256, 1]);
-    if (opts.ijkToRAS) {
-      this.p2t = patientToTextureFromIjkToRAS(opts.ijkToRAS, dims);
-      this.box = volumeAABBFromIjkToRAS(opts.ijkToRAS, dims);
-      this.stepMm = Math.min(...spacingFromIjkToRAS(opts.ijkToRAS));
-    } else {
-      this.p2t = patientToTexture(dims, spacing, center);
-      this.box = volumeAABB(dims, spacing, center);
-      this.stepMm = Math.min(...spacing);
-    }
-    this.clim = opts.clim;
-    this.shade = opts.shade ?? [0.35, 0.75, 0.35, 20];
-    this.unit = opts.opacityUnitDistance ?? this.stepMm;
-  }
-  uniformFloats() {
-    return 28;
-  }
-  // mat4(16) + clim(4) + shade(4) + params(4)
-  aabb() {
-    return this.box;
-  }
-  sampleStep() {
-    return this.stepMm;
-  }
-  /** The r32float 3D scalar texture (e.g. to share with a SliceRenderer for MPR). */
-  volumeTexture() {
-    return this.volTex;
-  }
-  /** RAS(patient) -> texture[0,1] matrix (encodes the real ijkToRAS geometry). */
-  patientToTexture() {
-    return this.p2t;
-  }
-  structMembers(s) {
-    return [
-      `  img${s}_p2t : mat4x4<f32>,`,
-      `  img${s}_clim : vec4<f32>,`,
-      // lo, hi, _, _
-      `  img${s}_shade : vec4<f32>,`,
-      // ka, kd, ks, shininess
-      `  img${s}_params : vec4<f32>,`
-      // opacity_unit_distance, _, _, _
-    ].join("\n");
-  }
-  declareBindings(s, base) {
-    return [
-      `@group(0) @binding(${base}) var t_vol_img${s} : texture_3d<f32>;`,
-      `@group(0) @binding(${base + 1}) var t_lut_img${s} : texture_2d<f32>;`
-    ].join("\n");
-  }
-  samplingWGSL(s) {
-    return (
-      /* wgsl */
-      `
-fn sampc_img${s}(wp : vec3<f32>) -> f32 {
-  let t4 = u_material.img${s}_p2t * vec4<f32>(transform_point_img${s}(wp), 1.0);
-  return textureSampleLevel(t_vol_img${s}, s_lin, clamp(t4.xyz, vec3<f32>(0.0), vec3<f32>(1.0)), 0.0).r;
-}
-fn sample_field_img${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
-  let t4 = u_material.img${s}_p2t * vec4<f32>(transform_point_img${s}(wp), 1.0);
-  let tex = t4.xyz;
-  if (any(tex < vec3<f32>(0.0)) || any(tex > vec3<f32>(1.0))) { return vec4<f32>(0.0); }
-  let val = textureSampleLevel(t_vol_img${s}, s_lin, tex, 0.0).r;
-  let lo = u_material.img${s}_clim.x; let hi = u_material.img${s}_clim.y;
-  let tf = textureSampleLevel(t_lut_img${s}, s_lin, vec2<f32>(clamp((val - lo) / max(hi - lo, 1e-6), 0.0, 1.0), 0.5), 0.0);
-  let step = u_material.scene.x;
-  let unit = max(u_material.img${s}_params.x, 1e-3);
-  let opacity = clamp(1.0 - pow(1.0 - clamp(tf.a, 0.0, 1.0), step / unit), 0.0, 1.0);
-  if (opacity <= 0.001) { return vec4<f32>(0.0); }
-  let h = step * 2.0;   // wider central difference -> smoother normals (less shading aliasing on coarse volumes)
-  let g = vec3<f32>(
-    sampc_img${s}(wp + vec3<f32>(h,0,0)) - sampc_img${s}(wp - vec3<f32>(h,0,0)),
-    sampc_img${s}(wp + vec3<f32>(0,h,0)) - sampc_img${s}(wp - vec3<f32>(0,h,0)),
-    sampc_img${s}(wp + vec3<f32>(0,0,h)) - sampc_img${s}(wp - vec3<f32>(0,0,h))) / (2.0 * h);
-  let glen = length(g);
-  let ka = u_material.img${s}_shade.x; let kd = u_material.img${s}_shade.y;
-  let ks = u_material.img${s}_shade.z; let sh = u_material.img${s}_shade.w;
-  var lit_srgb = tf.rgb * ka;
-  if (glen > 1e-6) {
-    var n = g / glen;
-    if (dot(n, -rd) < 0.0) { n = -n; }
-    let view_dir = normalize(-rd);
-    let ldotn = dot(view_dir, n);
-    if (ldotn > 0.0) {
-      let refl = normalize(2.0 * ldotn * n - view_dir);
-      let rdotv = max(0.0, dot(refl, view_dir));
-      lit_srgb = tf.rgb * (ka + kd * ldotn) + vec3<f32>(ks * pow(rdotv, sh));
-    }
-  }
-  let lit = srgb2physical(clamp(lit_srgb, vec3<f32>(0.0), vec3<f32>(1.0)));
-  return vec4<f32>(lit * opacity, opacity);
-}`
-    );
-  }
-  fillUniforms(out, off) {
-    out.set(this.p2t, off);
-    out[off + 16] = this.clim[0];
-    out[off + 17] = this.clim[1];
-    out[off + 20] = this.shade[0];
-    out[off + 21] = this.shade[1];
-    out[off + 22] = this.shade[2];
-    out[off + 23] = this.shade[3];
-    out[off + 24] = this.unit;
-  }
-  bindEntries(_s, base) {
-    return [
-      { binding: base, resource: this.volTex.createView() },
-      { binding: base + 1, resource: this.lutTex.createView() }
-    ];
-  }
-};
-
 // render/fiducial-field.ts
 var MAX = 64;
 var FiducialField = class {
@@ -792,51 +663,340 @@ function sampleDisplacementGrid(dims, spacing, center, f) {
   return out;
 }
 
-// render/demos/sphere-scene.ts
-var N = 128;
-var SPACING = [1.5, 1.5, 1.5];
-var clamp01 = (v) => Math.max(0, Math.min(1, v));
-function syntheticVolume() {
-  const data = new Float32Array(N * N * N);
-  const c = (N - 1) / 2;
-  const ic = [c + 16, c, c + 12];
-  for (let z = 0; z < N; z++) {
-    for (let y = 0; y < N; y++) {
-      for (let x = 0; x < N; x++) {
-        const ro = Math.hypot(x - c, y - c, z - c);
-        const ri = Math.hypot(x - ic[0], y - ic[1], z - ic[2]);
-        const soft = 45 * clamp01((44 - ro) / 3);
-        const dense = 210 * clamp01((20 - ri) / 3);
-        data[(z * N + y) * N + x] = Math.max(soft, dense);
-      }
+// render/fields.ts
+var ImageField = class {
+  kind = "img";
+  bindingCount = 2;
+  // volume (3d) + lut (2d)
+  volTex;
+  lutTex;
+  p2t;
+  clim;
+  shade;
+  unit;
+  stepMm;
+  box;
+  constructor(dev, data, dims, spacing, lut, opts) {
+    const center = opts.center ?? [0, 0, 0];
+    this.volTex = dev.createTexture({ size: dims, dimension: "3d", format: "r32float", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+    dev.queue.writeTexture({ texture: this.volTex }, data, { bytesPerRow: dims[0] * 4, rowsPerImage: dims[1] }, dims);
+    this.lutTex = dev.createTexture({ size: [256, 1], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+    dev.queue.writeTexture({ texture: this.lutTex }, lut, { bytesPerRow: 256 * 4 }, [256, 1]);
+    if (opts.ijkToRAS) {
+      this.p2t = patientToTextureFromIjkToRAS(opts.ijkToRAS, dims);
+      this.box = volumeAABBFromIjkToRAS(opts.ijkToRAS, dims);
+      this.stepMm = Math.min(...spacingFromIjkToRAS(opts.ijkToRAS));
+    } else {
+      this.p2t = patientToTexture(dims, spacing, center);
+      this.box = volumeAABB(dims, spacing, center);
+      this.stepMm = Math.min(...spacing);
+    }
+    this.clim = opts.clim;
+    this.shade = opts.shade ?? [0.35, 0.75, 0.35, 20];
+    this.unit = opts.opacityUnitDistance ?? this.stepMm;
+  }
+  uniformFloats() {
+    return 28;
+  }
+  // mat4(16) + clim(4) + shade(4) + params(4)
+  aabb() {
+    return this.box;
+  }
+  sampleStep() {
+    return this.stepMm;
+  }
+  /** The r32float 3D scalar texture (e.g. to share with a SliceRenderer for MPR). */
+  volumeTexture() {
+    return this.volTex;
+  }
+  /** RAS(patient) -> texture[0,1] matrix (encodes the real ijkToRAS geometry). */
+  patientToTexture() {
+    return this.p2t;
+  }
+  structMembers(s) {
+    return [
+      `  img${s}_p2t : mat4x4<f32>,`,
+      `  img${s}_clim : vec4<f32>,`,
+      // lo, hi, _, _
+      `  img${s}_shade : vec4<f32>,`,
+      // ka, kd, ks, shininess
+      `  img${s}_params : vec4<f32>,`
+      // opacity_unit_distance, _, _, _
+    ].join("\n");
+  }
+  declareBindings(s, base) {
+    return [
+      `@group(0) @binding(${base}) var t_vol_img${s} : texture_3d<f32>;`,
+      `@group(0) @binding(${base + 1}) var t_lut_img${s} : texture_2d<f32>;`
+    ].join("\n");
+  }
+  samplingWGSL(s) {
+    return (
+      /* wgsl */
+      `
+fn sampc_img${s}(wp : vec3<f32>) -> f32 {
+  let t4 = u_material.img${s}_p2t * vec4<f32>(transform_point_img${s}(wp), 1.0);
+  return textureSampleLevel(t_vol_img${s}, s_lin, clamp(t4.xyz, vec3<f32>(0.0), vec3<f32>(1.0)), 0.0).r;
+}
+fn sample_field_img${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
+  let t4 = u_material.img${s}_p2t * vec4<f32>(transform_point_img${s}(wp), 1.0);
+  let tex = t4.xyz;
+  if (any(tex < vec3<f32>(0.0)) || any(tex > vec3<f32>(1.0))) { return vec4<f32>(0.0); }
+  let val = textureSampleLevel(t_vol_img${s}, s_lin, tex, 0.0).r;
+  let lo = u_material.img${s}_clim.x; let hi = u_material.img${s}_clim.y;
+  let tf = textureSampleLevel(t_lut_img${s}, s_lin, vec2<f32>(clamp((val - lo) / max(hi - lo, 1e-6), 0.0, 1.0), 0.5), 0.0);
+  let step = u_material.scene.x;
+  let unit = max(u_material.img${s}_params.x, 1e-3);
+  let opacity = clamp(1.0 - pow(1.0 - clamp(tf.a, 0.0, 1.0), step / unit), 0.0, 1.0);
+  if (opacity <= 0.001) { return vec4<f32>(0.0); }
+  let h = step * 2.0;   // wider central difference -> smoother normals (less shading aliasing on coarse volumes)
+  let g = vec3<f32>(
+    sampc_img${s}(wp + vec3<f32>(h,0,0)) - sampc_img${s}(wp - vec3<f32>(h,0,0)),
+    sampc_img${s}(wp + vec3<f32>(0,h,0)) - sampc_img${s}(wp - vec3<f32>(0,h,0)),
+    sampc_img${s}(wp + vec3<f32>(0,0,h)) - sampc_img${s}(wp - vec3<f32>(0,0,h))) / (2.0 * h);
+  let glen = length(g);
+  let ka = u_material.img${s}_shade.x; let kd = u_material.img${s}_shade.y;
+  let ks = u_material.img${s}_shade.z; let sh = u_material.img${s}_shade.w;
+  var lit_srgb = tf.rgb * ka;
+  if (glen > 1e-6) {
+    var n = g / glen;
+    if (dot(n, -rd) < 0.0) { n = -n; }
+    let view_dir = normalize(-rd);
+    let ldotn = dot(view_dir, n);
+    if (ldotn > 0.0) {
+      let refl = normalize(2.0 * ldotn * n - view_dir);
+      let rdotv = max(0.0, dot(refl, view_dir));
+      lit_srgb = tf.rgb * (ka + kd * ldotn) + vec3<f32>(ks * pow(rdotv, sh));
     }
   }
-  return data;
+  let lit = srgb2physical(clamp(lit_srgb, vec3<f32>(0.0), vec3<f32>(1.0)));
+  return vec4<f32>(lit * opacity, opacity);
+}`
+    );
+  }
+  fillUniforms(out, off) {
+    out.set(this.p2t, off);
+    out[off + 16] = this.clim[0];
+    out[off + 17] = this.clim[1];
+    out[off + 20] = this.shade[0];
+    out[off + 21] = this.shade[1];
+    out[off + 22] = this.shade[2];
+    out[off + 23] = this.shade[3];
+    out[off + 24] = this.unit;
+  }
+  bindEntries(_s, base) {
+    return [
+      { binding: base, resource: this.volTex.createView() },
+      { binding: base + 1, resource: this.lutTex.createView() }
+    ];
+  }
+};
+
+// render/zarr.ts
+var ZDT = {
+  "<f4": Float32Array,
+  "<f8": Float64Array,
+  "<i4": Int32Array,
+  "<u4": Uint32Array,
+  "<i2": Int16Array,
+  "<u2": Uint16Array,
+  "|i1": Int8Array,
+  "|u1": Uint8Array,
+  "<i1": Int8Array,
+  "<u1": Uint8Array
+};
+async function inflateDeflate(buf) {
+  const ds = new DecompressionStream("deflate");
+  return await new Response(new Response(buf).body.pipeThrough(ds)).arrayBuffer();
 }
-function buildLUT() {
+async function fetchZarrVolume(blobBase, z, onBytes, concurrency = 12) {
+  const Ctor = ZDT[z.dtype] ?? Int16Array;
+  const [nz, ny, nx] = z.shape, [cz, cy, cx] = z.chunks, [ncz, ncy, ncx] = z.chunkGrid;
+  const base = blobBase + z.dir + "/" + z.dataset + "/";
+  const out = new Float32Array(nz * ny * nx);
+  let lo = Infinity, hi = -Infinity;
+  const jobs = [];
+  for (let kk = 0; kk < ncz; kk++) for (let jj = 0; jj < ncy; jj++) for (let ii = 0; ii < ncx; ii++) jobs.push([kk, jj, ii]);
+  let idx = 0;
+  const worker = async () => {
+    while (idx < jobs.length) {
+      const [kk, jj, ii] = jobs[idx++];
+      const gz = await (await fetch(base + kk + "." + jj + "." + ii)).arrayBuffer();
+      onBytes?.(gz.byteLength);
+      const chunk = new Ctor(await inflateDeflate(gz));
+      const z0 = kk * cz, y0 = jj * cy, x0 = ii * cx;
+      const zw = Math.min(cz, nz - z0), yw = Math.min(cy, ny - y0), xw = Math.min(cx, nx - x0);
+      for (let zz = 0; zz < zw; zz++) {
+        for (let yy = 0; yy < yw; yy++) {
+          const src = (zz * cy + yy) * cx;
+          const dst = ((z0 + zz) * ny + (y0 + yy)) * nx + x0;
+          for (let xx = 0; xx < xw; xx++) {
+            const v = chunk[src + xx];
+            out[dst + xx] = v;
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+          }
+        }
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, jobs.length) }, worker));
+  return { data: out, dims: [nx, ny, nz], range: [lo, hi] };
+}
+
+// render/scene-volume.ts
+function interpTF(tf, s, comps) {
+  if (!tf.length) return new Array(comps).fill(0);
+  if (s <= tf[0][0]) return tf[0].slice(1, 1 + comps);
+  const last = tf[tf.length - 1];
+  if (s >= last[0]) return last.slice(1, 1 + comps);
+  for (let i = 1; i < tf.length; i++) {
+    if (s <= tf[i][0]) {
+      const a = tf[i - 1], b = tf[i];
+      const u = (s - a[0]) / Math.max(b[0] - a[0], 1e-9);
+      return Array.from({ length: comps }, (_, c) => a[1 + c] + u * (b[1 + c] - a[1 + c]));
+    }
+  }
+  return last.slice(1, 1 + comps);
+}
+function lutFromTransferFunctions(colorTF, opacityTF, clim) {
   const lut = new Uint8Array(256 * 4);
   for (let i = 0; i < 256; i++) {
-    let r = 0, g = 0, b = 0, a = 0;
-    if (i >= 15 && i < 120) {
-      const t = clamp01((i - 25) / 55);
-      r = 0.78;
-      g = 0.4;
-      b = 0.34;
-      a = 0.02 + 0.11 * t;
-    } else if (i >= 120) {
-      const t = clamp01((i - 120) / 100);
-      r = 0.8 + 0.15 * t;
-      g = 0.76 + 0.16 * t;
-      b = 0.66 + 0.19 * t;
-      a = 0.25 + 0.65 * t;
-    }
-    lut[i * 4] = Math.round(r * 255);
-    lut[i * 4 + 1] = Math.round(g * 255);
-    lut[i * 4 + 2] = Math.round(b * 255);
-    lut[i * 4 + 3] = Math.round(a * 255);
+    const s = clim[0] + i / 255 * (clim[1] - clim[0]);
+    const [r, g, b] = interpTF(colorTF, s, 3);
+    const [a] = interpTF(opacityTF, s, 1);
+    lut[i * 4 + 0] = Math.round(Math.max(0, Math.min(1, r)) * 255);
+    lut[i * 4 + 1] = Math.round(Math.max(0, Math.min(1, g)) * 255);
+    lut[i * 4 + 2] = Math.round(Math.max(0, Math.min(1, b)) * 255);
+    lut[i * 4 + 3] = Math.round(Math.max(0, Math.min(1, a)) * 255);
   }
   return lut;
 }
+function lutFromWindowLevel() {
+  const lut = new Uint8Array(256 * 4);
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255;
+    const g = Math.round(t * 255);
+    lut[i * 4 + 0] = lut[i * 4 + 1] = lut[i * 4 + 2] = g;
+    lut[i * 4 + 3] = Math.round(Math.max(0, Math.min(1, (t - 0.15) / 0.85)) * 200);
+  }
+  return lut;
+}
+async function loadSceneVolumeField(dev, sceneUrl, onBytes) {
+  const raw = await (await fetch(sceneUrl)).json();
+  const wrapper = raw.nodes ? raw : { nodes: raw };
+  const nodes = wrapper.nodes;
+  const blobBase = wrapper.blobBase ?? sceneUrl.replace(/[^/]*$/, "") + "blobs/";
+  const vol = Object.values(nodes).find((n) => n.class === "vtkMRMLScalarVolumeNode" && n.attrs?.zarr);
+  if (!vol) throw new Error("no zarr ScalarVolumeNode in scene");
+  const z = vol.attrs.zarr;
+  const ijkToRAS = vol.attrs.ijkToRAS;
+  if (!ijkToRAS) throw new Error("volume node has no ijkToRAS");
+  const zv = await fetchZarrVolume(blobBase, z, onBytes);
+  let vp;
+  for (const dispId of vol.refs?.display ?? []) {
+    const disp = nodes[dispId];
+    for (const vpId of disp?.refs?.volumeProperty ?? []) {
+      if (nodes[vpId]?.class === "vtkMRMLVolumePropertyNode") vp = nodes[vpId];
+    }
+  }
+  let lut, clim, shade;
+  if (vp?.attrs?.color && vp?.attrs?.scalarOpacity) {
+    const colorTF = vp.attrs.color, opacityTF = vp.attrs.scalarOpacity;
+    const lo2 = colorTF[0][0], hi2 = colorTF[colorTF.length - 1][0];
+    clim = [lo2, hi2];
+    lut = lutFromTransferFunctions(colorTF, opacityTF, clim);
+    shade = vp.attrs.shade ? [0.25, 0.75, 0.5, 24] : [1, 0, 0, 1];
+  } else {
+    const disp = nodes[(vol.refs?.display ?? [])[0]]?.attrs ?? {};
+    const win2 = disp.window ?? zv.range[1] - zv.range[0];
+    const lev2 = disp.level ?? (zv.range[0] + zv.range[1]) / 2;
+    clim = [lev2 - win2 / 2, lev2 + win2 / 2];
+    lut = lutFromWindowLevel();
+    shade = [0.25, 0.75, 0.5, 24];
+  }
+  const disp0 = nodes[(vol.refs?.display ?? [])[0]]?.attrs ?? {};
+  const win = disp0.window ?? zv.range[1] - zv.range[0];
+  const lev = disp0.level ?? (zv.range[0] + zv.range[1]) / 2;
+  const field = new ImageField(dev, zv.data, zv.dims, [1, 1, 1], lut, { clim, ijkToRAS, shade });
+  const [lo, hi] = field.aabb();
+  const center = [(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2];
+  const radius = Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) / 2;
+  return { field, voxels: zv.data, dims: zv.dims, ijkToRAS, name: vol.name ?? "volume", range: zv.range, center, radius, win, lev };
+}
+
+// render/demos/deform-scene.ts
+var GRID_DIMS = [24, 24, 24];
+var PAD_MM = 40;
+function boundsCorners(lo, hi) {
+  return [
+    [lo[0], lo[1], lo[2]],
+    [hi[0], lo[1], lo[2]],
+    [lo[0], hi[1], lo[2]],
+    [hi[0], hi[1], lo[2]],
+    [lo[0], lo[1], hi[2]],
+    [hi[0], lo[1], hi[2]],
+    [lo[0], hi[1], hi[2]],
+    [hi[0], hi[1], hi[2]]
+  ];
+}
+function defaultTargets(sources) {
+  const t = sources.map((c) => [...c]);
+  t[7] = [t[7][0] + 55, t[7][1] + 25, t[7][2] + 20];
+  t[0] = [t[0][0] - 30, t[0][1] - 10, t[0][2] - 15];
+  return t;
+}
+async function buildDeformScene(dev, sceneUrl = "https://pieper.github.io/live/legacy/scenes/MRHead.json", onBytes) {
+  const sv = await loadSceneVolumeField(dev, sceneUrl, onBytes);
+  const image = sv.field;
+  const [lo, hi] = image.aabb();
+  const sources = boundsCorners(lo, hi);
+  const targets = defaultTargets(sources);
+  const gLo = [lo[0] - PAD_MM, lo[1] - PAD_MM, lo[2] - PAD_MM];
+  const gHi = [hi[0] + PAD_MM, hi[1] + PAD_MM, hi[2] + PAD_MM];
+  const center = [(gLo[0] + gHi[0]) / 2, (gLo[1] + gHi[1]) / 2, (gLo[2] + gHi[2]) / 2];
+  const spacing = [
+    (gHi[0] - gLo[0]) / GRID_DIMS[0],
+    (gHi[1] - gLo[1]) / GRID_DIMS[1],
+    (gHi[2] - gLo[2]) / GRID_DIMS[2]
+  ];
+  let warp;
+  const fiducials = new FiducialField([]);
+  const pinR = Math.max(4, Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) * 0.012);
+  const scene = {
+    sv,
+    image,
+    warp: void 0,
+    fiducials,
+    sources,
+    targets,
+    rebuild(d) {
+      const f = tps3d(sources, targets);
+      const disp = sampleDisplacementGrid(GRID_DIMS, spacing, center, f);
+      warp = new TransformField(d, disp, GRID_DIMS, spacing, { gain: 1, center });
+      image.transform = warp;
+      scene.warp = warp;
+      const pins = [
+        ...sources.map((c) => ({ center: c, radius: pinR, color: [0.25, 0.85, 1, 1] })),
+        ...targets.map((c, i) => ({
+          center: c,
+          radius: pinR,
+          // only show a magenta target pin where it actually differs from its source
+          color: Math.hypot(c[0] - sources[i][0], c[1] - sources[i][1], c[2] - sources[i][2]) > 1e-6 ? [1, 0.35, 0.85, 1] : [0, 0, 0, 0]
+        }))
+      ];
+      fiducials.setSpheres(pins);
+    },
+    setTarget(i, p, d) {
+      targets[i] = [...p];
+      scene.rebuild(d);
+    }
+  };
+  scene.rebuild(dev);
+  return scene;
+}
+
+// render/demos/sphere-scene.ts
 function orbitEye(azimuth, elevation, distance) {
   const ce = Math.cos(elevation);
   return [
@@ -844,50 +1004,6 @@ function orbitEye(azimuth, elevation, distance) {
     -distance * ce * Math.cos(azimuth),
     distance * Math.sin(elevation)
   ];
-}
-
-// render/demos/deform-scene.ts
-var GRID_DIMS = [32, 32, 32];
-var WORLD = N * SPACING[0];
-var GRID_SPACING = [WORLD / GRID_DIMS[0], WORLD / GRID_DIMS[1], WORLD / GRID_DIMS[2]];
-function landmarks() {
-  const R = 52;
-  const source = [
-    [R, 0, 0],
-    [-R, 0, 0],
-    [0, R, 0],
-    [0, -R, 0],
-    [0, 0, R],
-    [0, 0, -R]
-  ];
-  const target = [
-    [R + 34, 0, 12],
-    [-R, 0, 0],
-    [0, R + 10, 0],
-    [0, -R, 0],
-    [0, 0, R - 26],
-    [0, 0, -R]
-  ];
-  return { source, target };
-}
-function buildDeformScene(dev, gain = 1) {
-  const { source, target } = landmarks();
-  const f = tps3d(source, target);
-  const disp = sampleDisplacementGrid(GRID_DIMS, GRID_SPACING, [0, 0, 0], f);
-  const warp = new TransformField(dev, disp, GRID_DIMS, GRID_SPACING, { gain });
-  const image = new ImageField(dev, syntheticVolume(), [N, N, N], SPACING, buildLUT(), {
-    clim: [0, 255],
-    shade: [0.35, 0.75, 0.35, 24]
-  });
-  image.transform = warp;
-  const pins = [
-    ...source.map((c) => ({ center: c, radius: 4, color: [0.25, 0.85, 1, 1] })),
-    // cyan = source
-    ...target.map((c) => ({ center: c, radius: 4, color: [1, 0.35, 0.85, 1] }))
-    // magenta = target
-  ];
-  const fiducials = new FiducialField(pins, { shininess: 90, kSpecular: 0.6 });
-  return { image, warp, fiducials };
 }
 
 // render/introspect.ts
@@ -940,6 +1056,7 @@ var status = (msg, err = false) => {
 };
 async function main() {
   const canvas = document.getElementById("gpu");
+  const sceneUrl = new URLSearchParams(location.search).get("scene") ?? "https://pieper.github.io/live/legacy/scenes/MRHead.json";
   if (!navigator.gpu) {
     status("WebGPU not available \u2014 try Chrome/Edge 113+ or Safari 18+.", true);
     return;
@@ -950,18 +1067,27 @@ async function main() {
   const preferred = navigator.gpu.getPreferredCanvasFormat();
   const srgb = preferred + "-srgb";
   ctx.configure({ device: gpu.device, format: preferred, viewFormats: [srgb], alphaMode: "opaque" });
-  status("solving thin-plate spline\u2026");
-  const sc = buildDeformScene(gpu.device, 1);
+  let mb = 0;
+  status("streaming MRHead from the bucket\u2026");
+  const sc = await buildDeformScene(gpu.device, sceneUrl, (n) => {
+    mb += n;
+    status(`streaming MRHead\u2026 ${(mb / 1e6).toFixed(1)} MB`);
+  });
   const scene = new SceneRenderer(gpu, srgb);
   scene.build([sc.warp, sc.image, sc.fiducials]);
   scene.setBackground(0.06, 0.07, 0.1);
-  let az = 0.75, el = 0.28, dist = 360;
+  const { center, radius } = sc.sv;
+  let az = Math.PI, el = 0.12, dist = radius * 2.6;
+  const eyeAt = () => {
+    const o = orbitEye(az, el, dist);
+    return [center[0] + o[0], center[1] + o[1], center[2] + o[2]];
+  };
   const draw = () => {
     const w = canvas.width, h = canvas.height;
-    scene.setCamera(orbitEye(az, el, dist), [0, 0, 0], [0, 0, 1], 26, w, h);
+    scene.setCamera(eyeAt(), center, [0, 0, 1], 26, w, h);
     const t0 = performance.now();
     scene.renderToView(ctx.getCurrentTexture().createView({ format: srgb }), w, h);
-    status(`Landmark deform (TPS) \xB7 gain ${sc.warp.gain.toFixed(2)} \xB7 ${w}\xD7${h} \xB7 ${(performance.now() - t0).toFixed(0)} ms/frame \xB7 drag to orbit`);
+    status(`${sc.sv.name} \xB7 TPS landmark deform \xB7 gain ${sc.warp.gain.toFixed(2)} \xB7 8 corner landmarks \xB7 ${(performance.now() - t0).toFixed(0)} ms/frame \xB7 drag to orbit`);
   };
   const resize = () => {
     const dpr = Math.min(2, globalThis.devicePixelRatio || 1);
@@ -999,11 +1125,11 @@ async function main() {
   });
   canvas.addEventListener("wheel", (e) => {
     e.preventDefault();
-    dist = Math.max(120, Math.min(900, dist * (e.deltaY > 0 ? 1.08 : 0.93)));
+    dist = Math.max(radius * 1.1, Math.min(radius * 8, dist * (e.deltaY > 0 ? 1.08 : 0.93)));
     draw();
   }, { passive: false });
   installIntrospection({
-    getCamera: () => ({ azimuth: az, elevation: el, distance: dist, position: orbitEye(az, el, dist), focalPoint: [0, 0, 0], viewUp: [0, 0, 1], viewAngle: 26 }),
+    getCamera: () => ({ azimuth: az, elevation: el, distance: dist, position: eyeAt(), focalPoint: [...center], viewUp: [0, 0, 1], viewAngle: 26 }),
     setCamera: (p) => {
       if (p.azimuth !== void 0) az = p.azimuth;
       if (p.elevation !== void 0) el = p.elevation;
