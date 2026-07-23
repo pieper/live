@@ -26,14 +26,17 @@
 </head>
 <body>
 <header>
-  <h1>nnLive — interactive segmentation in the 4-up <span class="badge">nnLive</span></h1>
+  <h1>nnLive — interactive segmentation in the 4-up <span class="badge">nnLive · faithful 192³</span></h1>
   <div class="sub">The payoff: a <strong>real CT</strong> streamed into the SlicerLive 4-up, where <strong>each click runs
-    interactive segmentation</strong> (nnLive's distilled nnInteractive model, an ONNX net evaluated on a 64³ patch on
-    your GPU). The returned mask is splatted into a labelmap, re-baked with ColorizeVolume, and shown live as a colored
-    3D volume + MPR overlay, with a pushpin at each click. Click an organ in any MPR view; <strong>shift-click</strong>
-    adds a background (negative) point to refine. The whole SlicerLive-side pipeline runs here; the nnLive model loads
-    from its weights host (override with <code>?model=&lt;url&gt;</code>). If it can't load, a built-in region-grow
-    stub keeps the pipeline live (and says so).
+    nnLive's faithful interactive segmentation</strong> — the distilled nnInteractive model (image-only trunk encode +
+    perclick decode) running the full <strong>192³</strong> path on your GPU via a hand-written WGSL runtime, with
+    EDT-ball prompts, autoregressive prev-mask feedback, and auto-zoom ×1.5→×4, exactly as the standalone
+    <a href="https://pieper.github.io/nnLive/" target="_blank">nnLive</a> demo. The returned mask is splatted into a
+    labelmap, re-baked with ColorizeVolume, and shown live as a colored 3D volume + MPR overlay, with a pushpin at each
+    click. Coordinates are correct end-to-end: the MPR planes reslice in RAS (honoring the scene's anisotropic ijkToRAS),
+    and clicks map view→RAS→voxel through the same transform. Click an organ in any MPR view;
+    <strong>shift-click</strong> adds a background point to refine. The 188 MB perclick weights stream from the public
+    bucket (cached after first load); first click is slow (encode+decode 192³), later clicks refine.
     &nbsp;·&nbsp; <a href="https://github.com/pieper/nnLive" target="_blank">nnLive</a>
     &nbsp;·&nbsp; <a href="https://github.com/pieper/SlicerLive" target="_blank">SlicerLive</a></div>
 </header>

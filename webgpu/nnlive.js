@@ -142,6 +142,13 @@ function volumeAABBFromIjkToRAS(ijkToRAS, dims) {
   }
   return [lo, hi];
 }
+function applyMat4(m, p) {
+  const x = m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12];
+  const y = m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13];
+  const z = m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14];
+  const w = m[3] * p[0] + m[7] * p[1] + m[11] * p[2] + m[15] || 1;
+  return [x / w, y / w, z / w];
+}
 function applyRowMajor(m, p) {
   return [
     m[0] * p[0] + m[1] * p[1] + m[2] * p[2] + m[3],
@@ -372,7 +379,14 @@ var DEFAULT_FORMAT2 = "rgba8unorm-srgb";
 var SHADER = (
   /* wgsl */
   `
-struct U { a : vec4<f32>, b : vec4<f32> };  // a: axis, offset, win, lev ; b: overlayOpacity, sizeX, sizeY, _
+struct U {
+  p2t : mat4x4<f32>,     // RAS -> texture[0,1] (folds in ijkToRAS: rotation + anisotropy)
+  origin : vec4<f32>,    // RAS of the plane center (for the current scrub offset)
+  uvec : vec4<f32>,      // RAS vector spanning the view width  (isotropic mm)
+  vvec : vec4<f32>,      // RAS vector spanning the view height (isotropic mm)
+  params : vec4<f32>,    // win, lev, overlayOpacity, _
+  size : vec4<f32>,      // sizeX, sizeY, _, _
+};
 @group(0) @binding(0) var<uniform> u : U;
 @group(0) @binding(1) var s_lin : sampler;
 @group(0) @binding(2) var t_scalar : texture_3d<f32>;
@@ -391,34 +405,42 @@ fn srgb2physical(c : vec3<f32>) -> vec3<f32> {
 }
 @fragment
 fn fs_main(v : V) -> @location(0) vec4<f32> {
-  let uv = v.position.xy / vec2<f32>(u.b.y, u.b.z);      // [0,1] within this view
-  let s = u.a.y;
-  let axis = u32(u.a.x);
-  var tex : vec3<f32>;
-  if (axis == 0u) { tex = vec3<f32>(s, uv.x, uv.y); }        // sagittal (fix X)
-  else if (axis == 1u) { tex = vec3<f32>(uv.x, s, uv.y); }   // coronal  (fix Y)
-  else { tex = vec3<f32>(uv.x, uv.y, s); }                    // axial    (fix Z)
+  let uv = v.position.xy / u.size.xy;                 // [0,1], y down
+  let ras = u.origin.xyz + u.uvec.xyz * (uv.x - 0.5) + u.vvec.xyz * (0.5 - uv.y);
+  let t4 = u.p2t * vec4<f32>(ras, 1.0);
+  let tex = t4.xyz;
+  if (any(tex < vec3<f32>(0.0)) || any(tex > vec3<f32>(1.0))) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
   let val = textureSampleLevel(t_scalar, s_lin, tex, 0.0).r;
-  let win = max(u.a.z, 1e-6);
-  let g = clamp((val - (u.a.w - win * 0.5)) / win, 0.0, 1.0);
+  let win = max(u.params.x, 1e-6);
+  let g = clamp((val - (u.params.y - win * 0.5)) / win, 0.0, 1.0);
   var col = vec3<f32>(g);
   let ov = textureSampleLevel(t_overlay, s_lin, tex, 0.0);
-  col = mix(col, ov.rgb, clamp(ov.a * u.b.x, 0.0, 1.0));
+  col = mix(col, ov.rgb, clamp(ov.a * u.params.z, 0.0, 1.0));
   return vec4<f32>(srgb2physical(col), 1.0);
 }
 `
 );
+var BASES = {
+  axial: { uDir: [1, 0, 0], vDir: [0, 1, 0], uAxis: 0, vAxis: 1, nAxis: 2 },
+  coronal: { uDir: [1, 0, 0], vDir: [0, 0, 1], uAxis: 0, vAxis: 2, nAxis: 1 },
+  sagittal: { uDir: [0, 1, 0], vDir: [0, 0, 1], uAxis: 1, vAxis: 2, nAxis: 0 }
+};
 var SliceRenderer = class {
   dev;
   format;
   pipeline;
   sampler;
   ubuf;
-  u = new Float32Array(8);
-  // a(4) + b(4)
+  u = new Float32Array(36);
+  // p2t(16) + origin(4) + uvec(4) + vvec(4) + params(4) + size(4)
   bind;
-  scalar;
   overlay;
+  // volume geometry + current plane
+  p2t = new Float32Array(16);
+  rasLo = [-1, -1, -1];
+  rasHi = [1, 1, 1];
+  orient = "axial";
+  offset01 = 0.5;
   constructor(gpu, format = DEFAULT_FORMAT2) {
     this.dev = gpu.device;
     this.format = format;
@@ -430,9 +452,8 @@ var SliceRenderer = class {
       primitive: { topology: "triangle-list", cullMode: "none" }
     });
     this.sampler = this.dev.createSampler({ magFilter: "linear", minFilter: "linear", addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge", addressModeW: "clamp-to-edge" });
-    this.ubuf = this.dev.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.ubuf = this.dev.createBuffer({ size: this.u.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.setWindowLevel(255, 127);
-    this.setSlice(2, 0.5);
     this.setOverlayOpacity(0.55);
   }
   emptyOverlay;
@@ -443,10 +464,18 @@ var SliceRenderer = class {
     }
     return this.emptyOverlay;
   }
+  /** Volume geometry: patientToTexture (RAS->tex[0,1], encodes ijkToRAS) + the RAS
+   *  bounding box (for plane extents/scrub range). Get both from the ImageField. */
+  setVolume(p2t, rasLo, rasHi) {
+    this.p2t = p2t;
+    this.rasLo = rasLo;
+    this.rasHi = rasHi;
+    this.u.set(p2t, 0);
+  }
   /** Set the grayscale scalar (r32float 3d) and, optionally, a colored overlay
-   *  (rgba16float 3d, e.g. a ColorizeVolume bake). Omit overlay for a plain MPR. */
+   *  (rgba16float 3d) — which MUST share the same geometry (ijkToRAS/dims) so the
+   *  same RAS->tex mapping addresses both. Omit overlay for a plain MPR. */
   setTextures(scalar, overlay) {
-    this.scalar = scalar;
     this.overlay = overlay ?? this.transparentOverlay();
     this.bind = this.dev.createBindGroup({
       layout: this.pipeline.getBindGroupLayout(0),
@@ -458,20 +487,70 @@ var SliceRenderer = class {
       ]
     });
   }
-  setSlice(axis, offset01) {
-    this.u[0] = axis;
-    this.u[1] = Math.max(0, Math.min(1, offset01));
+  // Uniform float layout: p2t[0..15] origin[16..19] uvec[20..23] vvec[24..27] params[28..31] size[32..35]
+  /** Select the anatomical plane and scrub position (0..1 along the plane normal, RAS bbox). */
+  setPlane(orient, offset01) {
+    this.orient = orient;
+    this.offset01 = Math.max(0, Math.min(1, offset01));
   }
   setWindowLevel(win, lev) {
-    this.u[2] = win;
-    this.u[3] = lev;
+    this.u[28] = win;
+    this.u[29] = lev;
   }
   setOverlayOpacity(o) {
-    this.u[4] = o;
+    this.u[30] = o;
+  }
+  /** Physical size (mm) of the square view for the current plane (isotropic, letterboxed). */
+  viewSpanMm() {
+    const b = BASES[this.orient];
+    const uExt = this.rasHi[b.uAxis] - this.rasLo[b.uAxis];
+    const vExt = this.rasHi[b.vAxis] - this.rasLo[b.vAxis];
+    return Math.max(uExt, vExt) * 1.02;
+  }
+  /** Plane center in RAS for the current scrub offset. */
+  planeCenter() {
+    const b = BASES[this.orient];
+    const c = [
+      (this.rasLo[0] + this.rasHi[0]) / 2,
+      (this.rasLo[1] + this.rasHi[1]) / 2,
+      (this.rasLo[2] + this.rasHi[2]) / 2
+    ];
+    c[b.nAxis] = this.rasLo[b.nAxis] + this.offset01 * (this.rasHi[b.nAxis] - this.rasLo[b.nAxis]);
+    return c;
+  }
+  /** Map a view (u,v) in [0,1] (y down) to normalized texture coords for the current
+   *  plane — for click picking. Returns the tex coord; the caller converts to IJK via
+   *  ijk = tex*dims - 0.5. Anisotropy/rotation are handled by the same p2t the shader uses. */
+  viewToTex(u, v) {
+    const b = BASES[this.orient];
+    const span = this.viewSpanMm();
+    const c = this.planeCenter();
+    const ras = [
+      c[0] + b.uDir[0] * (u - 0.5) * span + b.vDir[0] * (0.5 - v) * span,
+      c[1] + b.uDir[1] * (u - 0.5) * span + b.vDir[1] * (0.5 - v) * span,
+      c[2] + b.uDir[2] * (u - 0.5) * span + b.vDir[2] * (0.5 - v) * span
+    ];
+    return applyMat4(this.p2t, ras);
   }
   drawInto(view, w, h) {
-    this.u[5] = w;
-    this.u[6] = h;
+    const b = BASES[this.orient];
+    const span = this.viewSpanMm();
+    const c = this.planeCenter();
+    this.u.set(this.p2t, 0);
+    this.u[16] = c[0];
+    this.u[17] = c[1];
+    this.u[18] = c[2];
+    this.u[19] = 0;
+    this.u[20] = b.uDir[0] * span;
+    this.u[21] = b.uDir[1] * span;
+    this.u[22] = b.uDir[2] * span;
+    this.u[23] = 0;
+    this.u[24] = b.vDir[0] * span;
+    this.u[25] = b.vDir[1] * span;
+    this.u[26] = b.vDir[2] * span;
+    this.u[27] = 0;
+    this.u[32] = w;
+    this.u[33] = h;
     this.dev.queue.writeBuffer(this.ubuf, 0, this.u);
     const enc = this.dev.createCommandEncoder();
     const pass = enc.beginRenderPass({ colorAttachments: [{ view, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }] });
@@ -548,6 +627,10 @@ var ImageField = class {
   /** The r32float 3D scalar texture (e.g. to share with a SliceRenderer for MPR). */
   volumeTexture() {
     return this.volTex;
+  }
+  /** RAS(patient) -> texture[0,1] matrix (encodes the real ijkToRAS geometry). */
+  patientToTexture() {
+    return this.p2t;
   }
   structMembers(s) {
     return [
@@ -1108,21 +1191,6 @@ async function loadSceneVolumeField(dev, sceneUrl, onBytes) {
   return { field, voxels: zv.data, dims: zv.dims, ijkToRAS, name: vol.name ?? "volume", range: zv.range, center, radius, win, lev };
 }
 
-// render/demos/real-scene.ts
-function anatomicalAxes(ijkToRAS) {
-  const col = (a) => [ijkToRAS[a], ijkToRAS[4 + a], ijkToRAS[8 + a]];
-  const map = {
-    0: { axis: 0, label: "SAGITTAL", cls: "yellow" },
-    1: { axis: 0, label: "CORONAL", cls: "green" },
-    2: { axis: 0, label: "AXIAL", cls: "red" }
-  };
-  return [0, 1, 2].map((a) => {
-    const c = col(a);
-    const dom = [Math.abs(c[0]), Math.abs(c[1]), Math.abs(c[2])].reduce((bi, v, i, arr) => v > arr[bi] ? i : bi, 0);
-    return { ...map[dom], axis: a };
-  });
-}
-
 // render/demos/sphere-scene.ts
 function orbitEye(azimuth, elevation, distance) {
   const ce = Math.cos(elevation);
@@ -1133,165 +1201,154 @@ function orbitEye(azimuth, elevation, distance) {
   ];
 }
 
-// render/live-segmenter.ts
-function ball(r) {
-  const o = [];
-  for (let z = -r; z <= r; z++) for (let y = -r; y <= r; y++) for (let x = -r; x <= r; x++) if (x * x + y * y + z * z <= r * r) o.push([z, y, x]);
-  return o;
-}
-var BALL2 = ball(2);
-function patchOrigin(center, dims, P2) {
-  const [X, Y, Z] = dims;
-  const c = [center.z, center.y, center.x], dim = [Z, Y, X];
-  return c.map((v, i) => Math.max(0, Math.min(v - (P2 >> 1), dim[i] - P2)));
-}
-function buildPatchInput(vol, dims, clicks, P2, prevMask) {
-  const [X, Y, Z] = dims;
-  const center = clicks[clicks.length - 1];
-  const [z0, y0, x0] = patchOrigin(center, dims, P2);
-  const P3 = P2 * P2 * P2;
-  const inp = new Float32Array(8 * P3);
-  let sum = 0, sum2 = 0;
-  for (let z = 0; z < P2; z++) for (let y = 0; y < P2; y++) for (let x = 0; x < P2; x++) {
-    const src = (z0 + z) * Y * X + (y0 + y) * X + (x0 + x), pi = z * P2 * P2 + y * P2 + x;
-    const gv = vol[src];
-    inp[pi] = gv;
-    sum += gv;
-    sum2 += gv * gv;
-    if (prevMask && prevMask[src]) inp[P3 + pi] = 1;
-  }
-  const mean = sum / P3, std = Math.sqrt(Math.max(1e-6, sum2 / P3 - mean * mean));
-  for (let i = 0; i < P3; i++) inp[i] = (inp[i] - mean) / std;
-  for (const c of clicks) {
-    const lz = c.z - z0, ly = c.y - y0, lx = c.x - x0;
-    if (lz < 0 || ly < 0 || lx < 0 || lz >= P2 || ly >= P2 || lx >= P2) continue;
-    const ch = c.sign > 0 ? 4 : 5;
-    for (const [dz, dy, dx] of BALL2) {
-      const z = lz + dz, y = ly + dy, x = lx + dx;
-      if (z < 0 || y < 0 || x < 0 || z >= P2 || y >= P2 || x >= P2) continue;
-      inp[ch * P3 + z * P2 * P2 + y * P2 + x] = 1;
-    }
-  }
-  return { inp, lo: [z0, y0, x0] };
-}
-function applyMaskDelta(labelmap, dims, mask, lo, P2, label = 1) {
-  const [X, Y] = dims;
-  const [z0, y0, x0] = lo;
-  let fg = 0;
-  for (let z = 0; z < P2; z++) for (let y = 0; y < P2; y++) for (let x = 0; x < P2; x++) {
-    const m = mask[z * P2 * P2 + y * P2 + x];
-    const dst = (z0 + z) * Y * X + (y0 + y) * X + (x0 + x);
-    labelmap[dst] = m ? label : 0;
-    if (m) fg++;
-  }
-  return fg;
-}
-var SyntheticSegmenter = class {
-  // `band` (z-score units) is the half-width kept around the seed when the seed
-  // isn't clearly bright; for a bright seed the primary test is relative to its
-  // own z-score (ch0 has mean 0 by construction, so this is air-robust).
-  constructor(patch = 64, band = 0.6) {
-    this.patch = patch;
-    this.band = band;
-  }
-  ready() {
-    return Promise.resolve();
-  }
-  infer(input) {
-    const P2 = this.patch, P3 = P2 * P2 * P2;
-    const img = input.subarray(0, P3);
-    const pos = input.subarray(4 * P3, 5 * P3);
-    const neg = input.subarray(5 * P3, 6 * P3);
-    let sx = 0, sy = 0, sz = 0, ns = 0;
-    for (let z = 0; z < P2; z++) for (let y = 0; y < P2; y++) for (let x = 0; x < P2; x++) {
-      if (pos[z * P2 * P2 + y * P2 + x]) {
-        sx += x;
-        sy += y;
-        sz += z;
-        ns++;
-      }
-    }
-    const mask = new Uint8Array(P3);
-    if (!ns) return Promise.resolve(mask);
-    const seed = [Math.round(sz / ns), Math.round(sy / ns), Math.round(sx / ns)];
-    const at = (z, y, x) => z * P2 * P2 + y * P2 + x;
-    const ref = img[at(seed[0], seed[1], seed[2])];
-    const floor = ref > 0 ? 0.5 * ref : -Infinity;
-    const ok = (i) => !neg[i] && Math.abs(img[i] - ref) <= Math.max(this.band, Math.abs(ref) * 0.5) && img[i] >= floor;
-    const stack = [seed];
-    mask[at(seed[0], seed[1], seed[2])] = 1;
-    while (stack.length) {
-      const [z, y, x] = stack.pop();
-      for (const [dz, dy, dx] of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]) {
-        const nz = z + dz, ny = y + dy, nx = x + dx;
-        if (nz < 0 || ny < 0 || nx < 0 || nz >= P2 || ny >= P2 || nx >= P2) continue;
-        const i = at(nz, ny, nx);
-        if (mask[i]) continue;
-        if (ok(i)) {
-          mask[i] = 1;
-          stack.push([nz, ny, nx]);
-        }
-      }
-    }
-    return Promise.resolve(mask);
-  }
-};
-
-// render/ort-segmenter.ts
-var OrtWorkerSegmenter = class {
-  patch;
+// render/faithful-segmenter.ts
+var P = 192;
+var MAX_ZOOM = 4;
+var BORDER_ABS = 1200;
+var FaithfulSegmenter = class {
+  patch = P;
   worker;
-  modelUrl;
-  onStatus;
-  seq = 0;
-  readyPromise;
-  pending = /* @__PURE__ */ new Map();
-  lastRunMs = 0;
+  enc;
+  opts;
+  Z = 0;
+  Y = 0;
+  X = 0;
+  vol;
+  stats = { mean: 0, std: 1 };
+  inter;
+  _labelmap;
+  lastMs = 0;
+  lastZoom = 1;
+  // per-predict state machine
+  center = [0, 0, 0];
+  zoom = 1;
+  settle = null;
   constructor(opts) {
-    this.patch = opts.patch ?? 64;
-    this.modelUrl = opts.modelUrl;
-    this.onStatus = opts.onStatus;
-    this.worker = new Worker(opts.workerUrl, { type: "module" });
-    let resolveReady, rejectReady;
-    this.readyPromise = new Promise((res, rej) => {
-      resolveReady = res;
-      rejectReady = rej;
-    });
-    this.worker.onmessage = (e) => {
-      const { type, data } = e.data;
-      if (type === "ready") {
-        this.onStatus?.(`model ready \xB7 load ${(data.loadMs / 1e3).toFixed(1)}s \xB7 warmup ${(data.warmMs / 1e3).toFixed(1)}s`);
-        resolveReady();
-      } else if (type === "result") {
-        this.lastRunMs = data.runMs;
-        const cb = this.pending.get(data.seq);
-        if (cb) {
-          this.pending.delete(data.seq);
-          cb(new Uint8Array(data.mask));
+    this.opts = opts;
+  }
+  get labelmap() {
+    return this._labelmap;
+  }
+  async init() {
+    this.enc = await import(this.opts.encUrl);
+    this.worker = new Worker(this.opts.workerUrl, { type: "module" });
+    await new Promise((resolve, reject) => {
+      const onFirst = (e) => {
+        const d = e.data;
+        if (d.type === "progress") {
+          this.opts.onStatus?.(d.cached ? "model cached" : d.total ? `downloading model ${(d.loaded / 1e6).toFixed(0)}/${(d.total / 1e6).toFixed(0)} MB` : "loading model\u2026");
+        } else if (d.type === "ready") {
+          this.worker.removeEventListener("message", onFirst);
+          this.wire();
+          this.opts.onStatus?.(`nnLive faithful 192\xB3 ready \xB7 ~${d.ms} ms/click \xB7 load ${(d.loadMs / 1e3).toFixed(1)}s`);
+          resolve();
+        } else if (d.type === "error") {
+          this.worker.removeEventListener("message", onFirst);
+          reject(new Error(d.msg));
         }
-      } else if (type === "error") {
-        rejectReady(new Error(data));
-        for (const cb of this.pending.values()) cb(new Uint8Array(this.patch ** 3));
-        this.pending.clear();
-        this.onStatus?.("inference error: " + data);
-      }
-    };
-    this.worker.onerror = (e) => rejectReady(e);
-  }
-  ready() {
-    this.worker.postMessage({ type: "init", modelUrl: this.modelUrl, patch: this.patch });
-    return this.readyPromise;
-  }
-  infer(input) {
-    const seq = ++this.seq;
-    return new Promise((resolve) => {
-      this.pending.set(seq, resolve);
-      const buf = input.slice().buffer;
-      this.worker.postMessage({ type: "infer", input: buf, lo: [0, 0, 0], seq }, [buf]);
+      };
+      this.worker.addEventListener("message", onFirst);
+      this.worker.onerror = (e) => reject(e);
+      this.worker.postMessage({ type: "init", res: P, base: this.opts.base, perclickWeights: this.opts.weights });
     });
+  }
+  wire() {
+    this.worker.addEventListener("message", (e) => {
+      const d = e.data;
+      if (d.type === "encoded") {
+        const i7 = this.inter.buildInter(this.center, P, this.zoom);
+        this.worker.postMessage({ type: "infer", inter: i7.buffer }, [i7.buffer]);
+      } else if (d.type === "result") {
+        const m = new Uint8Array(d.mask);
+        this.lastMs = d.ms;
+        const bc = this.borderCount(m);
+        if (this.zoom < MAX_ZOOM && bc > BORDER_ABS) {
+          this.zoom = Math.min(MAX_ZOOM, this.zoom * 1.5);
+          this.opts.onStatus?.(`auto-zoom \xD7${this.zoom.toFixed(1)} (mask exceeds FOV)\u2026`);
+          this.encode();
+          return;
+        }
+        this.pasteMask(m, this.center, this.zoom);
+        this.lastZoom = this.zoom;
+        const done = this.settle;
+        this.settle = null;
+        done?.(this._labelmap);
+      } else if (d.type === "error") {
+        const done = this.settle;
+        this.settle = null;
+        this.opts.onStatus?.("inference error: " + d.msg);
+        done?.(this._labelmap);
+      }
+    });
+  }
+  /** Load the CT (raw voxels, (z,y,x) C-order) + dims=[X,Y,Z]. Resets interactions. */
+  setVolume(voxels, dims) {
+    this.vol = voxels;
+    this.X = dims[0];
+    this.Y = dims[1];
+    this.Z = dims[2];
+    this.inter = new this.enc.Interactions(this.Z, this.Y, this.X);
+    this.stats = this.enc.globalStats(voxels);
+    this._labelmap = new Uint8Array(this.X * this.Y * this.Z);
+  }
+  reset() {
+    this.inter.clear();
+    this._labelmap.fill(0);
+  }
+  /** Add a point (voxel coords z=k,y=j,x=i; sign +1 fg / -1 bg) and run a faithful
+   *  encode+decode (+ auto-zoom). Resolves with the updated full-volume labelmap. */
+  clickPredict(z, y, x, sign) {
+    this.inter.addPoint(z, y, x, sign);
+    this.center = [z, y, x];
+    this.zoom = 1;
+    return new Promise((resolve) => {
+      this.settle = resolve;
+      this.encode();
+    });
+  }
+  encode() {
+    const crop = this.enc.extractCrop(this.vol, this.Z, this.Y, this.X, this.center, P, this.zoom, this.stats.mean, this.stats.std);
+    this.worker.postMessage({ type: "encode", image: crop.buffer, ctr: this.center, zoom: this.zoom }, [crop.buffer]);
+  }
+  borderCount(m) {
+    let n = 0;
+    const F = P - 1;
+    for (let a = 0; a < P; a++) for (let b = 0; b < P; b++) {
+      if (m[(0 * P + a) * P + b]) n++;
+      if (m[(F * P + a) * P + b]) n++;
+      if (m[(a * P + 0) * P + b]) n++;
+      if (m[(a * P + F) * P + b]) n++;
+      if (m[(a * P + b) * P + 0]) n++;
+      if (m[(a * P + b) * P + F]) n++;
+    }
+    return n;
+  }
+  pasteMask(m, ctr, zoom) {
+    const size = Math.round(P * zoom);
+    const [oz, oy, ox] = this.enc.boxOrigin(ctr, P, zoom);
+    const { Z, Y, X } = this;
+    const mask = this._labelmap;
+    for (let z = 0; z < size; z++) {
+      const zz = oz + z;
+      if (zz < 0 || zz >= Z) continue;
+      const pz = Math.min(P - 1, Math.floor(z / zoom));
+      for (let y = 0; y < size; y++) {
+        const yy = oy + y;
+        if (yy < 0 || yy >= Y) continue;
+        const py = Math.min(P - 1, Math.floor(y / zoom));
+        const vrow = (zz * Y + yy) * X, mrow = (pz * P + py) * P;
+        for (let x = 0; x < size; x++) {
+          const xx = ox + x;
+          if (xx < 0 || xx >= X) continue;
+          const px = Math.min(P - 1, Math.floor(x / zoom));
+          mask[vrow + xx] = m[mrow + px];
+        }
+      }
+    }
+    this.inter.prev = mask;
   }
   dispose() {
-    this.worker.terminate();
+    this.worker?.terminate();
   }
 };
 
@@ -1304,10 +1361,10 @@ var status = (msg, err = false) => {
   }
 };
 var el = (id) => document.getElementById(id);
-var P = 64;
 var params = new URLSearchParams(location.search);
 var SCENE = params.get("scene") ?? "https://pieper.github.io/live/legacy/scenes/TotalSegmentator-CT.json";
-var MODEL = params.get("model") ?? "https://js2.jetstream-cloud.org:8001/swift/v1/nnlive-models/net_64_webgpu_fp16.onnx";
+var BASE = params.get("base") ?? "https://pieper.github.io/nnLive/models/pathA/faithful/";
+var WEIGHTS = params.get("weights") ?? "https://js2.jetstream-cloud.org:8001/swift/v1/nnlive-models/perclick_192.weights.bin";
 async function main() {
   if (!navigator.gpu) {
     status("WebGPU not available \u2014 try Chrome/Edge 113+ or Safari 18+.", true);
@@ -1330,9 +1387,11 @@ async function main() {
     status(`streaming CT\u2026 ${(mb / 1e6).toFixed(1)} MB`);
   });
   const [X, Y, Z] = sv.dims;
-  const labelmap = new Uint8Array(X * Y * Z);
+  const [rasLo, rasHi] = sv.field.aabb();
+  const p2t = sv.field.patientToTexture();
   const palette = new Float32Array(256 * 4);
   palette.set([0.96, 0.78, 0.3, 0.92], 4);
+  let labelmap = new Uint8Array(X * Y * Z);
   let colorizeTex = bakeColorizeRGBA(gpu.device, labelmap, sv.dims, palette, 1.2);
   const overlay = new RGBAVolumeField(colorizeTex, sv.dims, [1, 1, 1], { ijkToRAS: sv.ijkToRAS, shade: [0.28, 0.8, 0.5, 28] });
   const fiducials = new FiducialField([]);
@@ -1340,29 +1399,29 @@ async function main() {
   scene.build([sv.field, overlay, fiducials]);
   scene.setBackground(0.05, 0.06, 0.09);
   const slice = new SliceRenderer(gpu, srgb);
+  slice.setVolume(p2t, rasLo, rasHi);
   slice.setTextures(sv.field.volumeTexture(), colorizeTex);
   slice.setWindowLevel(sv.win, sv.lev);
-  slice.setOverlayOpacity(0.55);
-  const cellFor = { AXIAL: "axial", CORONAL: "coronal", SAGITTAL: "sagittal" };
-  const planes = [];
-  for (const a of anatomicalAxes(sv.ijkToRAS)) {
-    planes.push({ cell: cellFor[a.label], axis: a.axis });
-    const lab = document.querySelector(`#lab-${cellFor[a.label]}`);
-    if (lab) lab.textContent = a.label;
-  }
+  slice.setOverlayOpacity(0.5);
+  const planes = [
+    { cell: "axial", orient: "axial" },
+    { cell: "coronal", orient: "coronal" },
+    { cell: "sagittal", orient: "sagittal" }
+  ];
   const off = { axial: 0.5, coronal: 0.5, sagittal: 0.5 };
-  const { center, radius } = sv;
+  const norm = { axial: 2, coronal: 1, sagittal: 0 };
+  const { center: ctr3d, radius } = sv;
   let az = 0.6, elev = 0.25, dist = radius * 2.6;
   const eyeAt = () => {
     const o = orbitEye(az, elev, dist);
-    return [center[0] + o[0], center[1] + o[1], center[2] + o[2]];
+    return [ctr3d[0] + o[0], ctr3d[1] + o[1], ctr3d[2] + o[2]];
   };
   const drawPlane = (p) => {
-    slice.setSlice(p.axis, off[p.cell]);
+    slice.setPlane(p.orient, off[p.cell]);
     slice.renderToView(cx[p.cell].getCurrentTexture().createView({ format: srgb }), cv[p.cell].width, cv[p.cell].height);
   };
   const draw3d = () => {
-    scene.setCamera(eyeAt(), center, [0, 0, 1], 26, cv.threeD.width, cv.threeD.height);
+    scene.setCamera(eyeAt(), ctr3d, [0, 0, 1], 26, cv.threeD.width, cv.threeD.height);
     scene.renderToView(cx.threeD.getCurrentTexture().createView({ format: srgb }), cv.threeD.width, cv.threeD.height);
   };
   const drawAll = () => {
@@ -1380,51 +1439,52 @@ async function main() {
   };
   globalThis.addEventListener("resize", resize);
   resize();
-  status("loading nnLive model\u2026 (first click after this is a warm forward)");
-  let seg, stub = false;
-  const ort = new OrtWorkerSegmenter({ workerUrl: "./nnlive-worker.js", modelUrl: MODEL, patch: P, onStatus: (m) => status(m) });
+  status("loading nnLive faithful model (188 MB perclick weights, cached after first load)\u2026");
+  const seg = new FaithfulSegmenter({
+    workerUrl: new URL("nnlive/pathA-faithful-worker.js", location.href).href,
+    encUrl: new URL("nnlive/faithful-enc.js", location.href).href,
+    base: BASE,
+    weights: WEIGHTS,
+    onStatus: (m) => status(m)
+  });
   try {
-    await ort.ready();
-    seg = ort;
-  } catch (_e) {
-    ort.dispose();
-    seg = new SyntheticSegmenter(P);
-    stub = true;
-    status(`nnLive model not reachable \u2014 using a built-in region-grow stub so the pipeline is live. Host net_64 (see ?model=) for real inference.`, true);
+    await seg.init();
+    seg.setVolume(sv.voxels, sv.dims);
+  } catch (e) {
+    status("nnLive model failed to load: " + (e?.message ?? e) + " \u2014 check WebGPU shader-f16 support.", true);
+    return;
   }
-  const clicks = [];
   const pins = [];
   let busy = false;
-  const voxelFromPixel = (p, px, py, w, h) => {
-    const u = px / w, vv = py / h, s = off[p.cell];
-    if (p.axis === 0) return [Math.min(X - 1, Math.floor(s * X)), Math.min(Y - 1, Math.floor(u * Y)), Math.min(Z - 1, Math.floor(vv * Z))];
-    if (p.axis === 1) return [Math.min(X - 1, Math.floor(u * X)), Math.min(Y - 1, Math.floor(s * Y)), Math.min(Z - 1, Math.floor(vv * Z))];
-    return [Math.min(X - 1, Math.floor(u * X)), Math.min(Y - 1, Math.floor(vv * Y)), Math.min(Z - 1, Math.floor(s * Z))];
+  const voxelAt = (orient, u, v) => {
+    slice.setPlane(orient, off[orient]);
+    const t = slice.viewToTex(u, v);
+    const i = Math.max(0, Math.min(X - 1, Math.round(t[0] * X - 0.5)));
+    const j = Math.max(0, Math.min(Y - 1, Math.round(t[1] * Y - 0.5)));
+    const k = Math.max(0, Math.min(Z - 1, Math.round(t[2] * Z - 0.5)));
+    return [i, j, k];
   };
   const segmentAt = async (i, j, k, sign) => {
     if (busy) return;
     busy = true;
-    clicks.push({ x: i, y: j, z: k, sign });
     const ras = applyRowMajor(sv.ijkToRAS, [i, j, k]);
     pins.push({ center: ras, radius: 4.5, color: sign > 0 ? [0.2, 0.85, 1, 1] : [1, 0.3, 0.8, 1] });
     fiducials.setSpheres(pins);
     scene.build([sv.field, overlay, fiducials]);
     scene.setBackground(0.05, 0.06, 0.09);
-    status(`segmenting\u2026 (${stub ? "stub" : "nnLive"} \xB7 click ${clicks.length})`);
-    const t0 = performance.now();
-    const { inp, lo } = buildPatchInput(sv.voxels, sv.dims, clicks, P, labelmap);
-    const mask = await seg.infer(inp);
-    const fg = applyMaskDelta(labelmap, sv.dims, mask, lo, P, 1);
+    status(`nnLive faithful \xB7 ${sign > 0 ? "foreground" : "background"} point ${pins.length} \xB7 encoding + decoding 192\xB3\u2026`);
+    labelmap = await seg.clickPredict(k, j, i, sign);
     colorizeTex = bakeColorizeRGBA(gpu.device, labelmap, sv.dims, palette, 1.2);
     overlay.setTexture(colorizeTex);
     scene.refreshBindings();
     slice.setTextures(sv.field.volumeTexture(), colorizeTex);
-    off.sagittal = i / X;
-    off.coronal = j / Y;
-    off.axial = k / Z;
+    off.sagittal = (ras[0] - rasLo[0]) / (rasHi[0] - rasLo[0]);
+    off.coronal = (ras[1] - rasLo[1]) / (rasHi[1] - rasLo[1]);
+    off.axial = (ras[2] - rasLo[2]) / (rasHi[2] - rasLo[2]);
     drawAll();
-    const runMs = seg.lastRunMs ?? 0;
-    status(`${stub ? "region-grow stub" : "nnLive"} \xB7 click ${clicks.length} \xB7 patch fg ${fg} vox \xB7 ${runMs || Math.round(performance.now() - t0)} ms \xB7 shift-click = background point`);
+    let vox = 0;
+    for (let n = 0; n < labelmap.length; n++) vox += labelmap[n];
+    status(`nnLive faithful \xB7 ${pins.length} point${pins.length > 1 ? "s" : ""} \xB7 ${vox.toLocaleString()} vox \xB7 ${seg.lastMs} ms decode \xB7 zoom \xD7${seg.lastZoom.toFixed(1)} \xB7 shift-click = background point`);
     busy = false;
   };
   for (const p of planes) {
@@ -1435,8 +1495,8 @@ async function main() {
     }, { passive: false });
     cv[p.cell].addEventListener("pointerdown", (e) => {
       const r = cv[p.cell].getBoundingClientRect();
-      const px = (e.clientX - r.left) / r.width * cv[p.cell].width, py = (e.clientY - r.top) / r.height * cv[p.cell].height;
-      const [i, j, k] = voxelFromPixel(p, px, py, cv[p.cell].width, cv[p.cell].height);
+      const u = (e.clientX - r.left) / r.width, v = (e.clientY - r.top) / r.height;
+      const [i, j, k] = voxelAt(p.orient, u, v);
       segmentAt(i, j, k, e.shiftKey ? -1 : 1);
     });
   }
@@ -1464,6 +1524,6 @@ async function main() {
     dist = Math.max(radius * 1.2, Math.min(radius * 6, dist * (e.deltaY > 0 ? 1.08 : 0.93)));
     draw3d();
   }, { passive: false });
-  if (!stub) status(`${sv.name} \xB7 nnLive ready \xB7 click an organ in any MPR view to segment \xB7 shift-click = background`);
+  status(`${sv.name} \xB7 nnLive faithful 192\xB3 ready \xB7 click an organ in any MPR view \xB7 shift-click = background`);
 }
 main().catch((e) => status("error: " + (e?.message ?? e), true));

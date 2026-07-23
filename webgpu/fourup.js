@@ -111,6 +111,48 @@ function volumeAABB(dims, spacing, center = [0, 0, 0]) {
     [center[0] + ext[0], center[1] + ext[1], center[2] + ext[2]]
   ];
 }
+function transpose4(m) {
+  const o = new Float32Array(16);
+  for (let r = 0; r < 4; r++) for (let c = 0; c < 4; c++) o[c * 4 + r] = m[r * 4 + c];
+  return o;
+}
+function patientToTextureFromIjkToRAS(ijkToRAS, dims) {
+  return invert(texToRASFromIjkToRAS(ijkToRAS, dims));
+}
+function texToRASFromIjkToRAS(ijkToRAS, dims) {
+  const M = transpose4(ijkToRAS);
+  const A = new Float32Array(16);
+  for (let a = 0; a < 3; a++) {
+    A[a * 4 + a] = dims[a];
+    A[12 + a] = -0.5;
+  }
+  A[15] = 1;
+  return multiply(M, A);
+}
+function volumeAABBFromIjkToRAS(ijkToRAS, dims) {
+  const t2r = texToRASFromIjkToRAS(ijkToRAS, dims);
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  for (let c = 0; c < 8; c++) {
+    const u = c & 1, v = c >> 1 & 1, w = c >> 2 & 1;
+    for (let r = 0; r < 3; r++) {
+      const p = t2r[r] * u + t2r[4 + r] * v + t2r[8 + r] * w + t2r[12 + r];
+      if (p < lo[r]) lo[r] = p;
+      if (p > hi[r]) hi[r] = p;
+    }
+  }
+  return [lo, hi];
+}
+function applyMat4(m, p) {
+  const x = m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12];
+  const y = m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13];
+  const z = m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14];
+  const w = m[3] * p[0] + m[7] * p[1] + m[11] * p[2] + m[15] || 1;
+  return [x / w, y / w, z / w];
+}
+function spacingFromIjkToRAS(ijkToRAS) {
+  const col = (c) => Math.hypot(ijkToRAS[c], ijkToRAS[4 + c], ijkToRAS[8 + c]);
+  return [col(0), col(1), col(2)];
+}
 
 // render/scene-renderer.ts
 var DEFAULT_FORMAT = "rgba8unorm-srgb";
@@ -267,6 +309,17 @@ ${dispatch}
     this.mat[5] = mx[1];
     this.mat[6] = mx[2];
   }
+  /** Rebuild the bind group from the fields' current resources (e.g. after a field
+   *  swapped a texture) without recompiling the pipeline. Field set/structure must be unchanged. */
+  refreshBindings() {
+    const entries = [
+      { binding: 0, resource: { buffer: this.camBuf } },
+      { binding: 1, resource: { buffer: this.matBuf } },
+      { binding: 2, resource: this.sampler }
+    ];
+    for (const p of this.placed) entries.push(...p.field.bindEntries(p.slot, p.bbase));
+    this.bind = this.dev.createBindGroup({ layout: this.pipeline.getBindGroupLayout(0), entries });
+  }
   setCamera(eye, center, up, fovyDeg, width, height) {
     const view = lookAt(eye, center, up);
     const proj = perspectiveZO(fovyDeg * Math.PI / 180, width / height, 1, 1e5);
@@ -319,7 +372,14 @@ var DEFAULT_FORMAT2 = "rgba8unorm-srgb";
 var SHADER = (
   /* wgsl */
   `
-struct U { a : vec4<f32>, b : vec4<f32> };  // a: axis, offset, win, lev ; b: overlayOpacity, sizeX, sizeY, _
+struct U {
+  p2t : mat4x4<f32>,     // RAS -> texture[0,1] (folds in ijkToRAS: rotation + anisotropy)
+  origin : vec4<f32>,    // RAS of the plane center (for the current scrub offset)
+  uvec : vec4<f32>,      // RAS vector spanning the view width  (isotropic mm)
+  vvec : vec4<f32>,      // RAS vector spanning the view height (isotropic mm)
+  params : vec4<f32>,    // win, lev, overlayOpacity, _
+  size : vec4<f32>,      // sizeX, sizeY, _, _
+};
 @group(0) @binding(0) var<uniform> u : U;
 @group(0) @binding(1) var s_lin : sampler;
 @group(0) @binding(2) var t_scalar : texture_3d<f32>;
@@ -338,34 +398,42 @@ fn srgb2physical(c : vec3<f32>) -> vec3<f32> {
 }
 @fragment
 fn fs_main(v : V) -> @location(0) vec4<f32> {
-  let uv = v.position.xy / vec2<f32>(u.b.y, u.b.z);      // [0,1] within this view
-  let s = u.a.y;
-  let axis = u32(u.a.x);
-  var tex : vec3<f32>;
-  if (axis == 0u) { tex = vec3<f32>(s, uv.x, uv.y); }        // sagittal (fix X)
-  else if (axis == 1u) { tex = vec3<f32>(uv.x, s, uv.y); }   // coronal  (fix Y)
-  else { tex = vec3<f32>(uv.x, uv.y, s); }                    // axial    (fix Z)
+  let uv = v.position.xy / u.size.xy;                 // [0,1], y down
+  let ras = u.origin.xyz + u.uvec.xyz * (uv.x - 0.5) + u.vvec.xyz * (0.5 - uv.y);
+  let t4 = u.p2t * vec4<f32>(ras, 1.0);
+  let tex = t4.xyz;
+  if (any(tex < vec3<f32>(0.0)) || any(tex > vec3<f32>(1.0))) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
   let val = textureSampleLevel(t_scalar, s_lin, tex, 0.0).r;
-  let win = max(u.a.z, 1e-6);
-  let g = clamp((val - (u.a.w - win * 0.5)) / win, 0.0, 1.0);
+  let win = max(u.params.x, 1e-6);
+  let g = clamp((val - (u.params.y - win * 0.5)) / win, 0.0, 1.0);
   var col = vec3<f32>(g);
   let ov = textureSampleLevel(t_overlay, s_lin, tex, 0.0);
-  col = mix(col, ov.rgb, clamp(ov.a * u.b.x, 0.0, 1.0));
+  col = mix(col, ov.rgb, clamp(ov.a * u.params.z, 0.0, 1.0));
   return vec4<f32>(srgb2physical(col), 1.0);
 }
 `
 );
+var BASES = {
+  axial: { uDir: [1, 0, 0], vDir: [0, 1, 0], uAxis: 0, vAxis: 1, nAxis: 2 },
+  coronal: { uDir: [1, 0, 0], vDir: [0, 0, 1], uAxis: 0, vAxis: 2, nAxis: 1 },
+  sagittal: { uDir: [0, 1, 0], vDir: [0, 0, 1], uAxis: 1, vAxis: 2, nAxis: 0 }
+};
 var SliceRenderer = class {
   dev;
   format;
   pipeline;
   sampler;
   ubuf;
-  u = new Float32Array(8);
-  // a(4) + b(4)
+  u = new Float32Array(36);
+  // p2t(16) + origin(4) + uvec(4) + vvec(4) + params(4) + size(4)
   bind;
-  scalar;
   overlay;
+  // volume geometry + current plane
+  p2t = new Float32Array(16);
+  rasLo = [-1, -1, -1];
+  rasHi = [1, 1, 1];
+  orient = "axial";
+  offset01 = 0.5;
   constructor(gpu, format = DEFAULT_FORMAT2) {
     this.dev = gpu.device;
     this.format = format;
@@ -377,38 +445,105 @@ var SliceRenderer = class {
       primitive: { topology: "triangle-list", cullMode: "none" }
     });
     this.sampler = this.dev.createSampler({ magFilter: "linear", minFilter: "linear", addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge", addressModeW: "clamp-to-edge" });
-    this.ubuf = this.dev.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.ubuf = this.dev.createBuffer({ size: this.u.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.setWindowLevel(255, 127);
-    this.setSlice(2, 0.5);
     this.setOverlayOpacity(0.55);
   }
+  emptyOverlay;
+  transparentOverlay() {
+    if (!this.emptyOverlay) {
+      this.emptyOverlay = this.dev.createTexture({ size: [1, 1, 1], dimension: "3d", format: "rgba16float", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+      this.dev.queue.writeTexture({ texture: this.emptyOverlay }, new Uint16Array(4), { bytesPerRow: 8, rowsPerImage: 1 }, [1, 1, 1]);
+    }
+    return this.emptyOverlay;
+  }
+  /** Volume geometry: patientToTexture (RAS->tex[0,1], encodes ijkToRAS) + the RAS
+   *  bounding box (for plane extents/scrub range). Get both from the ImageField. */
+  setVolume(p2t, rasLo, rasHi) {
+    this.p2t = p2t;
+    this.rasLo = rasLo;
+    this.rasHi = rasHi;
+    this.u.set(p2t, 0);
+  }
+  /** Set the grayscale scalar (r32float 3d) and, optionally, a colored overlay
+   *  (rgba16float 3d) — which MUST share the same geometry (ijkToRAS/dims) so the
+   *  same RAS->tex mapping addresses both. Omit overlay for a plain MPR. */
   setTextures(scalar, overlay) {
-    this.scalar = scalar;
-    this.overlay = overlay;
+    this.overlay = overlay ?? this.transparentOverlay();
     this.bind = this.dev.createBindGroup({
       layout: this.pipeline.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: this.ubuf } },
         { binding: 1, resource: this.sampler },
         { binding: 2, resource: scalar.createView() },
-        { binding: 3, resource: overlay.createView() }
+        { binding: 3, resource: this.overlay.createView() }
       ]
     });
   }
-  setSlice(axis, offset01) {
-    this.u[0] = axis;
-    this.u[1] = Math.max(0, Math.min(1, offset01));
+  // Uniform float layout: p2t[0..15] origin[16..19] uvec[20..23] vvec[24..27] params[28..31] size[32..35]
+  /** Select the anatomical plane and scrub position (0..1 along the plane normal, RAS bbox). */
+  setPlane(orient, offset01) {
+    this.orient = orient;
+    this.offset01 = Math.max(0, Math.min(1, offset01));
   }
   setWindowLevel(win, lev) {
-    this.u[2] = win;
-    this.u[3] = lev;
+    this.u[28] = win;
+    this.u[29] = lev;
   }
   setOverlayOpacity(o) {
-    this.u[4] = o;
+    this.u[30] = o;
+  }
+  /** Physical size (mm) of the square view for the current plane (isotropic, letterboxed). */
+  viewSpanMm() {
+    const b = BASES[this.orient];
+    const uExt = this.rasHi[b.uAxis] - this.rasLo[b.uAxis];
+    const vExt = this.rasHi[b.vAxis] - this.rasLo[b.vAxis];
+    return Math.max(uExt, vExt) * 1.02;
+  }
+  /** Plane center in RAS for the current scrub offset. */
+  planeCenter() {
+    const b = BASES[this.orient];
+    const c = [
+      (this.rasLo[0] + this.rasHi[0]) / 2,
+      (this.rasLo[1] + this.rasHi[1]) / 2,
+      (this.rasLo[2] + this.rasHi[2]) / 2
+    ];
+    c[b.nAxis] = this.rasLo[b.nAxis] + this.offset01 * (this.rasHi[b.nAxis] - this.rasLo[b.nAxis]);
+    return c;
+  }
+  /** Map a view (u,v) in [0,1] (y down) to normalized texture coords for the current
+   *  plane — for click picking. Returns the tex coord; the caller converts to IJK via
+   *  ijk = tex*dims - 0.5. Anisotropy/rotation are handled by the same p2t the shader uses. */
+  viewToTex(u, v) {
+    const b = BASES[this.orient];
+    const span = this.viewSpanMm();
+    const c = this.planeCenter();
+    const ras = [
+      c[0] + b.uDir[0] * (u - 0.5) * span + b.vDir[0] * (0.5 - v) * span,
+      c[1] + b.uDir[1] * (u - 0.5) * span + b.vDir[1] * (0.5 - v) * span,
+      c[2] + b.uDir[2] * (u - 0.5) * span + b.vDir[2] * (0.5 - v) * span
+    ];
+    return applyMat4(this.p2t, ras);
   }
   drawInto(view, w, h) {
-    this.u[5] = w;
-    this.u[6] = h;
+    const b = BASES[this.orient];
+    const span = this.viewSpanMm();
+    const c = this.planeCenter();
+    this.u.set(this.p2t, 0);
+    this.u[16] = c[0];
+    this.u[17] = c[1];
+    this.u[18] = c[2];
+    this.u[19] = 0;
+    this.u[20] = b.uDir[0] * span;
+    this.u[21] = b.uDir[1] * span;
+    this.u[22] = b.uDir[2] * span;
+    this.u[23] = 0;
+    this.u[24] = b.vDir[0] * span;
+    this.u[25] = b.vDir[1] * span;
+    this.u[26] = b.vDir[2] * span;
+    this.u[27] = 0;
+    this.u[32] = w;
+    this.u[33] = h;
     this.dev.queue.writeBuffer(this.ubuf, 0, this.u);
     const enc = this.dev.createCommandEncoder();
     const pass = enc.beginRenderPass({ colorAttachments: [{ view, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }] });
@@ -602,10 +737,16 @@ var RGBAVolumeField = class {
   constructor(tex, dims, spacing, opts = {}) {
     const center = opts.center ?? [0, 0, 0];
     this.tex = tex;
-    this.p2t = patientToTexture(dims, spacing, center);
-    this.box = volumeAABB(dims, spacing, center);
+    if (opts.ijkToRAS) {
+      this.p2t = patientToTextureFromIjkToRAS(opts.ijkToRAS, dims);
+      this.box = volumeAABBFromIjkToRAS(opts.ijkToRAS, dims);
+      this.stepMm = Math.min(...spacingFromIjkToRAS(opts.ijkToRAS));
+    } else {
+      this.p2t = patientToTexture(dims, spacing, center);
+      this.box = volumeAABB(dims, spacing, center);
+      this.stepMm = Math.min(...spacing);
+    }
     this.shade = opts.shade ?? [0.3, 0.75, 0.45, 24];
-    this.stepMm = Math.min(...spacing);
     this.unit = opts.opacityUnitDistance ?? this.stepMm;
   }
   uniformFloats() {
@@ -617,6 +758,15 @@ var RGBAVolumeField = class {
   }
   sampleStep() {
     return this.stepMm;
+  }
+  /** Swap the baked texture in place (e.g. after re-baking an updated mask). The
+   *  geometry is unchanged; the caller refreshes the SceneRenderer bind group. */
+  setTexture(tex, destroyPrev = true) {
+    if (destroyPrev && this.tex !== tex) this.tex.destroy();
+    this.tex = tex;
+  }
+  get texture() {
+    return this.tex;
   }
   structMembers(s) {
     return [
@@ -706,7 +856,8 @@ function buildFourUpScene(dev) {
   const scalarTex = createScalarTexture(dev, data, dims);
   const colorizeTex = bakeColorizeRGBA(dev, lab, dims, pal, 1.5);
   const field3d = new RGBAVolumeField(colorizeTex, dims, spacing, { opacityUnitDistance: SPACING[0], shade: [0.3, 0.78, 0.5, 28] });
-  return { scalarTex, colorizeTex, dims, spacing, win: 240, lev: 110, field3d };
+  const [rasLo, rasHi] = volumeAABB(dims, spacing);
+  return { scalarTex, colorizeTex, dims, spacing, p2t: patientToTexture(dims, spacing), rasLo, rasHi, win: 240, lev: 110, field3d };
 }
 
 // render/demos/fourup-browser.ts
@@ -740,14 +891,14 @@ async function main() {
   scene.build([sc.field3d]);
   scene.setBackground(0.05, 0.06, 0.09);
   const slice = new SliceRenderer(gpu, srgb);
+  slice.setVolume(sc.p2t, sc.rasLo, sc.rasHi);
   slice.setTextures(sc.scalarTex, sc.colorizeTex);
   slice.setWindowLevel(sc.win, sc.lev);
   slice.setOverlayOpacity(0.6);
   const off = { axial: 0.5, coronal: 0.5, sagittal: 0.55 };
-  const axisOf = { axial: 2, coronal: 1, sagittal: 0 };
   let az = 0.5, elev = 0.3, dist = 430;
   const drawSlice = (n) => {
-    slice.setSlice(axisOf[n], off[n]);
+    slice.setPlane(n, off[n]);
     slice.renderToView(cx[n].getCurrentTexture().createView({ format: srgb }), cv[n].width, cv[n].height);
   };
   const draw3d = () => {
