@@ -900,15 +900,241 @@ async function buildRealScene(gpu, sceneUrl, format, onBytes) {
   return { sv, scene, slice, axes: anatomicalAxes(sv.ijkToRAS) };
 }
 
-// render/demos/sphere-scene.ts
-function orbitEye(azimuth, elevation, distance) {
-  const ce = Math.cos(elevation);
+// render/vtk-camera.ts
+var sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+var add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+var scale = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
+var cross = (a, b) => [
+  a[1] * b[2] - a[2] * b[1],
+  a[2] * b[0] - a[0] * b[2],
+  a[0] * b[1] - a[1] * b[0]
+];
+var dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+var norm = (a) => Math.hypot(a[0], a[1], a[2]);
+var normalize = (a) => {
+  const n = norm(a) || 1;
+  return [a[0] / n, a[1] / n, a[2] / n];
+};
+function rotateAboutAxis(v, axis, deg) {
+  const k = normalize(axis);
+  const t = deg * Math.PI / 180;
+  const c = Math.cos(t), s = Math.sin(t);
+  const kv = cross(k, v);
+  const kd = dot(k, v);
   return [
-    distance * ce * Math.sin(azimuth),
-    -distance * ce * Math.cos(azimuth),
-    distance * Math.sin(elevation)
+    v[0] * c + kv[0] * s + k[0] * kd * (1 - c),
+    v[1] * c + kv[1] * s + k[1] * kd * (1 - c),
+    v[2] * c + kv[2] * s + k[2] * kd * (1 - c)
   ];
 }
+var VtkCamera = class _VtkCamera {
+  position;
+  focalPoint;
+  viewUp;
+  viewAngle;
+  // degrees (vtkCamera default 30)
+  parallelProjection = false;
+  parallelScale = 1;
+  constructor(position = [0, 0, 1], focalPoint = [0, 0, 0], viewUp = [0, 1, 0], viewAngle = 30) {
+    this.position = [...position];
+    this.focalPoint = [...focalPoint];
+    this.viewUp = [...viewUp];
+    this.viewAngle = viewAngle;
+  }
+  /** Slicer's default 3D camera (vtkMRMLCameraNode): (0,500,0) -> origin, +S up, 30 deg. */
+  static slicerDefault() {
+    return new _VtkCamera([0, 500, 0], [0, 0, 0], [0, 0, 1], 30);
+  }
+  clone() {
+    const c = new _VtkCamera(this.position, this.focalPoint, this.viewUp, this.viewAngle);
+    c.parallelProjection = this.parallelProjection;
+    c.parallelScale = this.parallelScale;
+    return c;
+  }
+  get distance() {
+    return norm(sub(this.focalPoint, this.position));
+  }
+  /** normalize(focalPoint - position) — vtkCamera::DirectionOfProjection. */
+  get directionOfProjection() {
+    return normalize(sub(this.focalPoint, this.position));
+  }
+  /** Rows of the view transform, per vtkTransform::SetupCamera. */
+  basis(viewUp = this.viewUp) {
+    const back = normalize(sub(this.position, this.focalPoint));
+    const right = normalize(cross(viewUp, back));
+    const up = cross(back, right);
+    return { right, up, back };
+  }
+  /** vtkCamera::Azimuth — rotate position about viewUp through the focal point. */
+  azimuth(deg) {
+    const rel = sub(this.position, this.focalPoint);
+    this.position = add(this.focalPoint, rotateAboutAxis(rel, this.viewUp, deg));
+  }
+  /** vtkCamera::Elevation — rotate position about -right through the focal point.
+   *  Returns the rotated view-up VTK uses internally (see class comment); callers that
+   *  mirror Slicer follow with orthogonalizeViewUp(rotatedUp). */
+  elevation(deg) {
+    const axis = scale(this.basis().right, -1);
+    const rotatedUp = rotateAboutAxis(this.viewUp, axis, deg);
+    const rel = sub(this.position, this.focalPoint);
+    this.position = add(this.focalPoint, rotateAboutAxis(rel, axis, deg));
+    return rotatedUp;
+  }
+  /** vtkCamera::OrthogonalizeViewUp — viewUp = row1 of the view transform. */
+  orthogonalizeViewUp(usingUp = this.viewUp) {
+    this.viewUp = this.basis(usingUp).up;
+  }
+  /** vtkCamera::Dolly — factor > 1 moves the camera toward the focal point. */
+  dolly(factor) {
+    if (factor <= 0) return;
+    if (this.parallelProjection) {
+      this.parallelScale = this.parallelScale / factor;
+      return;
+    }
+    const d = this.distance / factor;
+    const dop = this.directionOfProjection;
+    this.position = sub(this.focalPoint, scale(dop, d));
+  }
+  /** Translate both position and focal point (used by pan). */
+  translate(v) {
+    this.position = add(this.position, v);
+    this.focalPoint = add(this.focalPoint, v);
+  }
+  /** Half-height of the view plane at the focal point (perspective). */
+  focalPlaneHalfHeight() {
+    return this.parallelProjection ? this.parallelScale : this.distance * Math.tan(this.viewAngle * Math.PI / 360);
+  }
+  /** Pan by a display-space delta, moving the world under the cursor 1:1 at focal depth.
+   *  Equivalent to vtkMRMLCameraWidget::ProcessTranslate's focal-depth unprojection, but
+   *  expressed directly in the camera basis (exact for a centred perspective view).
+   *  dxDisplay/dyDisplay are in VTK display convention (y UP). */
+  panByDisplayDelta(dxDisplay, dyDisplay, viewportWidth, viewportHeight) {
+    const halfH = this.focalPlaneHalfHeight();
+    const mmPerPixel = 2 * halfH / viewportHeight;
+    const { right, up } = this.basis();
+    const motion = add(scale(right, -dxDisplay * mmPerPixel), scale(up, -dyDisplay * mmPerPixel));
+    this.translate(motion);
+  }
+  /** vtkCamera-comparable snapshot for the harness. */
+  state() {
+    return {
+      position: [...this.position],
+      focalPoint: [...this.focalPoint],
+      viewUp: [...this.viewUp],
+      viewAngle: this.viewAngle,
+      distance: this.distance
+    };
+  }
+};
+
+// render/vtk-interactor.ts
+var MOTION_FACTOR = 10;
+var MOUSE_WHEEL_MOTION_FACTOR = 1;
+function actionForButton(button, m = {}) {
+  const shift = !!m.shift, ctrl = !!m.ctrl, alt = !!m.alt;
+  if (button === 0) {
+    if (shift && ctrl) return "scale";
+    if (ctrl) return "spin";
+    if (shift) return "translate";
+    return "rotate";
+  }
+  if (button === 1) return "translate";
+  if (button === 2) return "scale";
+  return "none";
+}
+var CameraInteractor = class _CameraInteractor {
+  camera;
+  action = "none";
+  prev = null;
+  // previous position, VTK display coords
+  onChange;
+  constructor(camera, onChange) {
+    this.camera = camera;
+    this.onChange = onChange;
+  }
+  /** Convert browser (cssX, cssY within the view) to VTK display coords (y up). */
+  static toDisplay(cssX, cssY, height) {
+    return [cssX, height - cssY];
+  }
+  start(button, cssX, cssY, height, m = {}) {
+    this.action = actionForButton(button, m);
+    this.prev = _CameraInteractor.toDisplay(cssX, cssY, height);
+  }
+  end() {
+    this.action = "none";
+    this.prev = null;
+  }
+  /** Mouse move while dragging. width/height are the view size in CSS pixels. */
+  move(cssX, cssY, width, height) {
+    if (this.action === "none" || !this.prev) return;
+    const [x, y] = _CameraInteractor.toDisplay(cssX, cssY, height);
+    const dx = x - this.prev[0];
+    const dy = y - this.prev[1];
+    if (dx === 0 && dy === 0) return;
+    switch (this.action) {
+      case "rotate":
+        this.rotate(dx, dy, width, height);
+        break;
+      case "translate":
+        this.camera.panByDisplayDelta(dx, dy, width, height);
+        break;
+      case "scale":
+        this.scale(dy, height);
+        break;
+      case "spin":
+        this.spin(x, y, this.prev[0], this.prev[1], width, height);
+        break;
+    }
+    this.prev = [x, y];
+    this.onChange?.();
+  }
+  /** vtkMRMLCameraWidget::ProcessRotate */
+  rotate(dx, dy, width, height) {
+    const deltaAzimuth = -20 / width;
+    const deltaElevation = -20 / height;
+    const rxf = dx * deltaAzimuth * MOTION_FACTOR;
+    const ryf = dy * deltaElevation * MOTION_FACTOR;
+    this.camera.azimuth(rxf);
+    const rotatedUp = this.camera.elevation(ryf);
+    this.camera.orthogonalizeViewUp(rotatedUp);
+  }
+  /** vtkMRMLCameraWidget::ProcessScale — note the sign flip vs plain VTK. */
+  scale(dy, height) {
+    const centerY = height / 2;
+    const dyf = MOTION_FACTOR * dy / centerY;
+    this.camera.dolly(Math.pow(1.1, -dyf));
+  }
+  /** vtkMRMLCameraWidget::ProcessSpin — roll about the view plane normal. */
+  spin(x, y, px, py, width, height) {
+    const cx = width / 2, cy = height / 2;
+    const newAngle = Math.atan2(y - cy, x - cx) * 180 / Math.PI;
+    const oldAngle = Math.atan2(py - cy, px - cx) * 180 / Math.PI;
+    this.roll(newAngle - oldAngle);
+  }
+  /** vtkCamera::Roll — rotate viewUp about the direction of projection. */
+  roll(deg) {
+    const cam = this.camera;
+    const axis = cam.directionOfProjection;
+    const t = deg * Math.PI / 180, c = Math.cos(t), s = Math.sin(t);
+    const v = cam.viewUp;
+    const k = axis;
+    const kv = [k[1] * v[2] - k[2] * v[1], k[2] * v[0] - k[0] * v[2], k[0] * v[1] - k[1] * v[0]];
+    const kd = k[0] * v[0] + k[1] * v[1] + k[2] * v[2];
+    cam.viewUp = [
+      v[0] * c + kv[0] * s + k[0] * kd * (1 - c),
+      v[1] * c + kv[1] * s + k[1] * kd * (1 - c),
+      v[2] * c + kv[2] * s + k[2] * kd * (1 - c)
+    ];
+    cam.orthogonalizeViewUp();
+    this.onChange?.();
+  }
+  /** Mouse wheel. `forward` = wheel away from the user = zoom in. */
+  wheel(forward) {
+    const e = 0.2 * MOTION_FACTOR * MOUSE_WHEEL_MOTION_FACTOR;
+    this.camera.dolly(Math.pow(1.1, forward ? e : -e));
+    this.onChange?.();
+  }
+};
 
 // render/introspect.ts
 var LOG_MAX = 500;
@@ -993,20 +1219,14 @@ async function main() {
     coronal: slicerDefaultOffset01("coronal", rs.sv.dims, rs.sv.ijkToRAS, rasLo0, rasHi0),
     sagittal: slicerDefaultOffset01("sagittal", rs.sv.dims, rs.sv.ijkToRAS, rasLo0, rasHi0)
   };
-  const { radius } = rs.sv;
-  const center = [0, 0, 0];
-  const FOVY = 30;
-  let az = Math.PI, elev = 0, dist = 500;
-  const eyeAt = () => {
-    const o = orbitEye(az, elev, dist);
-    return [center[0] + o[0], center[1] + o[1], center[2] + o[2]];
-  };
+  const camera = VtkCamera.slicerDefault();
+  const interactor = new CameraInteractor(camera, () => draw3d());
   const drawPlane = (p) => {
     rs.slice.setPlane(p.orient, off[p.cell]);
     rs.slice.renderToView(cx[p.cell].getCurrentTexture().createView({ format: srgb }), cv[p.cell].width, cv[p.cell].height);
   };
   const draw3d = () => {
-    rs.scene.setCamera(eyeAt(), center, [0, 0, 1], FOVY, cv.threeD.width, cv.threeD.height);
+    rs.scene.setCamera(camera.position, camera.focalPoint, camera.viewUp, camera.viewAngle, cv.threeD.width, cv.threeD.height);
     rs.scene.renderToView(cx.threeD.getCurrentTexture().createView({ format: srgb }), cv.threeD.width, cv.threeD.height);
   };
   const drawAll = () => {
@@ -1031,45 +1251,49 @@ async function main() {
       drawPlane(p);
     }, { passive: false });
   }
-  let dragging = false, lx = 0, ly = 0;
+  const viewSize = () => ({ w: cv.threeD.clientWidth, h: cv.threeD.clientHeight });
+  const localXY = (e) => {
+    const r = cv.threeD.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  };
+  cv.threeD.addEventListener("contextmenu", (e) => e.preventDefault());
   cv.threeD.addEventListener("pointerdown", (e) => {
-    dragging = true;
-    lx = e.clientX;
-    ly = e.clientY;
+    const { x, y } = localXY(e), { h } = viewSize();
+    interactor.start(e.button, x, y, h, { shift: e.shiftKey, ctrl: e.ctrlKey || e.metaKey, alt: e.altKey });
     cv.threeD.setPointerCapture(e.pointerId);
+    hook?.logEvent("cameraStart", { action: interactor.action, x, y, button: e.button, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey });
   });
   cv.threeD.addEventListener("pointerup", (e) => {
-    dragging = false;
+    interactor.end();
     cv.threeD.releasePointerCapture(e.pointerId);
   });
   cv.threeD.addEventListener("pointermove", (e) => {
-    if (!dragging) return;
-    az += (e.clientX - lx) * 8e-3;
-    elev = Math.max(-1.4, Math.min(1.4, elev - (e.clientY - ly) * 8e-3));
-    lx = e.clientX;
-    ly = e.clientY;
-    draw3d();
+    if (interactor.action === "none") return;
+    const { x, y } = localXY(e), { w, h } = viewSize();
+    interactor.move(x, y, w, h);
   });
   cv.threeD.addEventListener("wheel", (e) => {
     e.preventDefault();
-    dist = Math.max(50, Math.min(3e3, dist * (e.deltaY > 0 ? 1.08 : 0.93)));
-    draw3d();
+    interactor.wheel(e.deltaY < 0);
+    hook?.logEvent("cameraWheel", { deltaY: e.deltaY, distance: camera.distance });
   }, { passive: false });
   const [rasLo, rasHi] = rs.sv.field.aabb();
   const hook = installIntrospection({
     getCamera: () => ({
-      azimuth: az,
-      elevation: elev,
-      distance: dist,
-      position: eyeAt(),
-      focalPoint: [...center],
-      viewUp: [0, 0, 1],
-      viewAngle: FOVY
+      azimuth: 0,
+      elevation: 0,
+      distance: camera.distance,
+      // orbit params retired; vtkCamera state is authoritative
+      position: [...camera.position],
+      focalPoint: [...camera.focalPoint],
+      viewUp: [...camera.viewUp],
+      viewAngle: camera.viewAngle
     }),
     setCamera: (p) => {
-      if (p.azimuth !== void 0) az = p.azimuth;
-      if (p.elevation !== void 0) elev = p.elevation;
-      if (p.distance !== void 0) dist = p.distance;
+      if (p.position) camera.position = [...p.position];
+      if (p.focalPoint) camera.focalPoint = [...p.focalPoint];
+      if (p.viewUp) camera.viewUp = [...p.viewUp];
+      if (p.viewAngle !== void 0) camera.viewAngle = p.viewAngle;
       draw3d();
     },
     getPlanes: () => {
