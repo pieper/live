@@ -618,6 +618,49 @@ var CameraInteractor = class _CameraInteractor {
   }
 };
 
+// render/demos/camera-control.ts
+function attachCameraControls(canvas, camera, opts = {}) {
+  const interactor = new CameraInteractor(camera, opts.onChange);
+  const local = (e) => {
+    const r = canvas.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  };
+  canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+  canvas.addEventListener("pointerdown", (e) => {
+    const { x, y } = local(e);
+    interactor.start(e.button, x, y, canvas.clientHeight, {
+      shift: e.shiftKey,
+      ctrl: e.ctrlKey || e.metaKey,
+      alt: e.altKey
+    });
+    canvas.setPointerCapture(e.pointerId);
+    opts.onLog?.("cameraStart", { action: interactor.action, x, y, button: e.button, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey });
+  });
+  canvas.addEventListener("pointerup", (e) => {
+    interactor.end();
+    canvas.releasePointerCapture(e.pointerId);
+  });
+  canvas.addEventListener("pointermove", (e) => {
+    if (interactor.action === "none") return;
+    const { x, y } = local(e);
+    interactor.move(x, y, canvas.clientWidth, canvas.clientHeight);
+  });
+  canvas.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    interactor.wheel(e.deltaY < 0);
+    opts.onLog?.("cameraWheel", { deltaY: e.deltaY, distance: camera.distance });
+  }, { passive: false });
+  return interactor;
+}
+function framedCamera(center, radius, distMul = 2.6) {
+  return new VtkCamera(
+    [center[0], center[1] + radius * distMul, center[2]],
+    [...center],
+    [0, 0, 1],
+    30
+  );
+}
+
 // render/introspect.ts
 var LOG_MAX = 500;
 function installIntrospection(api) {
@@ -1424,13 +1467,8 @@ async function main() {
   const scene = new SceneRenderer(gpu, srgb);
   scene.build(fields);
   scene.setBackground(0.05, 0.06, 0.09);
-  const camera = new VtkCamera(
-    [center[0], center[1] + radius * 2.6, center[2]],
-    [...center],
-    [0, 0, 1],
-    30
-  );
-  const interactor = new CameraInteractor(camera, () => draw());
+  const camera = framedCamera(center, radius);
+  attachCameraControls(canvas, camera, { onChange: () => draw() });
   const draw = () => {
     const w = canvas.width, h = canvas.height;
     scene.setCamera(camera.position, camera.focalPoint, camera.viewUp, camera.viewAngle, w, h);
@@ -1446,29 +1484,6 @@ async function main() {
     draw();
   };
   globalThis.addEventListener("resize", resize);
-  canvas.addEventListener("contextmenu", (e) => e.preventDefault());
-  const local = (e) => {
-    const r = canvas.getBoundingClientRect();
-    return { x: e.clientX - r.left, y: e.clientY - r.top };
-  };
-  canvas.addEventListener("pointerdown", (e) => {
-    const { x, y } = local(e);
-    interactor.start(e.button, x, y, canvas.clientHeight, { shift: e.shiftKey, ctrl: e.ctrlKey || e.metaKey, alt: e.altKey });
-    canvas.setPointerCapture(e.pointerId);
-  });
-  canvas.addEventListener("pointerup", (e) => {
-    interactor.end();
-    canvas.releasePointerCapture(e.pointerId);
-  });
-  canvas.addEventListener("pointermove", (e) => {
-    if (interactor.action === "none") return;
-    const { x, y } = local(e);
-    interactor.move(x, y, canvas.clientWidth, canvas.clientHeight);
-  });
-  canvas.addEventListener("wheel", (e) => {
-    e.preventDefault();
-    interactor.wheel(e.deltaY < 0);
-  }, { passive: false });
   installIntrospection({
     getCamera: () => ({
       azimuth: 0,
