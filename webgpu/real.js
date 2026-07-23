@@ -875,6 +875,46 @@ function orbitEye(azimuth, elevation, distance) {
   ];
 }
 
+// render/introspect.ts
+var LOG_MAX = 500;
+function installIntrospection(api) {
+  const log = [];
+  const hook = {
+    ...api,
+    ready: true,
+    log,
+    logEvent(kind, detail = {}) {
+      log.push({ t: Math.round(performance.now()), kind, detail });
+      if (log.length > LOG_MAX) log.shift();
+    },
+    clearLog() {
+      log.length = 0;
+    },
+    snapshot() {
+      const s = { camera: api.getCamera() };
+      try {
+        if (api.getPlanes) s.planes = api.getPlanes();
+      } catch (e) {
+        s.planesErr = String(e);
+      }
+      try {
+        if (api.getVolume) s.volume = api.getVolume();
+      } catch (e) {
+        s.volumeErr = String(e);
+      }
+      try {
+        if (api.extra) s.extra = api.extra();
+      } catch (e) {
+        s.extraErr = String(e);
+      }
+      s.logCount = log.length;
+      return s;
+    }
+  };
+  globalThis.__slicerlive = hook;
+  return hook;
+}
+
 // render/demos/real-browser.ts
 var status = (msg, err = false) => {
   const el2 = document.getElementById("status");
@@ -973,6 +1013,66 @@ async function main() {
     dist = Math.max(radius * 1.2, Math.min(radius * 8, dist * (e.deltaY > 0 ? 1.08 : 0.93)));
     draw3d();
   }, { passive: false });
+  const [rasLo, rasHi] = rs.sv.field.aabb();
+  const hook = installIntrospection({
+    getCamera: () => ({
+      azimuth: az,
+      elevation: elev,
+      distance: dist,
+      position: eyeAt(),
+      focalPoint: [...center],
+      viewUp: [0, 0, 1],
+      viewAngle: 26
+    }),
+    setCamera: (p) => {
+      if (p.azimuth !== void 0) az = p.azimuth;
+      if (p.elevation !== void 0) elev = p.elevation;
+      if (p.distance !== void 0) dist = p.distance;
+      draw3d();
+    },
+    getPlanes: () => {
+      const out = {};
+      const nAxis = { axial: 2, coronal: 1, sagittal: 0 };
+      for (const p of planes) {
+        const a = nAxis[p.orient];
+        out[p.cell] = { orient: p.orient, offset01: off[p.cell], offsetMm: rasLo[a] + off[p.cell] * (rasHi[a] - rasLo[a]) };
+      }
+      return out;
+    },
+    setPlane: (cell, offset01) => {
+      off[cell] = Math.max(0, Math.min(1, offset01));
+      const p = planes.find((q) => q.cell === cell);
+      if (p) drawPlane(p);
+    },
+    getVolume: () => ({
+      name: rs.sv.name,
+      dims: rs.sv.dims,
+      ijkToRAS: rs.sv.ijkToRAS,
+      rasLo,
+      rasHi,
+      window: rs.sv.win,
+      level: rs.sv.lev
+    }),
+    viewToVoxel: (cell, u, v) => {
+      const p = planes.find((q) => q.cell === cell);
+      if (!p) throw new Error("unknown cell " + cell);
+      rs.slice.setPlane(p.orient, off[cell]);
+      const t = rs.slice.viewToTex(u, v);
+      const [X, Y, Z] = rs.sv.dims;
+      return [
+        Math.max(0, Math.min(X - 1, Math.round(t[0] * X - 0.5))),
+        Math.max(0, Math.min(Y - 1, Math.round(t[1] * Y - 0.5))),
+        Math.max(0, Math.min(Z - 1, Math.round(t[2] * Z - 0.5)))
+      ];
+    },
+    render: () => drawAll()
+  });
+  for (const p of planes) {
+    cv[p.cell].addEventListener("wheel", (e) => hook.logEvent("wheel", { cell: p.cell, deltaY: e.deltaY, offset01: off[p.cell] }), { passive: true });
+    cv[p.cell].addEventListener("pointerdown", (e) => hook.logEvent("pointerdown", { cell: p.cell, x: e.offsetX, y: e.offsetY, button: e.button, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey }));
+  }
+  cv.threeD.addEventListener("pointerdown", (e) => hook.logEvent("pointerdown", { cell: "threeD", x: e.offsetX, y: e.offsetY, button: e.button, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey }));
+  cv.threeD.addEventListener("wheel", (e) => hook.logEvent("wheel", { cell: "threeD", deltaY: e.deltaY, distance: dist }), { passive: true });
   resize();
 }
 main().catch((e) => status("error: " + (e?.message ?? e), true));
