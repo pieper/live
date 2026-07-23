@@ -421,9 +421,9 @@ fn fs_main(v : V) -> @location(0) vec4<f32> {
 `
 );
 var BASES = {
-  axial: { uDir: [1, 0, 0], vDir: [0, 1, 0], uAxis: 0, vAxis: 1, nAxis: 2 },
-  coronal: { uDir: [1, 0, 0], vDir: [0, 0, 1], uAxis: 0, vAxis: 2, nAxis: 1 },
-  sagittal: { uDir: [0, 1, 0], vDir: [0, 0, 1], uAxis: 1, vAxis: 2, nAxis: 0 }
+  axial: { uDir: [-1, 0, 0], vDir: [0, 1, 0], uAxis: 0, vAxis: 1, nAxis: 2 },
+  coronal: { uDir: [-1, 0, 0], vDir: [0, 0, 1], uAxis: 0, vAxis: 2, nAxis: 1 },
+  sagittal: { uDir: [0, -1, 0], vDir: [0, 0, 1], uAxis: 1, vAxis: 2, nAxis: 0 }
 };
 var SliceRenderer = class {
   dev;
@@ -1236,11 +1236,14 @@ var FaithfulSegmenter = class {
       const onFirst = (e) => {
         const d = e.data;
         if (d.type === "progress") {
-          this.opts.onStatus?.(d.cached ? "model cached" : d.total ? `downloading model ${(d.loaded / 1e6).toFixed(0)}/${(d.total / 1e6).toFixed(0)} MB` : "loading model\u2026");
+          if (d.what === "tune") this.opts.onStatus?.("autotuning GPU convolutions (one-time)\u2026");
+          else if (d.cached) this.opts.onStatus?.("model weights cached \u2014 initializing\u2026");
+          else if (d.total) this.opts.onStatus?.(`downloading nnLive weights ${(d.loaded / 1e6).toFixed(0)}/${(d.total / 1e6).toFixed(0)} MB (${Math.round(100 * d.loaded / d.total)}%) \xB7 compiling shaders\u2026`);
+          else this.opts.onStatus?.("loading nnLive model + compiling shaders\u2026");
         } else if (d.type === "ready") {
           this.worker.removeEventListener("message", onFirst);
           this.wire();
-          this.opts.onStatus?.(`nnLive faithful 192\xB3 ready \xB7 ~${d.ms} ms/click \xB7 load ${(d.loadMs / 1e3).toFixed(1)}s`);
+          this.opts.onStatus?.(`nnLive faithful 192\xB3 ready \xB7 ~${d.ms} ms/click on this GPU \xB7 loaded in ${(d.loadMs / 1e3).toFixed(1)}s \u2014 click an organ to segment`);
           resolve();
         } else if (d.type === "error") {
           this.worker.removeEventListener("message", onFirst);
@@ -1256,6 +1259,7 @@ var FaithfulSegmenter = class {
     this.worker.addEventListener("message", (e) => {
       const d = e.data;
       if (d.type === "encoded") {
+        this.opts.onStatus?.(`encoded 192\xB3 in ${d.ms} ms \xB7 decoding (perclick)\u2026`);
         const i7 = this.inter.buildInter(this.center, P, this.zoom);
         this.worker.postMessage({ type: "infer", inter: i7.buffer }, [i7.buffer]);
       } else if (d.type === "result") {
@@ -1307,6 +1311,7 @@ var FaithfulSegmenter = class {
     });
   }
   encode() {
+    this.opts.onStatus?.(`encoding 192\xB3 (trunk)${this.zoom > 1 ? ` \xB7 zoom \xD7${this.zoom.toFixed(1)}` : ""}\u2026`);
     const crop = this.enc.extractCrop(this.vol, this.Z, this.Y, this.X, this.center, P, this.zoom, this.stats.mean, this.stats.std);
     this.worker.postMessage({ type: "encode", image: crop.buffer, ctr: this.center, zoom: this.zoom }, [crop.buffer]);
   }
@@ -1411,7 +1416,7 @@ async function main() {
   const off = { axial: 0.5, coronal: 0.5, sagittal: 0.5 };
   const norm = { axial: 2, coronal: 1, sagittal: 0 };
   const { center: ctr3d, radius } = sv;
-  let az = 0.6, elev = 0.25, dist = radius * 2.6;
+  let az = Math.PI, elev = 0.12, dist = radius * 2.6;
   const eyeAt = () => {
     const o = orbitEye(az, elev, dist);
     return [ctr3d[0] + o[0], ctr3d[1] + o[1], ctr3d[2] + o[2]];

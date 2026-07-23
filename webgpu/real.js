@@ -414,9 +414,9 @@ fn fs_main(v : V) -> @location(0) vec4<f32> {
 `
 );
 var BASES = {
-  axial: { uDir: [1, 0, 0], vDir: [0, 1, 0], uAxis: 0, vAxis: 1, nAxis: 2 },
-  coronal: { uDir: [1, 0, 0], vDir: [0, 0, 1], uAxis: 0, vAxis: 2, nAxis: 1 },
-  sagittal: { uDir: [0, 1, 0], vDir: [0, 0, 1], uAxis: 1, vAxis: 2, nAxis: 0 }
+  axial: { uDir: [-1, 0, 0], vDir: [0, 1, 0], uAxis: 0, vAxis: 1, nAxis: 2 },
+  coronal: { uDir: [-1, 0, 0], vDir: [0, 0, 1], uAxis: 0, vAxis: 2, nAxis: 1 },
+  sagittal: { uDir: [0, -1, 0], vDir: [0, 0, 1], uAxis: 1, vAxis: 2, nAxis: 0 }
 };
 var SliceRenderer = class {
   dev;
@@ -914,7 +914,7 @@ async function main() {
   ];
   const off = { axial: 0.5, coronal: 0.5, sagittal: 0.5 };
   const { center, radius } = rs.sv;
-  let az = 0.6, elev = 0.25, dist = radius * 3;
+  let az = Math.PI, elev = 0.12, dist = radius * 3;
   const eyeAt = () => {
     const o = orbitEye(az, elev, dist);
     return [center[0] + o[0], center[1] + o[1], center[2] + o[2]];
