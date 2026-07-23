@@ -942,8 +942,14 @@ function boundsCorners(lo, hi) {
 }
 function defaultTargets(sources) {
   const t = sources.map((c) => [...c]);
-  t[7] = [t[7][0] + 55, t[7][1] + 25, t[7][2] + 20];
-  t[0] = [t[0][0] - 30, t[0][1] - 10, t[0][2] - 15];
+  const STRETCH_S = 62;
+  const SQUEEZE_R = 30;
+  for (let i = 0; i < 8; i++) {
+    const top = i >= 4;
+    const rHi = (i & 1) === 1;
+    t[i][2] += top ? -STRETCH_S : STRETCH_S * 0.45;
+    t[i][0] += rHi ? SQUEEZE_R : -SQUEEZE_R;
+  }
   return t;
 }
 async function buildDeformScene(dev, sceneUrl = "https://pieper.github.io/live/legacy/scenes/MRHead.json", onBytes) {
@@ -1077,7 +1083,7 @@ async function main() {
   scene.build([sc.warp, sc.image, sc.fiducials]);
   scene.setBackground(0.06, 0.07, 0.1);
   const { center, radius } = sc.sv;
-  let az = Math.PI, el = 0.12, dist = radius * 2.6;
+  let az = Math.PI, el = 0.12, dist = radius * 3.5;
   const eyeAt = () => {
     const o = orbitEye(az, el, dist);
     return [center[0] + o[0], center[1] + o[1], center[2] + o[2]];
