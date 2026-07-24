@@ -23,8 +23,7 @@
 <body>
 <header>
   <h1>Multi-Volume — CTACardio + Panoramix <span class="badge">selftest · real data</span></h1>
-  <div class="sub">A port of the slicer-wgpu <em>Multi-Volume</em> selftest: <strong>CTACardio</strong> and <strong>CTAAbdomenPanoramix</strong>, each with its own transfer function, composited in a single ray-march with Panoramix offset <strong>+200 mm along R</strong> exactly as the selftest places it. Camera and mouse bindings match Slicer's <code>vtkMRMLCameraWidget</code>:
-    drag = rotate, shift/middle = pan, right = zoom, wheel = dolly.
+  <div class="sub">A port of the slicer-wgpu <em>Multi-Volume</em> selftest: <strong>CTACardio</strong> and <strong>CTAAbdomenPanoramix</strong>, each with its own transfer function, composited in a single ray-march with Panoramix offset <strong>+200 mm along R</strong> — which the selftest puts on an <em>interactive linear transform</em>. So this demo has a <strong>transform widget</strong> on Panoramix: drag the <span style="color:#e0e0e0">white centre handle</span> to translate, an <span style="color:#ff8a8a">R</span>/<span style="color:#7fe08a">A</span>/<span style="color:#8aa0ff">S</span>-coloured <strong>ring handle</strong> to rotate about that axis; drag empty space to rotate the camera. All GPU-local — the volume re-places on one uniform update, no pipeline rebuild.
     &nbsp;·&nbsp; <a href="https://github.com/pieper/SlicerLive" target="_blank">SlicerLive</a></div>
 </header>
 <main>
