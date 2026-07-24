@@ -1130,8 +1130,8 @@ function defaultTargets(sources) {
   for (let i = 0; i < 8; i++) {
     const top = i >= 4;
     const rHi = (i & 1) === 1;
-    t[i][2] += top ? -STRETCH_S : STRETCH_S * 0.45;
-    t[i][0] += rHi ? SQUEEZE_R : -SQUEEZE_R;
+    t[i][2] += top ? STRETCH_S : -STRETCH_S * 0.45;
+    t[i][0] += rHi ? -SQUEEZE_R : SQUEEZE_R;
   }
   return t;
 }
@@ -1164,7 +1164,7 @@ async function buildDeformScene(dev, sceneUrl = "https://pieper.github.io/live/l
     }
     fiducials.setSpheres(pins);
   };
-  const solveDisp = () => sampleDisplacementGrid(GRID_DIMS, spacing, center, tps3d(sources, targets));
+  const solveDisp = () => sampleDisplacementGrid(GRID_DIMS, spacing, center, tps3d(targets, sources));
   const warp = new TransformField(dev, solveDisp(), GRID_DIMS, spacing, { gain: 1, center });
   image.transform = warp;
   buildPins();
