@@ -151,6 +151,13 @@ function volumeAABBFromIjkToRAS(ijkToRAS, dims) {
   }
   return [lo, hi];
 }
+function applyMat4(m, p) {
+  const x = m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12];
+  const y = m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13];
+  const z = m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14];
+  const w = m[3] * p[0] + m[7] * p[1] + m[11] * p[2] + m[15] || 1;
+  return [x / w, y / w, z / w];
+}
 function spacingFromIjkToRAS(ijkToRAS) {
   const col = (c) => Math.hypot(ijkToRAS[c], ijkToRAS[4 + c], ijkToRAS[8 + c]);
   return [col(0), col(1), col(2)];
@@ -159,7 +166,7 @@ function spacingFromIjkToRAS(ijkToRAS) {
 // render/scene-renderer.ts
 var DEFAULT_FORMAT = "rgba8unorm-srgb";
 var SCENE_FLOATS = 16;
-var SceneRenderer = class {
+var SceneRenderer = class _SceneRenderer {
   dev;
   format;
   placed = [];
@@ -169,6 +176,24 @@ var SceneRenderer = class {
   matBuf;
   mat;
   bind;
+  /** Emit a default AABB-distance skip for fields that don't supply their own bound.
+   *
+   *  OFF because it MEASURED AS A NET LOSS (render/test/profile-boxskip.ts, 448², M-series):
+   *      MultiVolume +8.7%   Volume+Fiducials +7.3%   Segmentation +96.5%   SingleVolume -15.5%
+   *  The appealing theory — "Panoramix sits +200mm R of CTACardio, so rays spend much of the
+   *  scene box outside one volume" — is true but worthless: ImageField's out-of-box sample was
+   *  ALREADY nearly free (it early-returns on the texture-bounds test), so there was no per-step
+   *  cost to remove. Meanwhile every field pays a box distance + horizon bookkeeping at every
+   *  step it is INSIDE its box, which is most of the march since the scene box is the union of
+   *  the field boxes. Fields with their own cheap early-out are hurt worst — SegmentField
+   *  (`v<=0.02||v>=0.98`) nearly doubles. The lone SingleVolume win survives warm-up but has no
+   *  algorithmic explanation (the box IS the scene box there, so the bound is 0 at every sample)
+   *  and is almost certainly a shader-compiler/occupancy artifact — not something to bank on.
+   *
+   *  Kept behind a flag rather than deleted so the negative result stays reproducible, and
+   *  because it may behave differently on other GPUs (NVIDIA/AMD) — re-measure before enabling.
+   *  The real win for dense volumes is an occupancy grid over air INSIDE the box, not the box. */
+  static boxSkip = false;
   canTime;
   constructor(gpu, format = DEFAULT_FORMAT) {
     this.dev = gpu.device;
@@ -220,9 +245,21 @@ ${body}
 }`;
     }).join("\n");
     const fieldFns = receivers.map((p) => p.field.samplingWGSL(p.slot)).join("\n");
-    const skippers = receivers.filter((p) => p.field.providesSkip && p.field.skipWGSL && !p.field.transform);
+    const wf = (v) => (Number.isFinite(v) ? v : 0).toFixed(6);
+    const boxSkipWGSL = (p) => {
+      const [lo, hi] = p.field.aabb();
+      return `
+fn skip_${p.field.kind}${p.slot}(wp : vec3<f32>) -> f32 {
+  let q = max(vec3<f32>(${wf(lo[0])}, ${wf(lo[1])}, ${wf(lo[2])}) - wp,
+              wp - vec3<f32>(${wf(hi[0])}, ${wf(hi[1])}, ${wf(hi[2])}));
+  return length(max(q, vec3<f32>(0.0)));   // 0 inside the box, exact distance outside
+}`;
+    };
+    const skippers = receivers.filter((p) => !p.field.transform).filter((p) => _SceneRenderer.boxSkip || p.field.providesSkip && p.field.skipWGSL);
     const canSkip = new Set(skippers.map((p) => p.field));
-    const skipFns = skippers.map((p) => p.field.skipWGSL(p.slot)).join("\n");
+    const skipFns = skippers.map(
+      (p) => p.field.providesSkip && p.field.skipWGSL ? p.field.skipWGSL(p.slot) : boxSkipWGSL(p)
+    ).join("\n");
     const fns = [modFns, tpFns, fieldFns, skipFns].filter((s) => s.trim()).join("\n");
     const skipInit = skippers.map((p) => `  var resume_${p.field.kind}${p.slot} : f32 = -1.0e30;`).join("\n");
     const dispatch = receivers.map((p) => {
@@ -339,6 +376,24 @@ ${dispatch}
     this.mat[4] = mx[0];
     this.mat[5] = mx[1];
     this.mat[6] = mx[2];
+  }
+  /** Tier-A interactive update: re-pack every field's uniform block into the resident
+   *  material buffer WITHOUT recompiling the pipeline or rebuilding the bind group. This is
+   *  the render-side of the interaction architecture (ARCHITECTURE-2026-07-24 §7): a
+   *  lightweight drag — clip planes, ROI box geometry, fiducial position, TPS displacement
+   *  grid — mutates node state, the field re-derives its uniforms, and the SAME per-frame
+   *  flush() the renderer already does uploads them. Cost is a CPU re-pack; no shader build.
+   *
+   *  Also refreshes the scene AABB (which is uniform-resident), so a moved field's ray-clip
+   *  bounds stay correct. REQUIRES the field SET and each field's uniformFloats() to be
+   *  unchanged since build() — geometry/appearance may change, STRUCTURE may not. A structural
+   *  change (add/remove a field, a field that resizes its uniform block, or a texture swap
+   *  needing refreshBindings) still goes through build()/refreshBindings(). This is exactly
+   *  why moving geometry must be uniform-resident, never baked into generated WGSL — see the
+   *  box-skip note above and RENDER-PERFORMANCE.md. */
+  syncUniforms() {
+    for (const p of this.placed) p.field.fillUniforms(this.mat, p.uoff);
+    this.recomputeBounds();
   }
   /** Rebuild the bind group from the fields' current resources (e.g. after a field
    *  swapped a texture) without recompiling the pipeline. Field set/structure must be unchanged. */
@@ -616,6 +671,7 @@ var TransformField = class {
   bindingCount = 1;
   // displacement texture (sampler shared)
   tex;
+  dims;
   p2t;
   box;
   gainValue;
@@ -624,13 +680,14 @@ var TransformField = class {
   constructor(dev, displacement, dims, spacing, opts = {}) {
     const center = opts.center ?? [0, 0, 0];
     this.gainValue = opts.gain ?? 1;
+    this.dims = [...dims];
     this.tex = dev.createTexture({
       size: dims,
       dimension: "3d",
       format: "rgba32float",
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
     });
-    dev.queue.writeTexture({ texture: this.tex }, displacement, { bytesPerRow: dims[0] * 16, rowsPerImage: dims[1] }, dims);
+    this.updateDisplacement(dev, displacement);
     this.p2t = patientToTexture(dims, spacing, center);
     this.box = volumeAABB(dims, spacing, center);
     this.stepMm = Math.min(...spacing);
@@ -640,6 +697,19 @@ var TransformField = class {
   }
   setGain(g) {
     this.gainValue = g;
+  }
+  /** Re-upload the displacement grid into the EXISTING texture (same dims) — a Tier-A
+   *  interactive update (ARCHITECTURE-2026-07-24 §7): a TPS re-solve on a landmark drag
+   *  writes new values into the same texture the bind group already points at, so no new
+   *  field, no pipeline/bind rebuild. The grid geometry (dims/spacing/center → p2t) is
+   *  fixed at construction; only the per-voxel displacement changes. */
+  updateDisplacement(dev, displacement) {
+    dev.queue.writeTexture(
+      { texture: this.tex },
+      displacement,
+      { bytesPerRow: this.dims[0] * 16, rowsPerImage: this.dims[1] },
+      this.dims
+    );
   }
   uniformFloats() {
     return 20;
@@ -1079,39 +1149,42 @@ async function buildDeformScene(dev, sceneUrl = "https://pieper.github.io/live/l
     (gHi[1] - gLo[1]) / GRID_DIMS[1],
     (gHi[2] - gLo[2]) / GRID_DIMS[2]
   ];
-  let warp;
   const fiducials = new FiducialField([]);
   const pinR = Math.max(4, Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) * 0.012);
+  let hover = null;
+  const buildPins = () => {
+    const pins = sources.map((c) => ({ center: c, radius: pinR, color: [0.25, 0.85, 1, 1] }));
+    for (let i = 0; i < targets.length; i++) {
+      const on = i === hover;
+      pins.push({
+        center: targets[i],
+        radius: on ? pinR * 1.5 : pinR,
+        color: on ? [1, 0.75, 0.35, 1] : [1, 0.35, 0.85, 1]
+      });
+    }
+    fiducials.setSpheres(pins);
+  };
+  const solveDisp = () => sampleDisplacementGrid(GRID_DIMS, spacing, center, tps3d(sources, targets));
+  const warp = new TransformField(dev, solveDisp(), GRID_DIMS, spacing, { gain: 1, center });
+  image.transform = warp;
+  buildPins();
   const scene = {
     sv,
     image,
-    warp: void 0,
+    warp,
     fiducials,
     sources,
     targets,
-    rebuild(d) {
-      const f = tps3d(sources, targets);
-      const disp = sampleDisplacementGrid(GRID_DIMS, spacing, center, f);
-      warp = new TransformField(d, disp, GRID_DIMS, spacing, { gain: 1, center });
-      image.transform = warp;
-      scene.warp = warp;
-      const pins = [
-        ...sources.map((c) => ({ center: c, radius: pinR, color: [0.25, 0.85, 1, 1] })),
-        ...targets.map((c, i) => ({
-          center: c,
-          radius: pinR,
-          // only show a magenta target pin where it actually differs from its source
-          color: Math.hypot(c[0] - sources[i][0], c[1] - sources[i][1], c[2] - sources[i][2]) > 1e-6 ? [1, 0.35, 0.85, 1] : [0, 0, 0, 0]
-        }))
-      ];
-      fiducials.setSpheres(pins);
-    },
     setTarget(i, p, d) {
       targets[i] = [...p];
-      scene.rebuild(d);
+      warp.updateDisplacement(d, solveDisp());
+      buildPins();
+    },
+    highlightTarget(i) {
+      hover = i;
+      buildPins();
     }
   };
-  scene.rebuild(dev);
   return scene;
 }
 
@@ -1394,6 +1467,120 @@ function framedCamera(center, radius, distMul = 2.6) {
   );
 }
 
+// render/demos/widget-control.ts
+var sub2 = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+var dot2 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+function camMatrices(cam, w, h) {
+  const view = lookAt(cam.position, cam.focalPoint, cam.viewUp);
+  const proj = perspectiveZO(cam.viewAngle * Math.PI / 180, w / h, 1, 1e5);
+  const vp = multiply(proj, view);
+  return { vp, invVp: invert(vp) };
+}
+function worldToClip(vp, p) {
+  return [
+    vp[0] * p[0] + vp[4] * p[1] + vp[8] * p[2] + vp[12],
+    vp[1] * p[0] + vp[5] * p[1] + vp[9] * p[2] + vp[13],
+    vp[2] * p[0] + vp[6] * p[1] + vp[10] * p[2] + vp[14],
+    vp[3] * p[0] + vp[7] * p[1] + vp[11] * p[2] + vp[15]
+  ];
+}
+function attachWidgetControls(canvas, camera, opts) {
+  const cursorCss = (e) => {
+    const r = canvas.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top, rw: r.width, rh: r.height };
+  };
+  const project = (vp, world, rw, rh) => {
+    const c = worldToClip(vp, world);
+    if (c[3] <= 0) return null;
+    const ndcx = c[0] / c[3], ndcy = c[1] / c[3];
+    return { x: (ndcx * 0.5 + 0.5) * rw, y: (1 - (ndcy * 0.5 + 0.5)) * rh };
+  };
+  const unprojectToPlane = (invVp, px, py, rw, rh, planePt) => {
+    const ndcx = px / rw * 2 - 1, ndcy = 1 - py / rh * 2;
+    const near = applyMat4(invVp, [ndcx, ndcy, 0]);
+    const far = applyMat4(invVp, [ndcx, ndcy, 1]);
+    const ro = near, rd = sub2(far, near);
+    const n = sub2(camera.position, camera.focalPoint);
+    const denom = dot2(rd, n);
+    if (Math.abs(denom) < 1e-9) return [...planePt];
+    const t = dot2(sub2(planePt, ro), n) / denom;
+    return [ro[0] + rd[0] * t, ro[1] + rd[1] * t, ro[2] + rd[2] * t];
+  };
+  const pick = (e) => {
+    const { x, y, rw, rh } = cursorCss(e);
+    const { w, h } = opts.getSize();
+    const { vp } = camMatrices(camera, w, h);
+    let best = null, bestD = Infinity;
+    for (const hnd of opts.getHandles()) {
+      const s = project(vp, hnd.world, rw, rh);
+      if (!s) continue;
+      const d = Math.hypot(s.x - x, s.y - y), r = hnd.pickPx ?? 16;
+      if (d < r && d < bestD) {
+        bestD = d;
+        best = hnd;
+      }
+    }
+    return best;
+  };
+  let grabbed = null, hovered = null;
+  const onDown = (e) => {
+    if (e.button !== 0) return;
+    const h = pick(e);
+    if (!h) return;
+    e.stopPropagation();
+    e.preventDefault();
+    grabbed = h;
+    canvas.setPointerCapture(e.pointerId);
+    canvas.style.cursor = h.cursor ? h.cursor : "grabbing";
+    opts.onDragStart?.(h);
+    window.addEventListener("pointermove", onMove, true);
+    window.addEventListener("pointerup", onUp, true);
+  };
+  const onMove = (e) => {
+    if (!grabbed) return;
+    e.stopPropagation();
+    const { x, y, rw, rh } = cursorCss(e);
+    const { w, h } = opts.getSize();
+    const { invVp } = camMatrices(camera, w, h);
+    const world = unprojectToPlane(invVp, x, y, rw, rh, grabbed.world);
+    opts.onDrag(grabbed, world);
+    opts.onChange?.();
+  };
+  const onUp = (e) => {
+    if (!grabbed) return;
+    e.stopPropagation();
+    const g = grabbed;
+    grabbed = null;
+    try {
+      canvas.releasePointerCapture(e.pointerId);
+    } catch {
+    }
+    window.removeEventListener("pointermove", onMove, true);
+    window.removeEventListener("pointerup", onUp, true);
+    opts.onDragEnd?.(g);
+  };
+  const onHoverMove = (e) => {
+    if (grabbed) return;
+    const h = pick(e);
+    if (h !== hovered) {
+      hovered = h;
+      canvas.style.cursor = h ? h.cursor ?? "grab" : "";
+      opts.onHover?.(h);
+      opts.onChange?.();
+    }
+  };
+  canvas.addEventListener("pointerdown", onDown, true);
+  canvas.addEventListener("pointermove", onHoverMove);
+  return {
+    detach() {
+      canvas.removeEventListener("pointerdown", onDown, true);
+      canvas.removeEventListener("pointermove", onHoverMove);
+      window.removeEventListener("pointermove", onMove, true);
+      window.removeEventListener("pointerup", onUp, true);
+    }
+  };
+}
+
 // render/introspect.ts
 var LOG_MAX = 500;
 function installIntrospection(api) {
@@ -1466,12 +1653,13 @@ async function main() {
   scene.setBackground(0.06, 0.07, 0.1);
   const { center, radius } = sc.sv;
   const camera = framedCamera(center, radius, 3.5);
+  let msg = "drag a magenta pin to deform \xB7 drag empty space to rotate";
   const draw = () => {
     const w = canvas.width, h = canvas.height;
     scene.setCamera(camera.position, camera.focalPoint, camera.viewUp, camera.viewAngle, w, h);
     const t0 = performance.now();
     scene.renderToView(ctx.getCurrentTexture().createView({ format: srgb }), w, h);
-    status(`${sc.sv.name} \xB7 TPS landmark deform \xB7 gain ${sc.warp.gain.toFixed(2)} \xB7 8 corner landmarks \xB7 ${(performance.now() - t0).toFixed(0)} ms/frame \xB7 drag=rotate, shift/middle=pan, right=zoom`);
+    status(`${sc.sv.name} \xB7 TPS landmark deform \xB7 gain ${sc.warp.gain.toFixed(2)} \xB7 ${(performance.now() - t0).toFixed(0)} ms/frame \xB7 ${msg}`);
   };
   const resize = () => {
     const dpr = Math.min(2, globalThis.devicePixelRatio || 1);
@@ -1484,9 +1672,27 @@ async function main() {
   const slider = document.getElementById("gain");
   slider?.addEventListener("input", () => {
     sc.warp.setGain(Number(slider.value) / 100);
-    scene.build([sc.warp, sc.image, sc.fiducials]);
-    scene.setBackground(0.06, 0.07, 0.1);
+    scene.syncUniforms();
     draw();
+  });
+  attachWidgetControls(canvas, camera, {
+    getHandles: () => sc.targets.map((world, id) => ({ id, world, cursor: "grab" })),
+    getSize: () => ({ w: canvas.width, h: canvas.height }),
+    onDragStart: (h) => {
+      msg = `dragging landmark ${h.id}`;
+    },
+    onDrag: (h, world) => {
+      sc.setTarget(h.id, world, gpu.device);
+      scene.syncUniforms();
+    },
+    onDragEnd: () => {
+      msg = "drag a magenta pin to deform \xB7 drag empty space to rotate";
+    },
+    onHover: (h) => {
+      sc.highlightTarget(h ? h.id : null);
+      scene.syncUniforms();
+    },
+    onChange: draw
   });
   attachCameraControls(canvas, camera, { onChange: draw });
   installIntrospection({
@@ -1500,6 +1706,17 @@ async function main() {
     extra: () => ({ gain: sc.warp.gain }),
     render: () => draw()
   });
+  globalThis.__deformDbg = {
+    snapshot: () => {
+      const r = canvas.getBoundingClientRect();
+      return {
+        targets: sc.targets.map((t) => [...t]),
+        camera: { position: [...camera.position], focalPoint: [...camera.focalPoint], viewUp: [...camera.viewUp], viewAngle: camera.viewAngle },
+        canvas: { w: canvas.width, h: canvas.height, left: r.left, top: r.top, width: r.width, height: r.height },
+        gain: sc.warp.gain
+      };
+    }
+  };
   resize();
 }
 main().catch((e) => status("error: " + (e?.message ?? e), true));

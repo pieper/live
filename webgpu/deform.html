@@ -29,8 +29,10 @@
     transform</strong> authored from landmark pairs and applied <em>during the ray march</em>. The TransformField is a
     modifier — it contributes no colour; instead the volume samples through
     <code>transform_point()</code>, so the warp deforms the volume's apparent shape (and would equally move fiducials,
-    a segmentation, or anything else that attaches it). Cyan pins are the source landmarks, magenta the targets.
-    Drag the gain slider from identity to full warp. &nbsp;·&nbsp;
+    a segmentation, or anything else that attaches it). Cyan pins are the fixed source landmarks; <strong>drag a
+    magenta target pin</strong> to re-solve the spline and deform the head live — the TPS re-solve and displacement
+    grid update on the GPU with no pipeline rebuild. Drag empty space to rotate; the gain slider scales the warp.
+    &nbsp;·&nbsp;
     <a href="https://github.com/pieper/SlicerLive" target="_blank">SlicerLive</a></div>
 </header>
 <main>
