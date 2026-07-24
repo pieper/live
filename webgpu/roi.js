@@ -260,29 +260,39 @@ fn skip_${p.field.kind}${p.slot}(wp : vec3<f32>) -> f32 {
     };
     const ghostFields = receivers.filter((p) => p.field.ghost);
     const normalReceivers = receivers.filter((p) => !p.field.ghost);
-    const skippers = normalReceivers.filter((p) => !p.field.transform).filter((p) => _SceneRenderer.boxSkip || p.field.providesSkip && p.field.skipWGSL);
-    const canSkip = new Set(skippers.map((p) => p.field));
-    const skipFns = skippers.map(
-      (p) => p.field.providesSkip && p.field.skipWGSL ? p.field.skipWGSL(p.slot) : boxSkipWGSL(p)
-    ).join("\n");
-    const fns = [modFns, tpFns, fieldFns, skipFns].filter((s) => s.trim()).join("\n");
-    const skipInit = skippers.map((p) => `  var resume_${p.field.kind}${p.slot} : f32 = -1.0e30;`).join("\n");
-    const guard = (p, expr) => p.field.clippable === false ? expr : `if (!clipped) { ${expr} }`;
-    const dispatch = normalReceivers.map((p) => {
+    const clipGuard = (p, expr) => p.field.clippable === false ? expr : `if (!clipped) { ${expr} }`;
+    const skipBranch = (p, acc, clip) => {
       const nm = `${p.field.kind}${p.slot}`;
-      if (!canSkip.has(p.field)) {
-        return `    { ${guard(p, `let c = sample_field_${nm}(wp, rd); sum += c;`)} all_defer = false; }`;
-      }
+      const smp = `let c = sample_field_${nm}(wp, rd); ${acc} += c;`;
       return `    if (t >= resume_${nm}) {
       let d_${nm} = max(skip_${nm}(wp) - step, 0.0);
       if (d_${nm} > 0.0) { resume_${nm} = t + d_${nm}; }
-      else { ${guard(p, `let c = sample_field_${nm}(wp, rd); sum += c;`)} }
+      else { ${clip ? clipGuard(p, smp) : smp} }
     }
     if (t < resume_${nm}) { jump_t = min(jump_t, resume_${nm}); } else { all_defer = false; }`;
-    }).join("\n");
-    const ghostDispatch = ghostFields.map(
-      (p) => `    { let c = sample_field_${p.field.kind}${p.slot}(wp, rd); gsum += c; all_defer = false; }`
+    };
+    const plainBranch = (p, acc, clip) => {
+      const nm = `${p.field.kind}${p.slot}`;
+      const smp = `let c = sample_field_${nm}(wp, rd); ${acc} += c;`;
+      return `    { ${clip ? clipGuard(p, smp) : smp} all_defer = false; }`;
+    };
+    const normalSkippers = normalReceivers.filter((p) => !p.field.transform).filter((p) => _SceneRenderer.boxSkip || p.field.providesSkip && p.field.skipWGSL);
+    const ghostSkippers = ghostFields.filter((p) => p.field.providesSkip && p.field.skipWGSL);
+    const canSkip = new Set(normalSkippers.map((p) => p.field));
+    const ghostCanSkip = new Set(ghostSkippers.map((p) => p.field));
+    const skipFns = [
+      ...normalSkippers.map((p) => p.field.providesSkip && p.field.skipWGSL ? p.field.skipWGSL(p.slot) : boxSkipWGSL(p)),
+      ...ghostSkippers.map((p) => p.field.skipWGSL(p.slot))
+    ].join("\n");
+    const fns = [modFns, tpFns, fieldFns, skipFns].filter((s) => s.trim()).join("\n");
+    const skipInit = [...normalSkippers, ...ghostSkippers].map((p) => `  var resume_${p.field.kind}${p.slot} : f32 = -1.0e30;`).join("\n");
+    const dispatch = normalReceivers.map(
+      (p) => canSkip.has(p.field) ? skipBranch(p, "sum", true) : plainBranch(p, "sum", true)
     ).join("\n");
+    const ghostDispatch = ghostFields.map(
+      (p) => ghostCanSkip.has(p.field) ? skipBranch(p, "gsum", false) : plainBranch(p, "gsum", false)
+    ).join("\n");
+    const hasGhost = ghostFields.length > 0;
     return (
       /* wgsl */
       `
@@ -342,9 +352,12 @@ fn fs_main(v : Varyings) -> @location(0) vec4<f32> {
   var t = t_near;
   var integrated = vec4<f32>(0.0);
   var safety : i32 = 0;
+  var saturated = false;   // LATCH: once opaque, normal fields stay off even after a ghost
+                           // handle dims the accumulation (else the volume behind the handle
+                           // would re-opaque over it and re-bury the shine-through).
 ${skipInit}
   loop {
-    if (t >= t_far || safety >= 5000 || integrated.a >= 0.99) { break; }
+    if (t >= t_far || safety >= 5000${hasGhost ? "" : " || integrated.a >= 0.99"}) { break; }
     let js = fract(sin(dot(v.position.xy + vec2<f32>(f32(safety) * 0.7548, f32(safety) * 0.5698), vec2<f32>(12.9898, 78.233))) * 43758.5453) - 0.5; // per-(pixel,sample) jitter
     let wp = ro + rd * (t + js * step);
     var sum = vec4<f32>(0.0);
@@ -357,17 +370,20 @@ ${skipInit}
       let cp = u_material.clip_planes[ci];
       if (dot(wp, cp.xyz) + cp.w < 0.0) { clipped = true; break; }
     }
+    // Normal fields stop being sampled once the ray is opaque (latched); GHOST fields keep
+    // their skip horizons and keep going, so a handle behind an opaque region still shines
+    // through and the ray LEAPS between handles on the ghost skip (early-termination kept).
+${hasGhost ? "    if (integrated.a >= 0.99) { saturated = true; }\n    if (!saturated) {" : ""}
 ${dispatch}
+      if (sum.a > 0.0) { integrated = integrated + (1.0 - integrated.a) * vec4<f32>(sum.rgb, clamp(sum.a, 0.0, 1.0)); }
+${hasGhost ? "    }" : ""}
 ${ghostDispatch}
-    if (sum.a > 0.0) { integrated = integrated + (1.0 - integrated.a) * vec4<f32>(sum.rgb, clamp(sum.a, 0.0, 1.0)); }
     // Ghost handles: dim what's already in front (so the handle shines through), then OVER.
     if (gsum.a > 0.0) {
       let ga = clamp(gsum.a, 0.0, 1.0);
       integrated = integrated * (1.0 - 0.5 * ga);
       integrated = integrated + (1.0 - integrated.a) * vec4<f32>(gsum.rgb, ga);
     }
-    // Leap only across space EVERY field proved empty, so no sampled segment ever
-    // changes length and the fixed-step opacity integration stays exact.
     if (all_defer && jump_t > t + step) { t = jump_t; } else { t = t + step; }
     safety = safety + 1;
   }
@@ -588,7 +604,7 @@ var FiducialField = class {
     this.clippable = opts.clippable ?? true;
     this.ghost = opts.ghost ?? false;
     this.screen = opts.screenSpace ?? false;
-    this.providesSkip = !this.screen;
+    this.providesSkip = true;
   }
   setSpheres(list) {
     this.n = Math.min(list.length, MAX);
@@ -658,6 +674,24 @@ var FiducialField = class {
   // distances in the loop plus ONE sqrt at the end (cheaper than the sampling loop).
   // (providesSkip is false in screen-space mode — the world radius varies with the camera.)
   skipWGSL(s) {
+    if (this.screen) {
+      return (
+        /* wgsl */
+        `
+fn skip_fid${s}(wp : vec3<f32>) -> f32 {
+  let n = i32(u_material.fid${s}_params.x);
+  if (n <= 0) { return 1.0e6; }
+  var best = 1.0e12;
+  for (var k = 0; k < n; k = k + 1) {
+    let sp = u_material.fid${s}_spheres[k];
+    if (sp.w <= 0.0) { continue; }
+    let r = sp.w * length(u_cam.eye.xyz - sp.xyz) / max(u_cam.size.z, 1.0);
+    best = min(best, length(wp - sp.xyz) - r);
+  }
+  return max(best, 0.0);
+}`
+      );
+    }
     return (
       /* wgsl */
       `
