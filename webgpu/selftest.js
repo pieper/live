@@ -229,7 +229,7 @@ var SceneRenderer = class _SceneRenderer {
     this.format = format;
     this.canTime = gpu.features.has("timestamp-query");
     this.sampler = this.dev.createSampler({ magFilter: "linear", minFilter: "linear", addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge", addressModeW: "clamp-to-edge" });
-    this.camBuf = this.dev.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.camBuf = this.dev.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   }
   /** (Re)build the pipeline for a set of fields. */
   build(fields) {
@@ -285,7 +285,9 @@ fn skip_${p.field.kind}${p.slot}(wp : vec3<f32>) -> f32 {
   return length(max(q, vec3<f32>(0.0)));   // 0 inside the box, exact distance outside
 }`;
     };
-    const skippers = receivers.filter((p) => !p.field.transform).filter((p) => _SceneRenderer.boxSkip || p.field.providesSkip && p.field.skipWGSL);
+    const ghostFields = receivers.filter((p) => p.field.ghost);
+    const normalReceivers = receivers.filter((p) => !p.field.ghost);
+    const skippers = normalReceivers.filter((p) => !p.field.transform).filter((p) => _SceneRenderer.boxSkip || p.field.providesSkip && p.field.skipWGSL);
     const canSkip = new Set(skippers.map((p) => p.field));
     const skipFns = skippers.map(
       (p) => p.field.providesSkip && p.field.skipWGSL ? p.field.skipWGSL(p.slot) : boxSkipWGSL(p)
@@ -293,7 +295,7 @@ fn skip_${p.field.kind}${p.slot}(wp : vec3<f32>) -> f32 {
     const fns = [modFns, tpFns, fieldFns, skipFns].filter((s) => s.trim()).join("\n");
     const skipInit = skippers.map((p) => `  var resume_${p.field.kind}${p.slot} : f32 = -1.0e30;`).join("\n");
     const guard = (p, expr) => p.field.clippable === false ? expr : `if (!clipped) { ${expr} }`;
-    const dispatch = receivers.map((p) => {
+    const dispatch = normalReceivers.map((p) => {
       const nm = `${p.field.kind}${p.slot}`;
       if (!canSkip.has(p.field)) {
         return `    { ${guard(p, `let c = sample_field_${nm}(wp, rd); sum += c;`)} all_defer = false; }`;
@@ -305,10 +307,13 @@ fn skip_${p.field.kind}${p.slot}(wp : vec3<f32>) -> f32 {
     }
     if (t < resume_${nm}) { jump_t = min(jump_t, resume_${nm}); } else { all_defer = false; }`;
     }).join("\n");
+    const ghostDispatch = ghostFields.map(
+      (p) => `    { let c = sample_field_${p.field.kind}${p.slot}(wp, rd); gsum += c; all_defer = false; }`
+    ).join("\n");
     return (
       /* wgsl */
       `
-struct Camera { inv_view_proj : mat4x4<f32>, size : vec4<f32> };
+struct Camera { inv_view_proj : mat4x4<f32>, size : vec4<f32>, eye : vec4<f32> };
 struct Material {
   bmin : vec4<f32>,
   bmax : vec4<f32>,
@@ -370,6 +375,7 @@ ${skipInit}
     let js = fract(sin(dot(v.position.xy + vec2<f32>(f32(safety) * 0.7548, f32(safety) * 0.5698), vec2<f32>(12.9898, 78.233))) * 43758.5453) - 0.5; // per-(pixel,sample) jitter
     let wp = ro + rd * (t + js * step);
     var sum = vec4<f32>(0.0);
+    var gsum = vec4<f32>(0.0);   // ghost (handle) contribution, composited with the dim rule
     var all_defer = true;        // every field guarantees emptiness here -> we may leap
     var jump_t = 1.0e30;         // nearest field horizon
     var clipped = false;         // ROI clip: sample on the negative side of any active plane
@@ -379,7 +385,14 @@ ${skipInit}
       if (dot(wp, cp.xyz) + cp.w < 0.0) { clipped = true; break; }
     }
 ${dispatch}
+${ghostDispatch}
     if (sum.a > 0.0) { integrated = integrated + (1.0 - integrated.a) * vec4<f32>(sum.rgb, clamp(sum.a, 0.0, 1.0)); }
+    // Ghost handles: dim what's already in front (so the handle shines through), then OVER.
+    if (gsum.a > 0.0) {
+      let ga = clamp(gsum.a, 0.0, 1.0);
+      integrated = integrated * (1.0 - 0.5 * ga);
+      integrated = integrated + (1.0 - integrated.a) * vec4<f32>(gsum.rgb, ga);
+    }
     // Leap only across space EVERY field proved empty, so no sampled segment ever
     // changes length and the fixed-step opacity integration stays exact.
     if (all_defer && jump_t > t + step) { t = jump_t; } else { t = t + step; }
@@ -482,10 +495,14 @@ ${dispatch}
     const view = lookAt(eye, center, up);
     const proj = perspectiveZO(fovyDeg * Math.PI / 180, width / height, 1, 1e5);
     const invVP = invert(multiply(proj, view));
-    const cam = new Float32Array(20);
+    const cam = new Float32Array(24);
     cam.set(invVP, 0);
     cam[16] = width;
     cam[17] = height;
+    cam[18] = height / 2 / Math.tan(fovyDeg * Math.PI / 360);
+    cam[20] = eye[0];
+    cam[21] = eye[1];
+    cam[22] = eye[2];
     this.dev.queue.writeBuffer(this.camBuf, 0, cam);
   }
   flush() {
@@ -972,6 +989,10 @@ var FiducialField = class {
   maxR = 0;
   // largest radius in this field (for the skip bound)
   clippable;
+  ghost;
+  providesSkip;
+  // off in screen-space mode (radius varies with the camera)
+  screen;
   sh;
   ka;
   kd;
@@ -985,6 +1006,9 @@ var FiducialField = class {
     this.ks = opts.kSpecular ?? 0.5;
     this.light = opts.lightColor ?? [1, 1, 1];
     this.clippable = opts.clippable ?? true;
+    this.ghost = opts.ghost ?? false;
+    this.screen = opts.screenSpace ?? false;
+    this.providesSkip = !this.screen;
   }
   setSpheres(list) {
     this.n = Math.min(list.length, MAX);
@@ -1012,10 +1036,18 @@ var FiducialField = class {
     if (this.n === 0) return [[-1, -1, -1], [1, 1, 1]];
     const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
     for (let i = 0; i < this.n; i++) {
-      const r = this.spheres[i * 4 + 3];
+      const r = this.screen ? 0 : this.spheres[i * 4 + 3];
       for (let a = 0; a < 3; a++) {
         lo[a] = Math.min(lo[a], this.spheres[i * 4 + a] - r);
         hi[a] = Math.max(hi[a], this.spheres[i * 4 + a] + r);
+      }
+    }
+    if (this.screen) {
+      const diag = Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);
+      const m = Math.max(40, diag * 0.15);
+      for (let a = 0; a < 3; a++) {
+        lo[a] -= m;
+        hi[a] += m;
       }
     }
     return [lo, hi];
@@ -1044,7 +1076,7 @@ var FiducialField = class {
   // Since min_j(d_j) <= d_k and max_r >= r_k for every k, this never exceeds the true
   // min_k(d_k - r_k) — so it can't skip over a sphere — and it costs only squared
   // distances in the loop plus ONE sqrt at the end (cheaper than the sampling loop).
-  providesSkip = true;
+  // (providesSkip is false in screen-space mode — the world radius varies with the camera.)
   skipWGSL(s) {
     return (
       /* wgsl */
@@ -1077,8 +1109,10 @@ fn sample_field_fid${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
   var found = false;
   for (var k = 0; k < n; k = k + 1) {
     let sp = u_material.fid${s}_spheres[k];
-    let r = sp.w;
-    if (r <= 0.0) { continue; }
+    if (sp.w <= 0.0) { continue; }
+    // screen-space: sp.w is a PIXEL radius -> world radius = px * distance(eye) / focal_px,
+    // so the sphere stays a constant size on screen. Otherwise sp.w is a world radius.
+    ${this.screen ? `let r = sp.w * length(u_cam.eye.xyz - sp.xyz) / max(u_cam.size.z, 1.0);` : `let r = sp.w;`}
     let depth = r - length(wp_r - sp.xyz);   // > 0 -> inside this sphere
     if (depth > best_depth) { best_depth = depth; best_center = sp.xyz; best_color = u_material.fid${s}_colors[k]; found = true; }
   }
@@ -1163,12 +1197,12 @@ function makeXformWidget(target, sizeMm) {
     const c = AXCOL[m.axis];
     return m.kind === "rotate" ? [c[0], c[1], c[2], 1] : [c[0] * 0.7, c[1] * 0.7, c[2] * 0.7, 1];
   };
-  const handles = new FiducialField([], { shininess: 60, kSpecular: 0.4 });
-  const refresh = () => handles.setSpheres(metas.map((m, i) => ({
-    center: worldOf(m),
-    radius: i === hover ? hR * 1.55 : hR,
-    color: colorOf(m, i === hover)
-  })));
+  const handles = new FiducialField([], { shininess: 60, kSpecular: 0.4, screenSpace: true, ghost: true });
+  const refresh = () => handles.setSpheres(metas.map((m, i) => {
+    const on = i === hover;
+    const c = colorOf(m, on);
+    return { center: worldOf(m), radius: on ? 13 : 8, color: [c[0], c[1], c[2], on ? 1 : 0.5] };
+  }));
   refresh();
   return {
     handles,
