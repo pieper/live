@@ -287,29 +287,39 @@ fn skip_${p.field.kind}${p.slot}(wp : vec3<f32>) -> f32 {
     };
     const ghostFields = receivers.filter((p) => p.field.ghost);
     const normalReceivers = receivers.filter((p) => !p.field.ghost);
-    const skippers = normalReceivers.filter((p) => !p.field.transform).filter((p) => _SceneRenderer.boxSkip || p.field.providesSkip && p.field.skipWGSL);
-    const canSkip = new Set(skippers.map((p) => p.field));
-    const skipFns = skippers.map(
-      (p) => p.field.providesSkip && p.field.skipWGSL ? p.field.skipWGSL(p.slot) : boxSkipWGSL(p)
-    ).join("\n");
-    const fns = [modFns, tpFns, fieldFns, skipFns].filter((s) => s.trim()).join("\n");
-    const skipInit = skippers.map((p) => `  var resume_${p.field.kind}${p.slot} : f32 = -1.0e30;`).join("\n");
-    const guard = (p, expr) => p.field.clippable === false ? expr : `if (!clipped) { ${expr} }`;
-    const dispatch = normalReceivers.map((p) => {
+    const clipGuard = (p, expr) => p.field.clippable === false ? expr : `if (!clipped) { ${expr} }`;
+    const skipBranch = (p, acc, clip) => {
       const nm = `${p.field.kind}${p.slot}`;
-      if (!canSkip.has(p.field)) {
-        return `    { ${guard(p, `let c = sample_field_${nm}(wp, rd); sum += c;`)} all_defer = false; }`;
-      }
+      const smp = `let c = sample_field_${nm}(wp, rd); ${acc} += c;`;
       return `    if (t >= resume_${nm}) {
       let d_${nm} = max(skip_${nm}(wp) - step, 0.0);
       if (d_${nm} > 0.0) { resume_${nm} = t + d_${nm}; }
-      else { ${guard(p, `let c = sample_field_${nm}(wp, rd); sum += c;`)} }
+      else { ${clip ? clipGuard(p, smp) : smp} }
     }
     if (t < resume_${nm}) { jump_t = min(jump_t, resume_${nm}); } else { all_defer = false; }`;
-    }).join("\n");
-    const ghostDispatch = ghostFields.map(
-      (p) => `    { let c = sample_field_${p.field.kind}${p.slot}(wp, rd); gsum += c; all_defer = false; }`
+    };
+    const plainBranch = (p, acc, clip) => {
+      const nm = `${p.field.kind}${p.slot}`;
+      const smp = `let c = sample_field_${nm}(wp, rd); ${acc} += c;`;
+      return `    { ${clip ? clipGuard(p, smp) : smp} all_defer = false; }`;
+    };
+    const normalSkippers = normalReceivers.filter((p) => !p.field.transform).filter((p) => _SceneRenderer.boxSkip || p.field.providesSkip && p.field.skipWGSL);
+    const ghostSkippers = ghostFields.filter((p) => p.field.providesSkip && p.field.skipWGSL);
+    const canSkip = new Set(normalSkippers.map((p) => p.field));
+    const ghostCanSkip = new Set(ghostSkippers.map((p) => p.field));
+    const skipFns = [
+      ...normalSkippers.map((p) => p.field.providesSkip && p.field.skipWGSL ? p.field.skipWGSL(p.slot) : boxSkipWGSL(p)),
+      ...ghostSkippers.map((p) => p.field.skipWGSL(p.slot))
+    ].join("\n");
+    const fns = [modFns, tpFns, fieldFns, skipFns].filter((s) => s.trim()).join("\n");
+    const skipInit = [...normalSkippers, ...ghostSkippers].map((p) => `  var resume_${p.field.kind}${p.slot} : f32 = -1.0e30;`).join("\n");
+    const dispatch = normalReceivers.map(
+      (p) => canSkip.has(p.field) ? skipBranch(p, "sum", true) : plainBranch(p, "sum", true)
     ).join("\n");
+    const ghostDispatch = ghostFields.map(
+      (p) => ghostCanSkip.has(p.field) ? skipBranch(p, "gsum", false) : plainBranch(p, "gsum", false)
+    ).join("\n");
+    const hasGhost = ghostFields.length > 0;
     return (
       /* wgsl */
       `
@@ -371,7 +381,7 @@ fn fs_main(v : Varyings) -> @location(0) vec4<f32> {
   var safety : i32 = 0;
 ${skipInit}
   loop {
-    if (t >= t_far || safety >= 5000 || integrated.a >= 0.99) { break; }
+    if (t >= t_far || safety >= 5000${hasGhost ? "" : " || integrated.a >= 0.99"}) { break; }
     let js = fract(sin(dot(v.position.xy + vec2<f32>(f32(safety) * 0.7548, f32(safety) * 0.5698), vec2<f32>(12.9898, 78.233))) * 43758.5453) - 0.5; // per-(pixel,sample) jitter
     let wp = ro + rd * (t + js * step);
     var sum = vec4<f32>(0.0);
@@ -384,17 +394,20 @@ ${skipInit}
       let cp = u_material.clip_planes[ci];
       if (dot(wp, cp.xyz) + cp.w < 0.0) { clipped = true; break; }
     }
+    // Normal fields stop being sampled once the ray is opaque; GHOST fields keep their skip
+    // horizons and keep going, so a handle behind an opaque region still shines through and
+    // the ray LEAPS between handles on the ghost skip alone (early-termination efficiency).
+${hasGhost ? "    if (integrated.a < 0.99) {" : ""}
 ${dispatch}
+      if (sum.a > 0.0) { integrated = integrated + (1.0 - integrated.a) * vec4<f32>(sum.rgb, clamp(sum.a, 0.0, 1.0)); }
+${hasGhost ? "    }" : ""}
 ${ghostDispatch}
-    if (sum.a > 0.0) { integrated = integrated + (1.0 - integrated.a) * vec4<f32>(sum.rgb, clamp(sum.a, 0.0, 1.0)); }
     // Ghost handles: dim what's already in front (so the handle shines through), then OVER.
     if (gsum.a > 0.0) {
       let ga = clamp(gsum.a, 0.0, 1.0);
       integrated = integrated * (1.0 - 0.5 * ga);
       integrated = integrated + (1.0 - integrated.a) * vec4<f32>(gsum.rgb, ga);
     }
-    // Leap only across space EVERY field proved empty, so no sampled segment ever
-    // changes length and the fixed-step opacity integration stays exact.
     if (all_defer && jump_t > t + step) { t = jump_t; } else { t = t + step; }
     safety = safety + 1;
   }
@@ -975,187 +988,148 @@ function attachWidgetControls(canvas, camera, opts) {
   };
 }
 
-// render/fiducial-field.ts
-var MAX = 64;
-var FiducialField = class {
-  kind = "fid";
+// render/transform-gizmo-field.ts
+var TransformGizmoField = class {
+  kind = "giz";
   bindingCount = 0;
-  // procedural — all state lives in the uniform block
-  spheres = new Float32Array(MAX * 4);
-  // (cx,cy,cz,radius)
-  colors = new Float32Array(MAX * 4);
-  // (r,g,b,a)
-  n = 0;
-  maxR = 0;
-  // largest radius in this field (for the skip bound)
-  clippable;
-  ghost;
-  providesSkip;
-  // off in screen-space mode (radius varies with the camera)
-  screen;
-  sh;
-  ka;
-  kd;
-  ks;
-  light;
-  constructor(spheres = [], opts = {}) {
-    this.setSpheres(spheres);
-    this.sh = opts.shininess ?? 80;
-    this.ka = opts.kAmbient ?? 0.2;
-    this.kd = opts.kDiffuse ?? 0.85;
-    this.ks = opts.kSpecular ?? 0.5;
-    this.light = opts.lightColor ?? [1, 1, 1];
-    this.clippable = opts.clippable ?? true;
-    this.ghost = opts.ghost ?? false;
-    this.screen = opts.screenSpace ?? false;
-    this.providesSkip = !this.screen;
+  clippable = false;
+  ghost = true;
+  providesSkip = true;
+  pivot;
+  px;
+  // on-screen gizmo size, in pixels (radius of the rings ~ this)
+  active = -1;
+  // highlighted component (0..6) or -1
+  constructor(pivot, pxSize = 60) {
+    this.pivot = [...pivot];
+    this.px = pxSize;
   }
-  setSpheres(list) {
-    this.n = Math.min(list.length, MAX);
-    this.spheres.fill(0);
-    this.colors.fill(0);
-    this.maxR = 0;
-    for (let i = 0; i < this.n; i++) {
-      const s = list[i];
-      this.spheres.set([s.center[0], s.center[1], s.center[2], s.radius], i * 4);
-      this.colors.set(s.color, i * 4);
-      this.maxR = Math.max(this.maxR, s.radius);
-    }
+  setPivot(p) {
+    this.pivot = [...p];
   }
-  get count() {
-    return this.n;
+  setActive(id) {
+    this.active = id ?? -1;
+  }
+  get pxSize() {
+    return this.px;
+  }
+  get activeId() {
+    return this.active;
   }
   uniformFloats() {
-    return 12 + MAX * 4 * 2;
+    return 8;
   }
-  // params(4)+params2(4)+light(4) + spheres + colors
+  // pivot(4: xyz, pxSize) + params(4: active, _, _, _)
   sampleStep() {
     return 1;
   }
   aabb() {
-    if (this.n === 0) return [[-1, -1, -1], [1, 1, 1]];
-    const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
-    for (let i = 0; i < this.n; i++) {
-      const r = this.screen ? 0 : this.spheres[i * 4 + 3];
-      for (let a = 0; a < 3; a++) {
-        lo[a] = Math.min(lo[a], this.spheres[i * 4 + a] - r);
-        hi[a] = Math.max(hi[a], this.spheres[i * 4 + a] + r);
-      }
-    }
-    if (this.screen) {
-      const diag = Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);
-      const m = Math.max(40, diag * 0.15);
-      for (let a = 0; a < 3; a++) {
-        lo[a] -= m;
-        hi[a] += m;
-      }
-    }
-    return [lo, hi];
+    const m = 300;
+    return [[this.pivot[0] - m, this.pivot[1] - m, this.pivot[2] - m], [this.pivot[0] + m, this.pivot[1] + m, this.pivot[2] + m]];
   }
   structMembers(s) {
-    return [
-      `  fid${s}_params : vec4<f32>,`,
-      // n_spheres, visible, shininess, k_ambient
-      `  fid${s}_params2 : vec4<f32>,`,
-      // k_diffuse, k_specular, max_radius, _
-      `  fid${s}_light : vec4<f32>,`,
-      // light_color.rgb, _
-      `  fid${s}_spheres : array<vec4<f32>, ${MAX}>,`,
-      `  fid${s}_colors : array<vec4<f32>, ${MAX}>,`
-    ].join("\n");
+    return [`  giz${s}_pivot : vec4<f32>,`, `  giz${s}_params : vec4<f32>,`].join("\n");
   }
-  declareBindings(_s, _base) {
+  declareBindings() {
     return "";
   }
-  bindEntries(_s, _base) {
+  bindEntries() {
     return [];
-  }
-  // --- empty-space skipping -------------------------------------------------
-  // The spheres are an exact SDF, so we can hand the ray-marcher a real distance to
-  // leap. Conservative form: nearest-CENTRE distance minus the field's LARGEST radius.
-  // Since min_j(d_j) <= d_k and max_r >= r_k for every k, this never exceeds the true
-  // min_k(d_k - r_k) — so it can't skip over a sphere — and it costs only squared
-  // distances in the loop plus ONE sqrt at the end (cheaper than the sampling loop).
-  // (providesSkip is false in screen-space mode — the world radius varies with the camera.)
-  skipWGSL(s) {
-    return (
-      /* wgsl */
-      `
-fn skip_fid${s}(wp : vec3<f32>) -> f32 {
-  let n = i32(u_material.fid${s}_params.x);
-  if (n <= 0) { return 1.0e6; }        // nothing here: unbounded empty space
-  var min_d2 = 1.0e12;
-  for (var k = 0; k < n; k = k + 1) {
-    let sp = u_material.fid${s}_spheres[k];
-    if (sp.w <= 0.0) { continue; }
-    let dv = wp - sp.xyz;
-    min_d2 = min(min_d2, dot(dv, dv));
-  }
-  return max(sqrt(min_d2) - u_material.fid${s}_params2.z, 0.0);
-}`
-    );
   }
   samplingWGSL(s) {
     return (
       /* wgsl */
       `
-fn sample_field_fid${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
-  // an attached TransformField warps where the spheres appear (slicer_wgpu parity)
-  let wp_r = transform_point_fid${s}(wp);
-  let n = i32(u_material.fid${s}_params.x);
-  var best_depth = -1.0;
-  var best_center = vec3<f32>(0.0);
-  var best_color = vec4<f32>(0.0);
-  var found = false;
-  for (var k = 0; k < n; k = k + 1) {
-    let sp = u_material.fid${s}_spheres[k];
-    if (sp.w <= 0.0) { continue; }
-    // screen-space: sp.w is a PIXEL radius -> world radius = px * distance(eye) / focal_px,
-    // so the sphere stays a constant size on screen. Otherwise sp.w is a world radius.
-    ${this.screen ? `let r = sp.w * length(u_cam.eye.xyz - sp.xyz) / max(u_cam.size.z, 1.0);` : `let r = sp.w;`}
-    let depth = r - length(wp_r - sp.xyz);   // > 0 -> inside this sphere
-    if (depth > best_depth) { best_depth = depth; best_center = sp.xyz; best_color = u_material.fid${s}_colors[k]; found = true; }
+fn giz${s}_axis(i : i32) -> vec3<f32> {
+  if (i == 0) { return vec3<f32>(1.0, 0.0, 0.0); }
+  if (i == 1) { return vec3<f32>(0.0, 1.0, 0.0); }
+  return vec3<f32>(0.0, 0.0, 1.0);
+}
+fn giz${s}_color(a : i32, on : bool) -> vec3<f32> {
+  if (a == 0) { return select(vec3<f32>(0.85, 0.40, 0.40), vec3<f32>(0.98, 0.16, 0.16), on); }
+  if (a == 1) { return select(vec3<f32>(0.40, 0.80, 0.40), vec3<f32>(0.10, 0.85, 0.10), on); }
+  return select(vec3<f32>(0.45, 0.50, 0.95), vec3<f32>(0.20, 0.35, 1.00), on);
+}
+fn giz${s}_arrow(p : vec3<f32>, a : i32) -> f32 {
+  let e = giz${s}_axis(a);
+  let al = dot(p, e);
+  let rad = length(p - al * e);
+  let shaft = max(rad - 0.035, max(0.12 - al, al - 0.66));            // capped cylinder
+  let hr = 0.11 * clamp((1.0 - al) / 0.34, 0.0, 1.0);                 // cone taper to the tip
+  let head = max(rad - hr, max(0.66 - al, al - 1.0));
+  return min(shaft, head);
+}
+fn giz${s}_ring(p : vec3<f32>, a : i32) -> f32 {
+  let e = giz${s}_axis(a);
+  let al = dot(p, e);
+  let rad = length(p - al * e);
+  return length(vec2<f32>(rad - 0.92, al)) - 0.045;                   // torus in the plane \u22A5 axis
+}
+fn sample_field_giz${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
+  let pivot = u_material.giz${s}_pivot.xyz;
+  let pxSize = u_material.giz${s}_pivot.w;
+  let activeId = i32(u_material.giz${s}_params.x);
+  // screen-constant size: world size for pxSize pixels at the pivot's depth
+  let S = pxSize * length(u_cam.eye.xyz - pivot) / max(u_cam.size.z, 1.0);
+  if (S <= 0.0) { return vec4<f32>(0.0); }
+  let p = (wp - pivot) / S;                        // gizmo-local (unit = ring radius-ish)
+  let vn = normalize(u_cam.eye.xyz - pivot);       // view vector for the degenerate-axis fade
+  let stepg = max(u_material.scene.x / S, 1e-4);    // AA band, in gizmo units
+  var best_op = 0.0;
+  var best_col = vec3<f32>(0.0);
+  // 3 translation arrows \u2014 fade as the axis points at the camera
+  for (var a = 0; a < 3; a = a + 1) {
+    let dp = abs(dot(vn, giz${s}_axis(a)));
+    let fade = 1.0 - smoothstep(0.80, 0.97, dp);
+    let on = activeId == a;
+    let op = clamp(0.5 - giz${s}_arrow(p, a) / stepg, 0.0, 1.0) * select(0.5 * fade, 1.0, on);
+    if (op > best_op) { best_op = op; best_col = giz${s}_color(a, on); }
   }
-  if (!found || best_depth <= 0.0) { return vec4<f32>(0.0); }
-
-  let to_wp = wp_r - best_center;
-  var n_hat = to_wp / max(length(to_wp), 1e-6);
-  if (dot(n_hat, -rd) < 0.0) { n_hat = -n_hat; }
-  let view_dir = normalize(-rd);            // headlight (== normalize(ray_origin - wp) for t>0)
-  let ldotn = max(dot(view_dir, n_hat), 0.0);
-  let refl = normalize(2.0 * ldotn * n_hat - view_dir);
-  let rdotv = max(dot(refl, view_dir), 0.0);
-
-  let sh = u_material.fid${s}_params.z;
-  let ka = u_material.fid${s}_params.w; let kd = u_material.fid${s}_params2.x; let ks = u_material.fid${s}_params2.y;
-  let base = best_color.rgb;
-  let highlight = mix(base, u_material.fid${s}_light.rgb, 0.85);
-  let lit = base * ka + base * (kd * ldotn) + highlight * (ks * pow(rdotv, sh));
-  let col = srgb2physical(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)));
-  let opacity = clamp(best_color.a, 0.0, 1.0);
-  return vec4<f32>(col * opacity, opacity);
+  // 3 rotation rings \u2014 fade as the axis approaches edge-on
+  for (var a = 0; a < 3; a = a + 1) {
+    let dp = abs(dot(vn, giz${s}_axis(a)));
+    let fade = smoothstep(0.06, 0.22, dp);
+    let on = activeId == a + 3;
+    let op = clamp(0.5 - giz${s}_ring(p, a) / stepg, 0.0, 1.0) * select(0.5 * fade, 1.0, on);
+    if (op > best_op) { best_op = op; best_col = giz${s}_color(a, on); }
+  }
+  // centre sphere \u2014 view-plane translate
+  {
+    let on = activeId == 6;
+    let op = clamp(0.5 - (length(p) - 0.08) / stepg, 0.0, 1.0) * select(0.5, 1.0, on);
+    if (op > best_op) { best_op = op; best_col = select(vec3<f32>(0.85), vec3<f32>(1.0), on); }
+  }
+  if (best_op <= 0.0) { return vec4<f32>(0.0); }
+  return vec4<f32>(srgb2physical(best_col) * best_op, best_op);
+}`
+    );
+  }
+  skipWGSL(s) {
+    return (
+      /* wgsl */
+      `
+fn skip_giz${s}(wp : vec3<f32>) -> f32 {
+  let pivot = u_material.giz${s}_pivot.xyz;
+  let S = u_material.giz${s}_pivot.w * length(u_cam.eye.xyz - pivot) / max(u_cam.size.z, 1.0);
+  if (S <= 0.0) { return 1.0e6; }
+  let p = (wp - pivot) / S;
+  var d = length(p) - 0.08;
+  for (var a = 0; a < 3; a = a + 1) { d = min(d, giz${s}_arrow(p, a)); d = min(d, giz${s}_ring(p, a)); }
+  return max(d * S, 0.0);
 }`
     );
   }
   fillUniforms(out, off) {
-    out[off + 0] = this.n;
-    out[off + 1] = 1;
-    out[off + 2] = this.sh;
-    out[off + 3] = this.ka;
-    out[off + 4] = this.kd;
-    out[off + 5] = this.ks;
-    out[off + 6] = this.maxR;
-    out[off + 8] = this.light[0];
-    out[off + 9] = this.light[1];
-    out[off + 10] = this.light[2];
-    out.set(this.spheres, off + 12);
-    out.set(this.colors, off + 12 + MAX * 4);
+    out[off + 0] = this.pivot[0];
+    out[off + 1] = this.pivot[1];
+    out[off + 2] = this.pivot[2];
+    out[off + 3] = this.px;
+    out[off + 4] = this.active;
   }
 };
 
 // render/demos/xform-widget.ts
 var E = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
-var AXCOL = [[1, 0.35, 0.35], [0.4, 0.95, 0.45], [0.5, 0.6, 1]];
 var sub3 = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
 var dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 var cross2 = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
@@ -1165,48 +1139,42 @@ var norm2 = (a) => {
   return [a[0] / l, a[1] / l, a[2] / l];
 };
 var reject = (v, axis) => sub3(v, scale2(axis, dot3(v, axis)));
-function makeXformWidget(target, sizeMm) {
+function componentOf(m) {
+  if (m.kind === "translate-cam") return 6;
+  if (m.kind === "translate-axis") return m.axis;
+  return m.axis + 3;
+}
+function makeXformWidget(target, _sizeMm) {
   const C0 = target.worldCenter();
-  const hR = Math.max(3, sizeMm * 0.02);
-  const Lt = sizeMm * 0.5;
-  const Lr = sizeMm * 0.72;
+  const field = new TransformGizmoField(C0, 58);
   let M = identity();
   let M0 = identity();
   let pivot0 = [...C0];
-  let hover = null;
-  const metas = [
-    { kind: "translate-cam" },
-    { kind: "translate-axis", axis: 0 },
-    { kind: "translate-axis", axis: 1 },
-    { kind: "translate-axis", axis: 2 },
-    { kind: "rotate", axis: 0 },
-    { kind: "rotate", axis: 1 },
-    { kind: "rotate", axis: 2 }
-  ];
   const pivot = () => applyMat4(M, C0);
-  const worldOf = (m) => {
-    const p = pivot();
-    if (m.kind === "translate-cam") return p;
-    if (m.kind === "translate-axis") return [p[0] + Lt * E[m.axis][0], p[1] + Lt * E[m.axis][1], p[2] + Lt * E[m.axis][2]];
-    const e = E[(m.axis + 1) % 3];
-    return [p[0] + Lr * e[0], p[1] + Lr * e[1], p[2] + Lr * e[2]];
-  };
-  const colorOf = (m, on) => {
-    if (on) return [1, 0.9, 0.3, 1];
-    if (m.kind === "translate-cam") return [0.9, 0.9, 0.9, 1];
-    const c = AXCOL[m.axis];
-    return m.kind === "rotate" ? [c[0], c[1], c[2], 1] : [c[0] * 0.7, c[1] * 0.7, c[2] * 0.7, 1];
-  };
-  const handles = new FiducialField([], { shininess: 60, kSpecular: 0.4, screenSpace: true, ghost: true });
-  const refresh = () => handles.setSpheres(metas.map((m, i) => {
-    const on = i === hover;
-    const c = colorOf(m, on);
-    return { center: worldOf(m), radius: on ? 13 : 8, color: [c[0], c[1], c[2], on ? 1 : 0.5] };
-  }));
-  refresh();
   return {
-    handles,
-    handleList: () => metas.map((m, i) => ({ id: i, world: worldOf(m), data: m, cursor: m.kind === "rotate" ? "grab" : "move" })),
+    field,
+    pivotWorld: () => pivot(),
+    scaleFor(eye, focalPx) {
+      const p = pivot();
+      return field.pxSize * Math.hypot(eye[0] - p[0], eye[1] - p[1], eye[2] - p[2]) / Math.max(focalPx, 1);
+    },
+    handleList(S) {
+      const p = pivot();
+      const at = (off) => [p[0] + off[0] * S, p[1] + off[1] * S, p[2] + off[2] * S];
+      const hs = [];
+      let id = 0;
+      hs.push({ id: id++, world: p, data: { kind: "translate-cam" }, cursor: "move" });
+      for (let a = 0; a < 3; a++) hs.push({ id: id++, world: at(scale2(E[a], 0.5)), data: { kind: "translate-axis", axis: a }, cursor: "move" });
+      const k = 0.92 / Math.SQRT2;
+      for (let a = 0; a < 3; a++) {
+        const p1 = E[(a + 1) % 3], p2 = E[(a + 2) % 3];
+        for (const [s1, s2] of [[1, 1], [1, -1], [-1, 1], [-1, -1]]) {
+          const off = [(p1[0] * s1 + p2[0] * s2) * k, (p1[1] * s1 + p2[1] * s2) * k, (p1[2] * s1 + p2[2] * s2) * k];
+          hs.push({ id: id++, world: at(off), data: { kind: "rotate", axis: a }, cursor: "grab" });
+        }
+      }
+      return hs;
+    },
     beginDrag() {
       M0 = M.slice();
       pivot0 = pivot();
@@ -1215,8 +1183,7 @@ function makeXformWidget(target, sizeMm) {
       if (meta.kind === "translate-cam") {
         M = multiply(translation(sub3(W, P0)), M0);
       } else if (meta.kind === "translate-axis") {
-        const d = dot3(sub3(W, P0), E[meta.axis]);
-        M = multiply(translation(scale2(E[meta.axis], d)), M0);
+        M = multiply(translation(scale2(E[meta.axis], dot3(sub3(W, P0), E[meta.axis]))), M0);
       } else {
         const a = E[meta.axis];
         const v0 = norm2(reject(sub3(P0, pivot0), a));
@@ -1226,11 +1193,10 @@ function makeXformWidget(target, sizeMm) {
         M = multiply(Rp, M0);
       }
       target.setWorldTransform(M);
-      refresh();
+      field.setPivot(pivot());
     },
-    setHover(i) {
-      hover = i;
-      refresh();
+    setActive(id) {
+      field.setActive(id);
     },
     matrix: () => M.slice()
   };
@@ -1695,6 +1661,202 @@ async function loadSceneVolumeField(dev, sceneUrl, onBytes, opts = {}) {
   return { field, voxels: zv.data, dims: zv.dims, ijkToRAS, name: vol.name ?? "volume", range: zv.range, center, radius, win, lev };
 }
 
+// render/fiducial-field.ts
+var MAX = 64;
+var FiducialField = class {
+  kind = "fid";
+  bindingCount = 0;
+  // procedural — all state lives in the uniform block
+  spheres = new Float32Array(MAX * 4);
+  // (cx,cy,cz,radius)
+  colors = new Float32Array(MAX * 4);
+  // (r,g,b,a)
+  n = 0;
+  maxR = 0;
+  // largest radius in this field (for the skip bound)
+  clippable;
+  ghost;
+  providesSkip;
+  // off in screen-space mode (radius varies with the camera)
+  screen;
+  sh;
+  ka;
+  kd;
+  ks;
+  light;
+  constructor(spheres = [], opts = {}) {
+    this.setSpheres(spheres);
+    this.sh = opts.shininess ?? 80;
+    this.ka = opts.kAmbient ?? 0.2;
+    this.kd = opts.kDiffuse ?? 0.85;
+    this.ks = opts.kSpecular ?? 0.5;
+    this.light = opts.lightColor ?? [1, 1, 1];
+    this.clippable = opts.clippable ?? true;
+    this.ghost = opts.ghost ?? false;
+    this.screen = opts.screenSpace ?? false;
+    this.providesSkip = true;
+  }
+  setSpheres(list) {
+    this.n = Math.min(list.length, MAX);
+    this.spheres.fill(0);
+    this.colors.fill(0);
+    this.maxR = 0;
+    for (let i = 0; i < this.n; i++) {
+      const s = list[i];
+      this.spheres.set([s.center[0], s.center[1], s.center[2], s.radius], i * 4);
+      this.colors.set(s.color, i * 4);
+      this.maxR = Math.max(this.maxR, s.radius);
+    }
+  }
+  get count() {
+    return this.n;
+  }
+  uniformFloats() {
+    return 12 + MAX * 4 * 2;
+  }
+  // params(4)+params2(4)+light(4) + spheres + colors
+  sampleStep() {
+    return 1;
+  }
+  aabb() {
+    if (this.n === 0) return [[-1, -1, -1], [1, 1, 1]];
+    const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+    for (let i = 0; i < this.n; i++) {
+      const r = this.screen ? 0 : this.spheres[i * 4 + 3];
+      for (let a = 0; a < 3; a++) {
+        lo[a] = Math.min(lo[a], this.spheres[i * 4 + a] - r);
+        hi[a] = Math.max(hi[a], this.spheres[i * 4 + a] + r);
+      }
+    }
+    if (this.screen) {
+      const diag = Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);
+      const m = Math.max(40, diag * 0.15);
+      for (let a = 0; a < 3; a++) {
+        lo[a] -= m;
+        hi[a] += m;
+      }
+    }
+    return [lo, hi];
+  }
+  structMembers(s) {
+    return [
+      `  fid${s}_params : vec4<f32>,`,
+      // n_spheres, visible, shininess, k_ambient
+      `  fid${s}_params2 : vec4<f32>,`,
+      // k_diffuse, k_specular, max_radius, _
+      `  fid${s}_light : vec4<f32>,`,
+      // light_color.rgb, _
+      `  fid${s}_spheres : array<vec4<f32>, ${MAX}>,`,
+      `  fid${s}_colors : array<vec4<f32>, ${MAX}>,`
+    ].join("\n");
+  }
+  declareBindings(_s, _base) {
+    return "";
+  }
+  bindEntries(_s, _base) {
+    return [];
+  }
+  // --- empty-space skipping -------------------------------------------------
+  // The spheres are an exact SDF, so we can hand the ray-marcher a real distance to
+  // leap. Conservative form: nearest-CENTRE distance minus the field's LARGEST radius.
+  // Since min_j(d_j) <= d_k and max_r >= r_k for every k, this never exceeds the true
+  // min_k(d_k - r_k) — so it can't skip over a sphere — and it costs only squared
+  // distances in the loop plus ONE sqrt at the end (cheaper than the sampling loop).
+  // (providesSkip is false in screen-space mode — the world radius varies with the camera.)
+  skipWGSL(s) {
+    if (this.screen) {
+      return (
+        /* wgsl */
+        `
+fn skip_fid${s}(wp : vec3<f32>) -> f32 {
+  let n = i32(u_material.fid${s}_params.x);
+  if (n <= 0) { return 1.0e6; }
+  var best = 1.0e12;
+  for (var k = 0; k < n; k = k + 1) {
+    let sp = u_material.fid${s}_spheres[k];
+    if (sp.w <= 0.0) { continue; }
+    let r = sp.w * length(u_cam.eye.xyz - sp.xyz) / max(u_cam.size.z, 1.0);
+    best = min(best, length(wp - sp.xyz) - r);
+  }
+  return max(best, 0.0);
+}`
+      );
+    }
+    return (
+      /* wgsl */
+      `
+fn skip_fid${s}(wp : vec3<f32>) -> f32 {
+  let n = i32(u_material.fid${s}_params.x);
+  if (n <= 0) { return 1.0e6; }        // nothing here: unbounded empty space
+  var min_d2 = 1.0e12;
+  for (var k = 0; k < n; k = k + 1) {
+    let sp = u_material.fid${s}_spheres[k];
+    if (sp.w <= 0.0) { continue; }
+    let dv = wp - sp.xyz;
+    min_d2 = min(min_d2, dot(dv, dv));
+  }
+  return max(sqrt(min_d2) - u_material.fid${s}_params2.z, 0.0);
+}`
+    );
+  }
+  samplingWGSL(s) {
+    return (
+      /* wgsl */
+      `
+fn sample_field_fid${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
+  // an attached TransformField warps where the spheres appear (slicer_wgpu parity)
+  let wp_r = transform_point_fid${s}(wp);
+  let n = i32(u_material.fid${s}_params.x);
+  var best_depth = -1.0;
+  var best_center = vec3<f32>(0.0);
+  var best_color = vec4<f32>(0.0);
+  var found = false;
+  for (var k = 0; k < n; k = k + 1) {
+    let sp = u_material.fid${s}_spheres[k];
+    if (sp.w <= 0.0) { continue; }
+    // screen-space: sp.w is a PIXEL radius -> world radius = px * distance(eye) / focal_px,
+    // so the sphere stays a constant size on screen. Otherwise sp.w is a world radius.
+    ${this.screen ? `let r = sp.w * length(u_cam.eye.xyz - sp.xyz) / max(u_cam.size.z, 1.0);` : `let r = sp.w;`}
+    let depth = r - length(wp_r - sp.xyz);   // > 0 -> inside this sphere
+    if (depth > best_depth) { best_depth = depth; best_center = sp.xyz; best_color = u_material.fid${s}_colors[k]; found = true; }
+  }
+  if (!found || best_depth <= 0.0) { return vec4<f32>(0.0); }
+
+  let to_wp = wp_r - best_center;
+  var n_hat = to_wp / max(length(to_wp), 1e-6);
+  if (dot(n_hat, -rd) < 0.0) { n_hat = -n_hat; }
+  let view_dir = normalize(-rd);            // headlight (== normalize(ray_origin - wp) for t>0)
+  let ldotn = max(dot(view_dir, n_hat), 0.0);
+  let refl = normalize(2.0 * ldotn * n_hat - view_dir);
+  let rdotv = max(dot(refl, view_dir), 0.0);
+
+  let sh = u_material.fid${s}_params.z;
+  let ka = u_material.fid${s}_params.w; let kd = u_material.fid${s}_params2.x; let ks = u_material.fid${s}_params2.y;
+  let base = best_color.rgb;
+  let highlight = mix(base, u_material.fid${s}_light.rgb, 0.85);
+  let lit = base * ka + base * (kd * ldotn) + highlight * (ks * pow(rdotv, sh));
+  let col = srgb2physical(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)));
+  let opacity = clamp(best_color.a, 0.0, 1.0);
+  return vec4<f32>(col * opacity, opacity);
+}`
+    );
+  }
+  fillUniforms(out, off) {
+    out[off + 0] = this.n;
+    out[off + 1] = 1;
+    out[off + 2] = this.sh;
+    out[off + 3] = this.ka;
+    out[off + 4] = this.kd;
+    out[off + 5] = this.ks;
+    out[off + 6] = this.maxR;
+    out[off + 8] = this.light[0];
+    out[off + 9] = this.light[1];
+    out[off + 10] = this.light[2];
+    out.set(this.spheres, off + 12);
+    out.set(this.colors, off + 12 + MAX * 4);
+  }
+};
+
 // render/bake.ts
 var INIT_WGSL = (
   /* wgsl */
@@ -1936,7 +2098,7 @@ async function main() {
   } else if (which === "multi") {
     const sc = await buildMultiVolume(gpu.device, prog);
     widget = makeXformWidget(sc.pano.field, sc.pano.radius * 1.5);
-    fields = [...sc.fields, widget.handles];
+    fields = [...sc.fields, widget.field];
     center = [
       (sc.cta.center[0] + sc.pano.center[0]) / 2,
       (sc.cta.center[1] + sc.pano.center[1]) / 2,
@@ -1961,17 +2123,25 @@ async function main() {
   scene.build(fields);
   scene.setBackground(0.05, 0.06, 0.09);
   const camera = framedCamera(center, radius);
+  const focalPx = () => canvas.height / 2 / Math.tan(camera.viewAngle * Math.PI / 360);
   if (widget) {
     attachWidgetControls(canvas, camera, {
-      getHandles: () => widget.handleList(),
+      getHandles: () => widget.handleList(widget.scaleFor(camera.position, focalPx())),
       getSize: () => ({ w: canvas.width, h: canvas.height }),
-      onDragStart: () => widget.beginDrag(),
+      onDragStart: (h) => {
+        widget.setActive(componentOf(h.data));
+        widget.beginDrag();
+      },
       onDrag: (h, world) => {
         widget.drag(h.data, h.world, world);
         scene.syncUniforms();
       },
+      onDragEnd: () => {
+        widget.setActive(null);
+        scene.syncUniforms();
+      },
       onHover: (h) => {
-        widget.setHover(h ? h.id : null);
+        widget.setActive(h ? componentOf(h.data) : null);
         scene.syncUniforms();
       },
       onChange: () => draw()
@@ -2017,8 +2187,10 @@ async function main() {
       snapshot: () => {
         const r = canvas.getBoundingClientRect();
         return {
-          handles: widget.handleList().map((h) => ({ id: h.id, world: h.world, kind: h.data.kind, axis: h.data.axis })),
+          handles: widget.handleList(widget.scaleFor(camera.position, focalPx())).map((h) => ({ id: h.id, world: h.world, kind: h.data.kind, axis: h.data.axis })),
           matrix: [...widget.matrix()],
+          active: widget.field.activeId,
+          scale: widget.scaleFor(camera.position, focalPx()),
           camera: { position: [...camera.position], focalPoint: [...camera.focalPoint], viewUp: [...camera.viewUp], viewAngle: camera.viewAngle },
           canvas: { w: canvas.width, h: canvas.height, left: r.left, top: r.top, width: r.width, height: r.height }
         };
