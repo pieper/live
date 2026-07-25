@@ -791,6 +791,23 @@ var SliceRenderer = class {
     const v = 0.5 - (d[0] * b.vDir[0] + d[1] * b.vDir[1] + d[2] * b.vDir[2]) / vS;
     return { u, v, distMm: d[b.nAxis] };
   }
+  /** Map a view (u,v in [0,1], y down) on a plane back to a RAS point ON that plane —
+   *  the exact inverse of rasToView (same aspect convention). Used to drag a 2D markup:
+   *  the point lands on the current slice (its out-of-plane coord becomes the plane offset). */
+  viewToRas(orient, offset01, u, v, aspectWH) {
+    const b = BASES[orient];
+    const uExt = this.rasHi[b.uAxis] - this.rasLo[b.uAxis], vExt = this.rasHi[b.vAxis] - this.rasLo[b.vAxis];
+    const span = Math.max(uExt, vExt);
+    const uS = span * Math.max(1, aspectWH), vS = span * Math.max(1, 1 / aspectWH);
+    const c = [(this.rasLo[0] + this.rasHi[0]) / 2, (this.rasLo[1] + this.rasHi[1]) / 2, (this.rasLo[2] + this.rasHi[2]) / 2];
+    c[b.nAxis] = this.rasLo[b.nAxis] + offset01 * (this.rasHi[b.nAxis] - this.rasLo[b.nAxis]);
+    const du = (u - 0.5) * uS, dv = (0.5 - v) * vS;
+    return [
+      c[0] + b.uDir[0] * du + b.vDir[0] * dv,
+      c[1] + b.uDir[1] * du + b.vDir[1] * dv,
+      c[2] + b.uDir[2] * du + b.vDir[2] * dv
+    ];
+  }
   drawInto(view, w, h) {
     const b = BASES[this.orient];
     const span = this.viewSpanMm();
@@ -1310,7 +1327,9 @@ async function loadSceneVolumeField(dev, sceneUrl, onBytes, opts = {}) {
   const raw = await (await fetch(sceneUrl)).json();
   const wrapper = raw.nodes ? raw : { nodes: raw };
   const nodes = wrapper.nodes;
-  const blobBase = wrapper.blobBase ?? sceneUrl.replace(/[^/]*$/, "") + "blobs/";
+  const pageBase = globalThis.location?.href ?? "file:///";
+  const sceneAbs = new URL(sceneUrl, pageBase).href;
+  const blobBase = new URL(wrapper.blobBase ?? "./blobs/", sceneAbs).href;
   const vol = Object.values(nodes).find((n) => n.class === "vtkMRMLScalarVolumeNode" && n.attrs?.zarr);
   if (!vol) throw new Error("no zarr ScalarVolumeNode in scene");
   const z = vol.attrs.zarr;
@@ -1807,7 +1826,16 @@ async function main() {
     coronal: slicerDefaultOffset01("coronal", rs.sv.dims, rs.sv.ijkToRAS, rasLo0, rasHi0),
     sagittal: slicerDefaultOffset01("sagittal", rs.sv.dims, rs.sv.ijkToRAS, rasLo0, rasHi0)
   };
+  const sliceIx = new SliceInteractor({ ijkToRAS: rs.sv.ijkToRAS, rasLo: rasLo0, rasHi: rasHi0 });
   const markups = rs.sv.markups;
+  let draggingMarkup = null;
+  let hoverMarkup = null;
+  const refreshMarkups3D = () => {
+    if (!rs.markupField) return;
+    rs.markupField.setSpheres(markups.map((m) => ({ center: m.ras, radius: 9, color: [m.color[0], m.color[1], m.color[2], 1] })));
+    rs.scene.syncUniforms();
+    draw3d();
+  };
   const nAxisOf = { axial: 2, coronal: 1, sagittal: 0 };
   const ovc = {};
   const ov2d = {};
@@ -1818,7 +1846,8 @@ async function main() {
     ovc[p.cell] = o;
     ov2d[p.cell] = o.getContext("2d");
   }
-  const MARK_TOL_MM = 40;
+  const slabHalfMm = (orient) => Math.max(0.5, 0.5 * sliceIx.spacing(orient));
+  const glyphRadiusPx = (w, h) => Math.max(5, Math.hypot(w, h) * 0.015);
   const drawOverlay = (p) => {
     const o = ovc[p.cell], ctx = ov2d[p.cell];
     const w = cv[p.cell].clientWidth, h = cv[p.cell].clientHeight;
@@ -1830,32 +1859,28 @@ async function main() {
     }
     ctx.setTransform(o.width / w, 0, 0, o.height / h, 0, 0);
     ctx.clearRect(0, 0, w, h);
+    const slab = slabHalfMm(p.orient), R = glyphRadiusPx(w, h);
     for (const m of markups) {
       const { u, v, distMm } = rs.slice.rasToView(p.orient, off[p.cell], m.ras, w / h);
+      if (Math.abs(distMm) >= slab) continue;
       if (u < 0 || u > 1 || v < 0 || v > 1) continue;
-      const ad = Math.abs(distMm);
-      if (ad > MARK_TOL_MM) continue;
-      const near = ad < 3;
-      ctx.globalAlpha = near ? 1 : Math.max(0.2, 1 - ad / MARK_TOL_MM);
+      const x = u * w, y = v * h;
+      const active = m === draggingMarkup || m === hoverMarkup;
       ctx.fillStyle = `rgb(${m.color.map((c) => Math.round(c * 255)).join(",")})`;
-      ctx.strokeStyle = "rgba(0,0,0,0.7)";
-      ctx.lineWidth = 1.5;
       ctx.beginPath();
-      ctx.arc(u * w, v * h, near ? 6 : 4, 0, Math.PI * 2);
-      if (near) {
-        ctx.fill();
-        ctx.stroke();
-      } else {
-        ctx.stroke();
-      }
+      ctx.arc(x, y, R, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = active ? "#ffffff" : "rgba(0,0,0,0.6)";
+      ctx.lineWidth = active ? 2 : 1;
+      ctx.stroke();
     }
-    ctx.globalAlpha = 1;
   };
   const markupAtSlice = (p, u, v, w, h) => {
-    let best = null, bestD = 14;
+    const slab = slabHalfMm(p.orient);
+    let best = null, bestD = glyphRadiusPx(w, h) + 4;
     for (const m of markups) {
       const pr = rs.slice.rasToView(p.orient, off[p.cell], m.ras, w / h);
-      if (Math.abs(pr.distMm) > MARK_TOL_MM) continue;
+      if (Math.abs(pr.distMm) >= slab) continue;
       const d = Math.hypot((pr.u - u) * w, (pr.v - v) * h);
       if (d < bestD) {
         bestD = d;
@@ -1920,10 +1945,14 @@ async function main() {
     }
     return dbl;
   };
-  const sliceIx = new SliceInteractor({ ijkToRAS: rs.sv.ijkToRAS, rasLo: rasLo0, rasHi: rasHi0 });
   let focusedCell = null;
   const SCROLL_PX = 7;
   let sliceDrag = null;
+  let markDrag = null;
+  const cellUV = (cell, e) => {
+    const r = cv[cell].getBoundingClientRect();
+    return { u: (e.clientX - r.left) / r.width, v: (e.clientY - r.top) / r.height, w: r.width, h: r.height };
+  };
   for (const p of planes) {
     cv[p.cell].addEventListener("wheel", (e) => {
       e.preventDefault();
@@ -1935,38 +1964,71 @@ async function main() {
       if (isDoubleClick(p.cell, e)) return;
       if (e.button !== 0) return;
       e.preventDefault();
-      sliceDrag = { cell: p.cell, orient: p.orient, x: e.clientX, y: e.clientY, acc: 0, moved: 0 };
+      const { u, v, w, h } = cellUV(p.cell, e);
+      const grab = markups.length ? markupAtSlice(p, u, v, w, h) : null;
+      if (grab) {
+        draggingMarkup = grab;
+        hoverMarkup = grab;
+        markDrag = { cell: p.cell, moved: 0 };
+        cv[p.cell].style.cursor = "grabbing";
+        drawOverlay(p);
+      } else {
+        sliceDrag = { cell: p.cell, orient: p.orient, x: e.clientX, y: e.clientY, acc: 0, moved: 0 };
+      }
       cv[p.cell].setPointerCapture(e.pointerId);
     });
     cv[p.cell].addEventListener("pointermove", (e) => {
-      if (!sliceDrag || sliceDrag.cell !== p.cell) return;
-      sliceDrag.moved += Math.abs(e.clientX - sliceDrag.x) + Math.abs(e.clientY - sliceDrag.y);
-      sliceDrag.acc += e.clientX - sliceDrag.x - (e.clientY - sliceDrag.y);
-      sliceDrag.x = e.clientX;
-      sliceDrag.y = e.clientY;
-      while (Math.abs(sliceDrag.acc) >= SCROLL_PX) {
-        const fwd = sliceDrag.acc > 0;
-        off[p.cell] = sliceIx.wheel(p.orient, off[p.cell], fwd);
-        sliceDrag.acc -= fwd ? SCROLL_PX : -SCROLL_PX;
+      if (draggingMarkup && markDrag?.cell === p.cell) {
+        markDrag.moved += Math.abs(e.movementX) + Math.abs(e.movementY);
+        const { u, v, w, h } = cellUV(p.cell, e);
+        draggingMarkup.ras = rs.slice.viewToRas(p.orient, off[p.cell], u, v, w / h);
+        for (const q of planes) drawOverlay(q);
+        refreshMarkups3D();
+        return;
       }
-      drawPlane(p);
+      if (sliceDrag && sliceDrag.cell === p.cell) {
+        sliceDrag.moved += Math.abs(e.clientX - sliceDrag.x) + Math.abs(e.clientY - sliceDrag.y);
+        sliceDrag.acc += e.clientX - sliceDrag.x - (e.clientY - sliceDrag.y);
+        sliceDrag.x = e.clientX;
+        sliceDrag.y = e.clientY;
+        while (Math.abs(sliceDrag.acc) >= SCROLL_PX) {
+          const fwd = sliceDrag.acc > 0;
+          off[p.cell] = sliceIx.wheel(p.orient, off[p.cell], fwd);
+          sliceDrag.acc -= fwd ? SCROLL_PX : -SCROLL_PX;
+        }
+        drawPlane(p);
+        return;
+      }
+      if (e.buttons === 0 && markups.length) {
+        const { u, v, w, h } = cellUV(p.cell, e);
+        const m = markupAtSlice(p, u, v, w, h);
+        if (m !== hoverMarkup) {
+          hoverMarkup = m;
+          cv[p.cell].style.cursor = m ? "grab" : "default";
+          drawOverlay(p);
+        }
+      }
     });
     const endDrag = (e) => {
-      if (sliceDrag?.cell !== p.cell) return;
-      const wasClick = sliceDrag.moved < 5;
-      sliceDrag = null;
       try {
         cv[p.cell].releasePointerCapture(e.pointerId);
       } catch {
       }
-      if (wasClick && markups.length) {
-        const r = cv[p.cell].getBoundingClientRect();
-        const m = markupAtSlice(p, (e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height, r.width, r.height);
-        if (m) {
+      if (draggingMarkup && markDrag?.cell === p.cell) {
+        const wasClick = markDrag.moved < 5, m = draggingMarkup;
+        draggingMarkup = null;
+        markDrag = null;
+        cv[p.cell].style.cursor = "grab";
+        if (wasClick) {
           jumpAll(m.ras);
           hook?.logEvent("markupJump", { from: p.cell, ras: m.ras, label: m.label });
+        } else {
+          hook?.logEvent("markupMove", { cell: p.cell, ras: m.ras, label: m.label });
+          for (const q of planes) drawOverlay(q);
         }
+        return;
       }
+      if (sliceDrag?.cell === p.cell) sliceDrag = null;
     };
     cv[p.cell].addEventListener("pointerup", endDrag);
     cv[p.cell].addEventListener("pointercancel", endDrag);
@@ -2010,15 +2072,35 @@ async function main() {
     }
     return best;
   };
+  const camBasis = () => {
+    const e = camera.position, f = camera.focalPoint, u0 = camera.viewUp;
+    const fwd = [f[0] - e[0], f[1] - e[1], f[2] - e[2]];
+    const fl = Math.hypot(...fwd) || 1;
+    const fw = [fwd[0] / fl, fwd[1] / fl, fwd[2] / fl];
+    const rt = [fw[1] * u0[2] - fw[2] * u0[1], fw[2] * u0[0] - fw[0] * u0[2], fw[0] * u0[1] - fw[1] * u0[0]];
+    const rl = Math.hypot(...rt) || 1;
+    const r = [rt[0] / rl, rt[1] / rl, rt[2] / rl];
+    const up = [r[1] * fw[2] - r[2] * fw[1], r[2] * fw[0] - r[0] * fw[2], r[0] * fw[1] - r[1] * fw[0]];
+    return { eye: e, fwd: fw, right: r, up };
+  };
+  const worldPerPx = (pt, b, viewH) => {
+    const dist = (pt[0] - b.eye[0]) * b.fwd[0] + (pt[1] - b.eye[1]) * b.fwd[1] + (pt[2] - b.eye[2]) * b.fwd[2];
+    return 2 * Math.tan(camera.viewAngle * Math.PI / 180 / 2) * Math.max(dist, 1) / viewH;
+  };
   cv.threeD.addEventListener("contextmenu", (e) => e.preventDefault());
   let threeDDown = null;
+  let markDrag3D = null;
   cv.threeD.addEventListener("pointerdown", (e) => {
     if (isDoubleClick("threeD", e)) return;
     const { x, y } = localXY(e), { h } = viewSize();
     threeDDown = { x: e.clientX, y: e.clientY, moved: 0 };
-    interactor.start(e.button, x, y, h, { shift: e.shiftKey, ctrl: e.ctrlKey || e.metaKey, alt: e.altKey });
+    const grab = e.button === 0 ? markupAt3D(e.clientX, e.clientY) : null;
+    if (grab) {
+      markDrag3D = grab;
+      hoverMarkup = grab;
+    } else interactor.start(e.button, x, y, h, { shift: e.shiftKey, ctrl: e.ctrlKey || e.metaKey, alt: e.altKey });
     cv.threeD.setPointerCapture(e.pointerId);
-    hook?.logEvent("cameraStart", { action: interactor.action, x, y, button: e.button, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey });
+    hook?.logEvent("cameraStart", { action: markDrag3D ? "markupDrag" : interactor.action, x, y, button: e.button, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey });
   });
   cv.threeD.addEventListener("pointerup", (e) => {
     interactor.end();
@@ -2026,17 +2108,30 @@ async function main() {
       cv.threeD.releasePointerCapture(e.pointerId);
     } catch {
     }
-    if (threeDDown && threeDDown.moved < 5 && e.button === 0) {
-      const m = markupAt3D(e.clientX, e.clientY);
-      if (m) {
+    if (markDrag3D) {
+      const wasClick = !!threeDDown && threeDDown.moved < 5, m = markDrag3D;
+      markDrag3D = null;
+      if (wasClick) {
         jumpAll(m.ras);
         hook?.logEvent("markupJump", { from: "threeD", ras: m.ras, label: m.label });
-      }
+      } else hook?.logEvent("markupMove", { from: "threeD", ras: m.ras, label: m.label });
     }
     threeDDown = null;
   });
   cv.threeD.addEventListener("pointermove", (e) => {
     if (threeDDown) threeDDown.moved += Math.abs(e.movementX) + Math.abs(e.movementY);
+    if (markDrag3D) {
+      const b = camBasis(), { h: h2 } = viewSize(), s = worldPerPx(markDrag3D.ras, b, h2);
+      const dx = e.movementX * s, dy = e.movementY * s;
+      markDrag3D.ras = [
+        markDrag3D.ras[0] + b.right[0] * dx - b.up[0] * dy,
+        markDrag3D.ras[1] + b.right[1] * dx - b.up[1] * dy,
+        markDrag3D.ras[2] + b.right[2] * dx - b.up[2] * dy
+      ];
+      refreshMarkups3D();
+      for (const q of planes) drawOverlay(q);
+      return;
+    }
     if (interactor.action === "none") return;
     const { x, y } = localXY(e), { w, h } = viewSize();
     interactor.move(x, y, w, h);
@@ -2132,6 +2227,23 @@ async function main() {
   globalThis.__realDbg = {
     markups: () => markups.map((m) => ({ ras: m.ras, label: m.label })),
     offsets: () => Object.fromEntries(planes.map((p) => [p.cell, off[p.cell]])),
+    slabHalfMm: (cell) => slabHalfMm(cell),
+    // count of glyphs actually drawn on a slice at its current offset (only on-slab points)
+    drawnOn: (cell) => {
+      const p = planes.find((q) => q.cell === cell);
+      const r = cv[cell].getBoundingClientRect();
+      return markups.filter((m) => {
+        const pr = rs.slice.rasToView(p.orient, off[cell], m.ras, r.width / r.height);
+        return Math.abs(pr.distMm) < slabHalfMm(cell) && pr.u >= 0 && pr.u <= 1 && pr.v >= 0 && pr.v <= 1;
+      }).length;
+    },
+    // client-px position + signed plane distance of a RAS point in a slice cell (for drag tests)
+    sliceProject: (cell, ras) => {
+      const p = planes.find((q) => q.cell === cell);
+      const r = cv[cell].getBoundingClientRect();
+      const pr = rs.slice.rasToView(p.orient, off[cell], ras, r.width / r.height);
+      return { x: r.left + pr.u * r.width, y: r.top + pr.v * r.height, distMm: pr.distMm };
+    },
     project3D: (ras) => {
       const r = cv.threeD.getBoundingClientRect();
       const vp = multiply(perspectiveZO(camera.viewAngle * Math.PI / 180, r.width / r.height, 1, 1e5), lookAt(camera.position, camera.focalPoint, camera.viewUp));
