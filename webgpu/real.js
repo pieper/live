@@ -775,6 +775,22 @@ var SliceRenderer = class {
     ];
     return applyMat4(this.p2t, ras);
   }
+  /** Project a RAS point onto a plane's view: returns u,v in [0,1] (y down, matching the
+   *  rendered pixels for a viewport of aspect w/h) and the signed distance (mm) from the
+   *  point to the plane along its normal. Inverse of viewToTex; used to place 2D markup
+   *  glyphs and hit-test clicks on them. */
+  rasToView(orient, offset01, ras, aspectWH) {
+    const b = BASES[orient];
+    const uExt = this.rasHi[b.uAxis] - this.rasLo[b.uAxis], vExt = this.rasHi[b.vAxis] - this.rasLo[b.vAxis];
+    const span = Math.max(uExt, vExt);
+    const uS = span * Math.max(1, aspectWH), vS = span * Math.max(1, 1 / aspectWH);
+    const c = [(this.rasLo[0] + this.rasHi[0]) / 2, (this.rasLo[1] + this.rasHi[1]) / 2, (this.rasLo[2] + this.rasHi[2]) / 2];
+    c[b.nAxis] = this.rasLo[b.nAxis] + offset01 * (this.rasHi[b.nAxis] - this.rasLo[b.nAxis]);
+    const d = [ras[0] - c[0], ras[1] - c[1], ras[2] - c[2]];
+    const u = 0.5 + (d[0] * b.uDir[0] + d[1] * b.uDir[1] + d[2] * b.uDir[2]) / uS;
+    const v = 0.5 - (d[0] * b.vDir[0] + d[1] * b.vDir[1] + d[2] * b.vDir[2]) / vS;
+    return { u, v, distMm: d[b.nAxis] };
+  }
   drawInto(view, w, h) {
     const b = BASES[this.orient];
     const span = this.viewSpanMm();
@@ -826,6 +842,202 @@ var SliceRenderer = class {
     target.destroy();
     buf.destroy();
     return out;
+  }
+};
+
+// render/fiducial-field.ts
+var MAX = 64;
+var FiducialField = class {
+  kind = "fid";
+  bindingCount = 0;
+  // procedural — all state lives in the uniform block
+  spheres = new Float32Array(MAX * 4);
+  // (cx,cy,cz,radius)
+  colors = new Float32Array(MAX * 4);
+  // (r,g,b,a)
+  n = 0;
+  maxR = 0;
+  // largest radius in this field (for the skip bound)
+  clippable;
+  ghost;
+  providesSkip;
+  // off in screen-space mode (radius varies with the camera)
+  screen;
+  sh;
+  ka;
+  kd;
+  ks;
+  light;
+  constructor(spheres = [], opts = {}) {
+    this.setSpheres(spheres);
+    this.sh = opts.shininess ?? 80;
+    this.ka = opts.kAmbient ?? 0.2;
+    this.kd = opts.kDiffuse ?? 0.85;
+    this.ks = opts.kSpecular ?? 0.5;
+    this.light = opts.lightColor ?? [1, 1, 1];
+    this.clippable = opts.clippable ?? true;
+    this.ghost = opts.ghost ?? false;
+    this.screen = opts.screenSpace ?? false;
+    this.providesSkip = true;
+  }
+  setSpheres(list) {
+    this.n = Math.min(list.length, MAX);
+    this.spheres.fill(0);
+    this.colors.fill(0);
+    this.maxR = 0;
+    for (let i = 0; i < this.n; i++) {
+      const s = list[i];
+      this.spheres.set([s.center[0], s.center[1], s.center[2], s.radius], i * 4);
+      this.colors.set(s.color, i * 4);
+      this.maxR = Math.max(this.maxR, s.radius);
+    }
+  }
+  get count() {
+    return this.n;
+  }
+  uniformFloats() {
+    return 12 + MAX * 4 * 2;
+  }
+  // params(4)+params2(4)+light(4) + spheres + colors
+  sampleStep() {
+    return 1;
+  }
+  aabb() {
+    if (this.n === 0) return [[-1, -1, -1], [1, 1, 1]];
+    const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+    for (let i = 0; i < this.n; i++) {
+      const r = this.screen ? 0 : this.spheres[i * 4 + 3];
+      for (let a = 0; a < 3; a++) {
+        lo[a] = Math.min(lo[a], this.spheres[i * 4 + a] - r);
+        hi[a] = Math.max(hi[a], this.spheres[i * 4 + a] + r);
+      }
+    }
+    if (this.screen) {
+      const diag = Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);
+      const m = Math.max(40, diag * 0.15);
+      for (let a = 0; a < 3; a++) {
+        lo[a] -= m;
+        hi[a] += m;
+      }
+    }
+    return [lo, hi];
+  }
+  structMembers(s) {
+    return [
+      `  fid${s}_params : vec4<f32>,`,
+      // n_spheres, visible, shininess, k_ambient
+      `  fid${s}_params2 : vec4<f32>,`,
+      // k_diffuse, k_specular, max_radius, _
+      `  fid${s}_light : vec4<f32>,`,
+      // light_color.rgb, _
+      `  fid${s}_spheres : array<vec4<f32>, ${MAX}>,`,
+      `  fid${s}_colors : array<vec4<f32>, ${MAX}>,`
+    ].join("\n");
+  }
+  declareBindings(_s, _base) {
+    return "";
+  }
+  bindEntries(_s, _base) {
+    return [];
+  }
+  // --- empty-space skipping -------------------------------------------------
+  // The spheres are an exact SDF, so we can hand the ray-marcher a real distance to
+  // leap. Conservative form: nearest-CENTRE distance minus the field's LARGEST radius.
+  // Since min_j(d_j) <= d_k and max_r >= r_k for every k, this never exceeds the true
+  // min_k(d_k - r_k) — so it can't skip over a sphere — and it costs only squared
+  // distances in the loop plus ONE sqrt at the end (cheaper than the sampling loop).
+  // (providesSkip is false in screen-space mode — the world radius varies with the camera.)
+  skipWGSL(s) {
+    if (this.screen) {
+      return (
+        /* wgsl */
+        `
+fn skip_fid${s}(wp : vec3<f32>) -> f32 {
+  let n = i32(u_material.fid${s}_params.x);
+  if (n <= 0) { return 1.0e6; }
+  var best = 1.0e12;
+  for (var k = 0; k < n; k = k + 1) {
+    let sp = u_material.fid${s}_spheres[k];
+    if (sp.w <= 0.0) { continue; }
+    let r = sp.w * length(u_cam.eye.xyz - sp.xyz) / max(u_cam.size.z, 1.0);
+    best = min(best, length(wp - sp.xyz) - r);
+  }
+  return max(best, 0.0);
+}`
+      );
+    }
+    return (
+      /* wgsl */
+      `
+fn skip_fid${s}(wp : vec3<f32>) -> f32 {
+  let n = i32(u_material.fid${s}_params.x);
+  if (n <= 0) { return 1.0e6; }        // nothing here: unbounded empty space
+  var min_d2 = 1.0e12;
+  for (var k = 0; k < n; k = k + 1) {
+    let sp = u_material.fid${s}_spheres[k];
+    if (sp.w <= 0.0) { continue; }
+    let dv = wp - sp.xyz;
+    min_d2 = min(min_d2, dot(dv, dv));
+  }
+  return max(sqrt(min_d2) - u_material.fid${s}_params2.z, 0.0);
+}`
+    );
+  }
+  samplingWGSL(s) {
+    return (
+      /* wgsl */
+      `
+fn sample_field_fid${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
+  // an attached TransformField warps where the spheres appear (slicer_wgpu parity)
+  let wp_r = transform_point_fid${s}(wp);
+  let n = i32(u_material.fid${s}_params.x);
+  var best_depth = -1.0;
+  var best_center = vec3<f32>(0.0);
+  var best_color = vec4<f32>(0.0);
+  var found = false;
+  for (var k = 0; k < n; k = k + 1) {
+    let sp = u_material.fid${s}_spheres[k];
+    if (sp.w <= 0.0) { continue; }
+    // screen-space: sp.w is a PIXEL radius -> world radius = px * distance(eye) / focal_px,
+    // so the sphere stays a constant size on screen. Otherwise sp.w is a world radius.
+    ${this.screen ? `let r = sp.w * length(u_cam.eye.xyz - sp.xyz) / max(u_cam.size.z, 1.0);` : `let r = sp.w;`}
+    let depth = r - length(wp_r - sp.xyz);   // > 0 -> inside this sphere
+    if (depth > best_depth) { best_depth = depth; best_center = sp.xyz; best_color = u_material.fid${s}_colors[k]; found = true; }
+  }
+  if (!found || best_depth <= 0.0) { return vec4<f32>(0.0); }
+
+  let to_wp = wp_r - best_center;
+  var n_hat = to_wp / max(length(to_wp), 1e-6);
+  if (dot(n_hat, -rd) < 0.0) { n_hat = -n_hat; }
+  let view_dir = normalize(-rd);            // headlight (== normalize(ray_origin - wp) for t>0)
+  let ldotn = max(dot(view_dir, n_hat), 0.0);
+  let refl = normalize(2.0 * ldotn * n_hat - view_dir);
+  let rdotv = max(dot(refl, view_dir), 0.0);
+
+  let sh = u_material.fid${s}_params.z;
+  let ka = u_material.fid${s}_params.w; let kd = u_material.fid${s}_params2.x; let ks = u_material.fid${s}_params2.y;
+  let base = best_color.rgb;
+  let highlight = mix(base, u_material.fid${s}_light.rgb, 0.85);
+  let lit = base * ka + base * (kd * ldotn) + highlight * (ks * pow(rdotv, sh));
+  let col = srgb2physical(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)));
+  let opacity = clamp(best_color.a, 0.0, 1.0);
+  return vec4<f32>(col * opacity, opacity);
+}`
+    );
+  }
+  fillUniforms(out, off) {
+    out[off + 0] = this.n;
+    out[off + 1] = 1;
+    out[off + 2] = this.sh;
+    out[off + 3] = this.ka;
+    out[off + 4] = this.kd;
+    out[off + 5] = this.ks;
+    out[off + 6] = this.maxR;
+    out[off + 8] = this.light[0];
+    out[off + 9] = this.light[1];
+    out[off + 10] = this.light[2];
+    out.set(this.spheres, off + 12);
+    out.set(this.colors, off + 12 + MAX * 4);
   }
 };
 
@@ -1078,6 +1290,22 @@ function lutFromWindowLevel() {
   }
   return lut;
 }
+function parseMarkups(nodes) {
+  const out = [];
+  for (const n of Object.values(nodes)) {
+    if (!/Markups.*Node$/.test(n.class)) continue;
+    const cps = n.attrs?.controlPoints ?? n.attrs?.markups;
+    if (!Array.isArray(cps)) continue;
+    const color = n.attrs?.color ?? [1, 0.85, 0.2];
+    cps.forEach((cp, i) => {
+      const c = cp;
+      const p = c.position ?? cp;
+      if (!Array.isArray(p) || p.length < 3) return;
+      out.push({ ras: [p[0], p[1], p[2]], label: c.label ?? `${n.name ?? "F"}-${i + 1}`, color });
+    });
+  }
+  return out;
+}
 async function loadSceneVolumeField(dev, sceneUrl, onBytes, opts = {}) {
   const raw = await (await fetch(sceneUrl)).json();
   const wrapper = raw.nodes ? raw : { nodes: raw };
@@ -1125,7 +1353,7 @@ async function loadSceneVolumeField(dev, sceneUrl, onBytes, opts = {}) {
   const [lo, hi] = field.aabb();
   const center = [(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2];
   const radius = Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) / 2;
-  return { field, voxels: zv.data, dims: zv.dims, ijkToRAS, name: vol.name ?? "volume", range: zv.range, center, radius, win, lev };
+  return { field, voxels: zv.data, dims: zv.dims, ijkToRAS, name: vol.name ?? "volume", range: zv.range, center, radius, win, lev, markups: parseMarkups(nodes) };
 }
 
 // render/demos/real-scene.ts
@@ -1145,7 +1373,14 @@ function anatomicalAxes(ijkToRAS) {
 async function buildRealScene(gpu, sceneUrl, format, onBytes) {
   const sv = await loadSceneVolumeField(gpu.device, sceneUrl, onBytes);
   const scene = new SceneRenderer(gpu, format);
-  scene.build([sv.field]);
+  const rPin = Math.max(3, sv.radius * 0.015);
+  let markupField;
+  if (sv.markups.length) {
+    const pins = sv.markups.map((m) => ({ center: m.ras, radius: 9, color: [m.color[0], m.color[1], m.color[2], 1] }));
+    markupField = new FiducialField(pins, { screenSpace: true, ghost: true, shininess: 60 });
+    void rPin;
+  }
+  scene.build(markupField ? [sv.field, markupField] : [sv.field]);
   scene.setBackground(0.05, 0.06, 0.09);
   const slice = new SliceRenderer(gpu, format);
   const [rasLo, rasHi] = sv.field.aabb();
@@ -1153,7 +1388,7 @@ async function buildRealScene(gpu, sceneUrl, format, onBytes) {
   slice.setTextures(sv.field.volumeTexture());
   slice.setWindowLevel(sv.win, sv.lev);
   slice.setOverlayOpacity(0);
-  return { sv, scene, slice, axes: anatomicalAxes(sv.ijkToRAS) };
+  return { sv, scene, slice, axes: anatomicalAxes(sv.ijkToRAS), markupField };
 }
 
 // render/vtk-camera.ts
@@ -1572,6 +1807,71 @@ async function main() {
     coronal: slicerDefaultOffset01("coronal", rs.sv.dims, rs.sv.ijkToRAS, rasLo0, rasHi0),
     sagittal: slicerDefaultOffset01("sagittal", rs.sv.dims, rs.sv.ijkToRAS, rasLo0, rasHi0)
   };
+  const markups = rs.sv.markups;
+  const nAxisOf = { axial: 2, coronal: 1, sagittal: 0 };
+  const ovc = {};
+  const ov2d = {};
+  for (const p of planes) {
+    const o = document.createElement("canvas");
+    o.style.cssText = "position:absolute;inset:0;width:100%;height:100%;pointer-events:none;border-radius:5px;background:transparent;";
+    cv[p.cell].parentElement.appendChild(o);
+    ovc[p.cell] = o;
+    ov2d[p.cell] = o.getContext("2d");
+  }
+  const MARK_TOL_MM = 40;
+  const drawOverlay = (p) => {
+    const o = ovc[p.cell], ctx = ov2d[p.cell];
+    const w = cv[p.cell].clientWidth, h = cv[p.cell].clientHeight;
+    if (!w || !h) return;
+    const dpr = Math.min(2, globalThis.devicePixelRatio || 1);
+    if (o.width !== Math.floor(w * dpr)) {
+      o.width = Math.floor(w * dpr);
+      o.height = Math.floor(h * dpr);
+    }
+    ctx.setTransform(o.width / w, 0, 0, o.height / h, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    for (const m of markups) {
+      const { u, v, distMm } = rs.slice.rasToView(p.orient, off[p.cell], m.ras, w / h);
+      if (u < 0 || u > 1 || v < 0 || v > 1) continue;
+      const ad = Math.abs(distMm);
+      if (ad > MARK_TOL_MM) continue;
+      const near = ad < 3;
+      ctx.globalAlpha = near ? 1 : Math.max(0.2, 1 - ad / MARK_TOL_MM);
+      ctx.fillStyle = `rgb(${m.color.map((c) => Math.round(c * 255)).join(",")})`;
+      ctx.strokeStyle = "rgba(0,0,0,0.7)";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(u * w, v * h, near ? 6 : 4, 0, Math.PI * 2);
+      if (near) {
+        ctx.fill();
+        ctx.stroke();
+      } else {
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+  };
+  const markupAtSlice = (p, u, v, w, h) => {
+    let best = null, bestD = 14;
+    for (const m of markups) {
+      const pr = rs.slice.rasToView(p.orient, off[p.cell], m.ras, w / h);
+      if (Math.abs(pr.distMm) > MARK_TOL_MM) continue;
+      const d = Math.hypot((pr.u - u) * w, (pr.v - v) * h);
+      if (d < bestD) {
+        bestD = d;
+        best = m;
+      }
+    }
+    return best;
+  };
+  const jumpAll = (ras) => {
+    for (const q of planes) {
+      const a = nAxisOf[q.orient];
+      off[q.cell] = Math.max(0, Math.min(1, (ras[a] - rasLo0[a]) / (rasHi0[a] - rasLo0[a])));
+      drawPlane(q);
+    }
+    draw3d();
+  };
   const camera = VtkCamera.slicerDefault();
   const interactor = new CameraInteractor(camera, () => draw3d());
   const shown = (n) => cv[n].width > 0 && cv[n].height > 0;
@@ -1579,6 +1879,7 @@ async function main() {
     if (!shown(p.cell)) return;
     rs.slice.setPlane(p.orient, off[p.cell]);
     rs.slice.renderToView(cx[p.cell].getCurrentTexture().createView({ format: srgb }), cv[p.cell].width, cv[p.cell].height);
+    drawOverlay(p);
   };
   const draw3d = () => {
     if (!shown("threeD")) return;
@@ -1634,11 +1935,12 @@ async function main() {
       if (isDoubleClick(p.cell, e)) return;
       if (e.button !== 0) return;
       e.preventDefault();
-      sliceDrag = { cell: p.cell, orient: p.orient, x: e.clientX, y: e.clientY, acc: 0 };
+      sliceDrag = { cell: p.cell, orient: p.orient, x: e.clientX, y: e.clientY, acc: 0, moved: 0 };
       cv[p.cell].setPointerCapture(e.pointerId);
     });
     cv[p.cell].addEventListener("pointermove", (e) => {
       if (!sliceDrag || sliceDrag.cell !== p.cell) return;
+      sliceDrag.moved += Math.abs(e.clientX - sliceDrag.x) + Math.abs(e.clientY - sliceDrag.y);
       sliceDrag.acc += e.clientX - sliceDrag.x - (e.clientY - sliceDrag.y);
       sliceDrag.x = e.clientX;
       sliceDrag.y = e.clientY;
@@ -1650,11 +1952,19 @@ async function main() {
       drawPlane(p);
     });
     const endDrag = (e) => {
-      if (sliceDrag?.cell === p.cell) {
-        sliceDrag = null;
-        try {
-          cv[p.cell].releasePointerCapture(e.pointerId);
-        } catch {
+      if (sliceDrag?.cell !== p.cell) return;
+      const wasClick = sliceDrag.moved < 5;
+      sliceDrag = null;
+      try {
+        cv[p.cell].releasePointerCapture(e.pointerId);
+      } catch {
+      }
+      if (wasClick && markups.length) {
+        const r = cv[p.cell].getBoundingClientRect();
+        const m = markupAtSlice(p, (e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height, r.width, r.height);
+        if (m) {
+          jumpAll(m.ras);
+          hook?.logEvent("markupJump", { from: p.cell, ras: m.ras, label: m.label });
         }
       }
     };
@@ -1681,19 +1991,52 @@ async function main() {
     const r = cv.threeD.getBoundingClientRect();
     return { x: e.clientX - r.left, y: e.clientY - r.top };
   };
+  const markupAt3D = (clientX, clientY) => {
+    if (!markups.length) return null;
+    const r = cv.threeD.getBoundingClientRect();
+    const vp = multiply(perspectiveZO(camera.viewAngle * Math.PI / 180, r.width / r.height, 1, 1e5), lookAt(camera.position, camera.focalPoint, camera.viewUp));
+    let best = null, bestD = 16;
+    for (const m of markups) {
+      const p = m.ras;
+      const cw = vp[3] * p[0] + vp[7] * p[1] + vp[11] * p[2] + vp[15];
+      if (cw <= 0) continue;
+      const sx = r.left + ((vp[0] * p[0] + vp[4] * p[1] + vp[8] * p[2] + vp[12]) / cw * 0.5 + 0.5) * r.width;
+      const sy = r.top + (1 - ((vp[1] * p[0] + vp[5] * p[1] + vp[9] * p[2] + vp[13]) / cw * 0.5 + 0.5)) * r.height;
+      const d = Math.hypot(sx - clientX, sy - clientY);
+      if (d < bestD) {
+        bestD = d;
+        best = m;
+      }
+    }
+    return best;
+  };
   cv.threeD.addEventListener("contextmenu", (e) => e.preventDefault());
+  let threeDDown = null;
   cv.threeD.addEventListener("pointerdown", (e) => {
     if (isDoubleClick("threeD", e)) return;
     const { x, y } = localXY(e), { h } = viewSize();
+    threeDDown = { x: e.clientX, y: e.clientY, moved: 0 };
     interactor.start(e.button, x, y, h, { shift: e.shiftKey, ctrl: e.ctrlKey || e.metaKey, alt: e.altKey });
     cv.threeD.setPointerCapture(e.pointerId);
     hook?.logEvent("cameraStart", { action: interactor.action, x, y, button: e.button, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey });
   });
   cv.threeD.addEventListener("pointerup", (e) => {
     interactor.end();
-    cv.threeD.releasePointerCapture(e.pointerId);
+    try {
+      cv.threeD.releasePointerCapture(e.pointerId);
+    } catch {
+    }
+    if (threeDDown && threeDDown.moved < 5 && e.button === 0) {
+      const m = markupAt3D(e.clientX, e.clientY);
+      if (m) {
+        jumpAll(m.ras);
+        hook?.logEvent("markupJump", { from: "threeD", ras: m.ras, label: m.label });
+      }
+    }
+    threeDDown = null;
   });
   cv.threeD.addEventListener("pointermove", (e) => {
+    if (threeDDown) threeDDown.moved += Math.abs(e.movementX) + Math.abs(e.movementY);
     if (interactor.action === "none") return;
     const { x, y } = localXY(e), { w, h } = viewSize();
     interactor.move(x, y, w, h);
@@ -1786,6 +2129,19 @@ async function main() {
   }
   cv.threeD.addEventListener("pointerdown", (e) => hook.logEvent("pointerdown", { cell: "threeD", x: e.offsetX, y: e.offsetY, button: e.button, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey }));
   cv.threeD.addEventListener("wheel", (e) => hook.logEvent("wheel", { cell: "threeD", deltaY: e.deltaY, distance: camera.distance }), { passive: true });
+  globalThis.__realDbg = {
+    markups: () => markups.map((m) => ({ ras: m.ras, label: m.label })),
+    offsets: () => Object.fromEntries(planes.map((p) => [p.cell, off[p.cell]])),
+    project3D: (ras) => {
+      const r = cv.threeD.getBoundingClientRect();
+      const vp = multiply(perspectiveZO(camera.viewAngle * Math.PI / 180, r.width / r.height, 1, 1e5), lookAt(camera.position, camera.focalPoint, camera.viewUp));
+      const cw = vp[3] * ras[0] + vp[7] * ras[1] + vp[11] * ras[2] + vp[15];
+      return {
+        x: r.left + ((vp[0] * ras[0] + vp[4] * ras[1] + vp[8] * ras[2] + vp[12]) / cw * 0.5 + 0.5) * r.width,
+        y: r.top + (1 - ((vp[1] * ras[0] + vp[5] * ras[1] + vp[9] * ras[2] + vp[13]) / cw * 0.5 + 0.5)) * r.height
+      };
+    }
+  };
   resize();
 }
 main().catch((e) => status("error: " + (e?.message ?? e), true));
