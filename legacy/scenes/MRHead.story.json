@@ -1,0 +1,121 @@
+{
+ "scene": "MRHead.json",
+ "title": "LiveStory (prototype) \u2014 MR head",
+ "pages": [
+  {
+   "title": "Prototype placeholder",
+   "text": "LiveStory turns a 3D Slicer scene into a narrated walkthrough \u2014 a set of slice + 3D views with captions and out-links, authored in Slicer and rendered here by SlicerLive's WebGPU backbone. This is a placeholder; a real anatomy lesson is coming.",
+   "links": [
+    {
+     "label": "Human brain (Wikipedia)",
+     "url": "https://en.wikipedia.org/wiki/Human_brain"
+    }
+   ],
+   "camera": {
+    "position": [
+     -115.70976588357061,
+     181.69682401344787,
+     451.21781239507334
+    ],
+    "focalPoint": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "viewUp": [
+     0.2627637420720713,
+     -0.8697924898281812,
+     0.4176317043649528
+    ],
+    "viewAngle": 30.0
+   },
+   "slices": {
+    "Red": {
+     "sliceToRAS": [
+      -1.0,
+      0.0,
+      0.0,
+      -2.0,
+      0.0,
+      1.0,
+      0.0,
+      6.0,
+      0.0,
+      0.0,
+      1.0,
+      -11.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ],
+     "fieldOfView": [
+      467.1638418079096,
+      256.0,
+      1.0
+     ],
+     "orientation": "Axial"
+    },
+    "Green": {
+     "sliceToRAS": [
+      -1.0,
+      0.0,
+      0.0,
+      -2.0,
+      0.0,
+      0.0,
+      1.0,
+      6.0,
+      0.0,
+      1.0,
+      0.0,
+      -11.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ],
+     "fieldOfView": [
+      465.45454545454544,
+      256.0,
+      1.0
+     ],
+     "orientation": "Coronal"
+    },
+    "Yellow": {
+     "sliceToRAS": [
+      0.0,
+      0.0,
+      -1.0,
+      -2.0,
+      -1.0,
+      0.0,
+      0.0,
+      6.0,
+      0.0,
+      1.0,
+      0.0,
+      -11.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ],
+     "fieldOfView": [
+      461.0909090909091,
+      256.0,
+      1.2999954223632812
+     ],
+     "orientation": "Sagittal"
+    }
+   },
+   "visibility": {
+    "vtkMRMLSliceDisplayNode1": 0,
+    "vtkMRMLSliceDisplayNode2": 0,
+    "vtkMRMLSliceDisplayNode3": 0,
+    "vtkMRMLScalarVolumeDisplayNode1": 1,
+    "vtkMRMLMarkupsFiducialDisplayNode1": 1
+   }
+  }
+ ]
+}
