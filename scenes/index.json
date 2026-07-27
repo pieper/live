@@ -3,7 +3,8 @@
   "name": "nnLive \u2014 interactive segmentation (4-up)",
   "page": "webgpu/nnlive.html",
   "thumb": "nnlive.png",
-  "desc": "The payoff: a real CT in the SlicerLive 4-up where each click runs nnLive's FAITHFUL 192\u00b3 interactive segmentation (distilled nnInteractive: trunk encode + perclick decode, EDT-ball prompts, prev-mask feedback, auto-zoom) \u2192 mask \u2192 ColorizeVolume, live as a colored 3D volume + MPR overlay with a pushpin per click. Shift-click = background point. Coordinates correct end-to-end (RAS reslice + view\u2192RAS\u2192voxel). 188 MB weights stream from the public bucket."
+  "desc": "The payoff: a real CT in the SlicerLive 4-up where each click runs nnLive's FAITHFUL 192\u00b3 interactive segmentation (distilled nnInteractive: trunk encode + perclick decode, EDT-ball prompts, prev-mask feedback, auto-zoom) \u2192 mask \u2192 ColorizeVolume, live as a colored 3D volume + MPR overlay with a pushpin per click. Shift-click = background point. Coordinates correct end-to-end (RAS reslice + view\u2192RAS\u2192voxel). 188 MB weights stream from the public bucket.",
+  "wip": true
  },
  {
   "name": "WebGPU real scene \u2014 MRHead (MPR + 3D VR)",
@@ -16,12 +17,6 @@
   "page": "webgpu/story.html?scene=../legacy/scenes/MRHead.json",
   "thumb": "livestory.png",
   "desc": "PROTOTYPE / placeholder. LiveStory (inspired by MinervaStory) turns a 3D Slicer scene into a narrated walkthrough \u2014 camera + slice views with captions and Wikipedia-style links on the left, the live SlicerLive WebGPU 4-up on the right; click a page to jump the view. Authored in Slicer via the LiveStory module and previewed straight from Slicer's own web server."
- },
- {
-  "name": "WebGPU 4-up (MPR + 3D)",
-  "page": "webgpu/fourup.html",
-  "thumb": "fourup.png",
-  "desc": "The Slicer-style 4-up, native in WebGPU \u2014 three MPR planes (windowed CT + colored segmentation overlay) + a 3D ColorizeVolume view, all from the same GPU textures. The replacement for the vtk.js 4-up. Scroll a slice to scrub; drag 3D to orbit."
  },
  {
   "name": "WebGPU: Landmark Deform (TPS)",

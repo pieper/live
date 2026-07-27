@@ -35,6 +35,11 @@
 <h2>WebGPU LiveRenderer <span class="n">the new native rendering backbone (browser + Deno)</span></h2>
 <div class="grid" id="grid-webgpu"><div class="empty">loading…</div></div>
 
+<div id="wip-wrap" style="display:none">
+  <h2>Work in Progress <span class="n">experiments still coming together</span></h2>
+  <div class="grid" id="grid-wip"></div>
+</div>
+
 <div id="legacy-wrap" style="display:none">
   <h2>Legacy <span class="n">vtk.js viewer — kept servable while the WebGPU path reaches parity</span></h2>
   <div class="grid" id="grid-legacy"></div>
@@ -53,11 +58,17 @@
     a.appendChild(img); a.appendChild(t); return a;
   }
   fetch('scenes/index.json').then((r) => r.json()).then((scenes) => {
-    const gw = document.getElementById('grid-webgpu'), gl = document.getElementById('grid-legacy');
+    const gw = document.getElementById('grid-webgpu'), gl = document.getElementById('grid-legacy'), gwip = document.getElementById('grid-wip');
     gw.innerHTML = '';
-    const webgpu = scenes.filter((s) => !s.legacy), legacy = scenes.filter((s) => s.legacy);
+    const webgpu = scenes.filter((s) => !s.legacy && !s.wip);
+    const wip = scenes.filter((s) => s.wip && !s.legacy);
+    const legacy = scenes.filter((s) => s.legacy);
     if (!webgpu.length) gw.innerHTML = '<div class="empty">No demos yet.</div>';
     for (const s of webgpu) gw.appendChild(card(s));
+    if (wip.length) {
+      document.getElementById('wip-wrap').style.display = '';
+      for (const s of wip) gwip.appendChild(card(s));
+    }
     if (legacy.length) {
       document.getElementById('legacy-wrap').style.display = '';
       for (const s of legacy) gl.appendChild(card(s));
