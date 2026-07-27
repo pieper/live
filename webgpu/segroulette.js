@@ -1589,13 +1589,27 @@ function bakeSegmentPresence(dev, mask, dims, sigmaVoxels = 1.5) {
 
 // render/demos/segroulette-scene.ts
 var MAX_ISO_SEGMENTS = 12;
-function grayLUT() {
+function modalityLUT(modality, maxAlpha = 0.42) {
   const lut = new Uint8Array(256 * 4);
+  const m = (modality ?? "CT").toUpperCase();
   for (let i = 0; i < 256; i++) {
     const t = i / 255;
-    const g = Math.round(t * 255);
-    lut[i * 4] = lut[i * 4 + 1] = lut[i * 4 + 2] = g;
-    lut[i * 4 + 3] = Math.round(Math.max(0, Math.min(1, (t - 0.35) / 0.65)) * 130);
+    let r, g, b, a;
+    if (m === "PET" || m === "PT") {
+      r = Math.min(1, t * 3);
+      g = Math.min(1, Math.max(0, t * 3 - 1));
+      b = Math.min(1, Math.max(0, t * 3 - 2));
+      a = Math.max(0, (t - 0.25) / 0.75) * 0.9;
+    } else {
+      r = g = b = t;
+      let aa = Math.max(0, (t - 0.42) / 0.58);
+      aa *= aa;
+      a = Math.min(maxAlpha, aa);
+    }
+    lut[i * 4] = Math.round(r * 255);
+    lut[i * 4 + 1] = Math.round(g * 255);
+    lut[i * 4 + 2] = Math.round(b * 255);
+    lut[i * 4 + 3] = Math.round(a * 255);
   }
   return lut;
 }
@@ -1604,7 +1618,7 @@ function buildSegrouletteScene(gpu, format, ct, seg) {
   const dims = ct.dims;
   const data = ct.vol instanceof Float32Array ? ct.vol : Float32Array.from(ct.vol);
   const clim = [ct.lev - ct.win / 2, ct.lev + ct.win / 2];
-  const ctField = new ImageField(dev, data, dims, [1, 1, 1], grayLUT(), {
+  const volumeField = new ImageField(dev, data, dims, [1, 1, 1], modalityLUT(ct.modality), {
     clim,
     ijkToRAS: ct.ijkToRAS,
     shade: [0.25, 0.7, 0.45, 20]
@@ -1630,9 +1644,9 @@ function buildSegrouletteScene(gpu, format, ct, seg) {
   const colorizeTex = seg ? bakeColorizeRGBA(dev, seg.lab, dims, palette, 1.5) : void 0;
   const useIso = segments.length > 0 && segments.length <= MAX_ISO_SEGMENTS;
   let mode = "volume";
-  let fields3d;
+  let segLayer = [];
   if (useIso) {
-    fields3d = segments.map((s) => {
+    segLayer = segments.map((s) => {
       const mask = new Uint8Array(dims[0] * dims[1] * dims[2]);
       for (let i = 0; i < seg.lab.length; i++) if (seg.lab[i] === s.num) mask[i] = 1;
       const tex = bakeSegmentPresence(dev, mask, dims, 1.5);
@@ -1640,24 +1654,27 @@ function buildSegrouletteScene(gpu, format, ct, seg) {
     });
     mode = "iso";
   } else if (colorizeTex) {
-    fields3d = [new RGBAVolumeField(colorizeTex, dims, [1, 1, 1], { ijkToRAS: ct.ijkToRAS, shade: [0.3, 0.78, 0.5, 28] })];
+    segLayer = [new RGBAVolumeField(colorizeTex, dims, [1, 1, 1], { ijkToRAS: ct.ijkToRAS, shade: [0.3, 0.78, 0.5, 28] })];
     mode = "colorized";
-  } else {
-    fields3d = [ctField];
-    mode = "volume";
   }
   const scene = new SceneRenderer(gpu, format);
-  scene.build(fields3d);
-  scene.setBackground(0.05, 0.06, 0.09);
+  const setLayers = (showVolume, showSeg) => {
+    const f = [];
+    if (showVolume) f.push(volumeField);
+    if (showSeg) f.push(...segLayer);
+    scene.build(f.length ? f : [volumeField]);
+    scene.setBackground(0.05, 0.06, 0.09);
+  };
+  setLayers(true, segLayer.length > 0);
   const slice = new SliceRenderer(gpu, format);
-  const [rasLo, rasHi] = ctField.aabb();
-  slice.setVolume(ctField.patientToTexture(), rasLo, rasHi);
-  slice.setTextures(ctField.volumeTexture(), colorizeTex);
+  const [rasLo, rasHi] = volumeField.aabb();
+  slice.setVolume(volumeField.patientToTexture(), rasLo, rasHi);
+  slice.setTextures(volumeField.volumeTexture(), colorizeTex);
   slice.setWindowLevel(ct.win, ct.lev);
   slice.setOverlayOpacity(seg ? 0.5 : 0);
   const center = [(rasLo[0] + rasHi[0]) / 2, (rasLo[1] + rasHi[1]) / 2, (rasLo[2] + rasHi[2]) / 2];
   const radius = Math.hypot(rasHi[0] - rasLo[0], rasHi[1] - rasLo[1], rasHi[2] - rasLo[2]) / 2;
-  return { scene, slice, center, radius, rasLo, rasHi, ijkToRAS: ct.ijkToRAS, dims, win: ct.win, lev: ct.lev, segments, mode };
+  return { scene, slice, center, radius, rasLo, rasHi, ijkToRAS: ct.ijkToRAS, dims, win: ct.win, lev: ct.lev, segments, mode, hasSeg: segLayer.length > 0, setLayers };
 }
 
 // render/demos/crosshair.ts
@@ -2223,6 +2240,259 @@ function attachDoubleClick(canvas, onDbl) {
   });
 }
 
+// render/demos/sl-chrome.ts
+var DEFAULT_HELP = [
+  { title: "3D view", rows: [
+    ["Left-drag", "Rotate"],
+    ["Right-drag", "Zoom"],
+    ["Middle / Shift+Left-drag", "Pan"],
+    ["Wheel / two-finger", "Zoom (dolly)"],
+    ["Double-click", "Maximize / restore"],
+    ["Shift + move", "Pick \u2192 jump slices to the point"]
+  ] },
+  { title: "Slice views", rows: [
+    ["Wheel / Left-drag", "Scroll through slices"],
+    ["Right-drag / \u2318-wheel", "Zoom this slice"],
+    ["Middle / Shift+Left-drag", "Pan"],
+    ["Double-click", "Maximize / restore"],
+    ["R", "Reset pan/zoom"],
+    ["Shift + move", "Jump the other views to the point under the cursor"]
+  ] }
+];
+function glass(el2, extra = "") {
+  el2.style.cssText += ";background:linear-gradient(135deg,rgba(58,64,88,.55),rgba(20,24,38,.66));backdrop-filter:blur(20px) saturate(1.6);-webkit-backdrop-filter:blur(20px) saturate(1.6);border:1px solid rgba(255,255,255,.2);box-shadow:0 18px 50px rgba(0,0,0,.55);" + extra;
+}
+function installChrome(opts) {
+  const controls = opts.controls ?? [];
+  const help = opts.help ?? DEFAULT_HELP;
+  const helpBtn = document.createElement("button");
+  helpBtn.textContent = "?";
+  helpBtn.title = "Controls & key bindings";
+  helpBtn.style.cssText = "position:fixed;top:12px;left:12px;z-index:74;width:32px;height:32px;padding:0;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;border-radius:50%;color:#cfe6ff;font:700 15px -apple-system,system-ui,sans-serif;";
+  glass(helpBtn);
+  helpBtn.onclick = openHelp;
+  document.body.appendChild(helpBtn);
+  let helpEl = null;
+  function openHelp() {
+    if (helpEl) return;
+    helpEl = document.createElement("div");
+    helpEl.style.cssText = "position:fixed;inset:0;z-index:96;display:flex;align-items:center;justify-content:center;background:rgba(6,8,14,.55);font:13px/1.5 -apple-system,system-ui,sans-serif;color:#e8eeff;";
+    helpEl.addEventListener("mousedown", (e) => {
+      if (e.target === helpEl) closeHelp();
+    });
+    const panel = document.createElement("div");
+    panel.style.cssText = "max-width:min(640px,92vw);max-height:86vh;overflow-y:auto;padding:22px 26px;border-radius:16px;color:#eaf0ff;";
+    glass(panel);
+    panel.innerHTML = `<div style="font:800 20px -apple-system,system-ui,sans-serif;margin-bottom:4px">SlicerLive \u2014 controls</div>`;
+    for (const sec of help) {
+      const rows2 = sec.rows.map(([k, d]) => `<div style="font:600 12px ui-monospace,Menlo,monospace;color:#fff5d6;white-space:nowrap">${k}</div><div style="color:rgba(232,238,255,.85)">${d}</div>`).join("");
+      panel.innerHTML += `<div style="margin-top:14px;padding:12px 14px;border-radius:10px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08)"><div style="font:700 11px -apple-system,system-ui,sans-serif;letter-spacing:1.1px;text-transform:uppercase;color:#9fe9ff;margin-bottom:9px">${sec.title}</div><div style="display:grid;grid-template-columns:max-content 1fr;gap:6px 16px;align-items:baseline">${rows2}</div></div>`;
+    }
+    panel.innerHTML += `<div style="margin-top:16px;font-size:12px;color:rgba(232,238,255,.55)">Press <b style="color:#fff5d6">esc</b> or click outside to dismiss.</div>`;
+    helpEl.appendChild(panel);
+    document.body.appendChild(helpEl);
+    document.addEventListener("keydown", escClose, true);
+  }
+  function escClose(e) {
+    if (e.key === "Escape") closeHelp();
+  }
+  function closeHelp() {
+    if (helpEl) {
+      helpEl.remove();
+      helpEl = null;
+      document.removeEventListener("keydown", escClose, true);
+    }
+  }
+  const logo = document.createElement("div");
+  logo.textContent = "SlicerLive";
+  logo.style.cssText = "position:fixed;top:11px;right:12px;z-index:74;cursor:pointer;user-select:none;padding:4px 10px;border-radius:8px;font:700 12px -apple-system,system-ui,sans-serif;letter-spacing:.2px;color:#04121c;background:linear-gradient(180deg,#9fe9ff,#54c6f0);box-shadow:0 4px 14px rgba(0,0,0,.4);";
+  document.body.appendChild(logo);
+  const pop = document.createElement("div");
+  pop.style.cssText = "position:fixed;top:42px;right:12px;z-index:73;min-width:180px;padding:10px 12px;border-radius:12px;color:#eaf0ff;font:13px -apple-system,system-ui,sans-serif;opacity:0;pointer-events:none;transform:translateY(-6px);transition:opacity 120ms ease-out,transform 120ms ease-out;";
+  glass(pop);
+  document.body.appendChild(pop);
+  const rows = [];
+  if (controls.length) {
+    const head = document.createElement("div");
+    head.textContent = "Visualization";
+    head.style.cssText = "font:700 10px -apple-system,system-ui,sans-serif;letter-spacing:1.1px;text-transform:uppercase;color:#9fe9ff;margin:0 0 8px;";
+    pop.appendChild(head);
+    for (const c of controls) {
+      const row = document.createElement("div");
+      row.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:14px;padding:5px 0;cursor:pointer;";
+      const lab = document.createElement("span");
+      lab.textContent = c.label;
+      const sw = document.createElement("span");
+      sw.style.cssText = "width:34px;height:19px;border-radius:999px;position:relative;transition:background 120ms;flex:0 0 auto;";
+      row.appendChild(lab);
+      row.appendChild(sw);
+      row.onclick = () => {
+        if (c.disabled?.()) return;
+        c.set(!c.get());
+        opts.onChange?.();
+        refresh();
+      };
+      pop.appendChild(row);
+      rows.push({ c, row, sw });
+    }
+  } else {
+    pop.textContent = "SlicerLive \u2014 WebGPU renderer";
+  }
+  function refresh() {
+    for (const { c, row, sw } of rows) {
+      const on = c.get(), dis = c.disabled?.() ?? false;
+      row.style.opacity = dis ? "0.4" : "1";
+      row.style.cursor = dis ? "default" : "pointer";
+      sw.style.background = on ? "linear-gradient(180deg,#9fe9ff,#54c6f0)" : "rgba(255,255,255,.18)";
+      sw.innerHTML = `<span style="position:absolute;top:2px;left:${on ? 17 : 2}px;width:15px;height:15px;border-radius:50%;background:#fff;transition:left 120ms;box-shadow:0 1px 3px rgba(0,0,0,.4)"></span>`;
+    }
+  }
+  refresh();
+  const show = () => {
+    pop.style.opacity = "1";
+    pop.style.pointerEvents = "auto";
+    pop.style.transform = "translateY(0)";
+  };
+  const hide = () => {
+    pop.style.opacity = "0";
+    pop.style.pointerEvents = "none";
+    pop.style.transform = "translateY(-6px)";
+  };
+  let pinned = false;
+  logo.onmouseenter = () => show();
+  logo.onclick = () => {
+    pinned = !pinned;
+    pinned ? show() : hide();
+  };
+  logo.onmouseleave = () => {
+    if (!pinned) setTimeout(() => {
+      if (!pop.matches(":hover") && !pinned) hide();
+    }, 120);
+  };
+  pop.onmouseleave = () => {
+    if (!pinned) hide();
+  };
+  return { refresh };
+}
+
+// render/demos/idc-info.ts
+function glass2(el2) {
+  el2.style.cssText += ";background:linear-gradient(135deg,rgba(58,64,88,.55),rgba(20,24,38,.66));backdrop-filter:blur(22px) saturate(1.6);-webkit-backdrop-filter:blur(22px) saturate(1.6);border:1px solid rgba(255,255,255,.2);box-shadow:0 20px 56px rgba(0,0,0,.6);";
+}
+function installIdcInfo(host, opts) {
+  const btn = document.createElement("button");
+  btn.textContent = "\u24D8 Details";
+  btn.style.cssText = "cursor:pointer;white-space:nowrap;border:1px solid rgba(255,255,255,.18);border-radius:7px;padding:5px 11px;font:600 12px -apple-system,system-ui,sans-serif;color:#cfe6ff;background:rgba(255,255,255,.06);";
+  btn.onclick = open;
+  host.appendChild(btn);
+  let modal = null;
+  function close() {
+    if (modal) {
+      modal.remove();
+      modal = null;
+      document.removeEventListener("keydown", onKey, true);
+    }
+  }
+  function onKey(e) {
+    if (e.key === "Escape") close();
+  }
+  function open() {
+    if (modal) return;
+    const e = opts.getEntry();
+    const segs = opts.getSegments();
+    modal = document.createElement("div");
+    modal.style.cssText = "position:fixed;inset:0;z-index:96;display:flex;align-items:center;justify-content:center;background:rgba(6,8,14,.55);font:13px/1.5 -apple-system,system-ui,sans-serif;color:#e8eeff;";
+    modal.addEventListener("mousedown", (ev) => {
+      if (ev.target === modal) close();
+    });
+    const panel = document.createElement("div");
+    panel.style.cssText = "max-width:min(640px,92vw);max-height:86vh;overflow-y:auto;padding:22px 26px;border-radius:16px;";
+    glass2(panel);
+    const col = (e?.col ?? "IDC").toUpperCase();
+    const mod = e?.m ?? "";
+    const sd = e?.sd ?? "segmentation";
+    const lic = e?.lic ?? "";
+    const idoi = e?.idoi, sdoi = e?.sdoi, pid = e?.pid;
+    const chips = segs.map((s) => `<span style="font-size:11px;border:1px solid rgb(${s.color.map((c) => Math.round(c * 255)).join(",")});border-radius:999px;padding:1px 9px;white-space:nowrap">${s.name}</span>`).join(" ");
+    const doiLink = (d, label = "DOI") => d ? `<a href="https://doi.org/${d}" target="_blank" rel="noopener">${label}</a>` : "";
+    const ohif = e?.st ? `<a href="${opts.ohifURL(e.st)}" target="_blank" rel="noopener">Open in OHIF viewer</a>` : "";
+    const portal = `<a href="https://portal.imaging.datacommons.cancer.gov/explore/filters/?collection_id=${e?.col ?? ""}" target="_blank" rel="noopener">IDC portal \u2014 ${e?.col ?? "collections"}</a>`;
+    panel.innerHTML = `<div style="font:800 20px -apple-system,system-ui,sans-serif">${col} <span style="color:#9fe9ff;font-size:14px">${mod}</span></div><div style="opacity:.8;margin-top:2px">${sd}</div>` + (pid ? `<div style="opacity:.5;font-size:12px;margin-top:2px">patient ${pid}</div>` : "") + `<div style="margin-top:14px;display:flex;flex-wrap:wrap;gap:5px">${chips || "<i style='opacity:.6'>no segments</i>"}</div><div style="margin-top:16px;padding-top:12px;border-top:1px solid rgba(255,255,255,.1);display:grid;grid-template-columns:max-content 1fr;gap:6px 16px;font-size:12.5px">` + (lic ? `<div style="color:#9fe9ff">License</div><div>${lic}</div>` : "") + (idoi || sdoi ? `<div style="color:#9fe9ff">Citation</div><div>${[doiLink(idoi, "source series DOI"), doiLink(sdoi, "segmentation DOI")].filter(Boolean).join(" \xB7 ")}</div>` : "") + `<div style="color:#9fe9ff">View</div><div>${[ohif, portal].filter(Boolean).join(" \xB7 ")}</div></div><div style="margin-top:16px;font-size:12px;color:rgba(232,238,255,.55)">Data streamed live from the NCI Imaging Data Commons. Press <b style="color:#fff5d6">esc</b> or click outside to close.</div>`;
+    modal.appendChild(panel);
+    document.body.appendChild(modal);
+    document.addEventListener("keydown", onKey, true);
+  }
+  return { refresh() {
+  } };
+}
+
+// render/demos/mosaic.ts
+function createMosaic(host) {
+  const wrap = document.createElement("div");
+  wrap.style.cssText = "position:absolute;inset:0;z-index:20;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:radial-gradient(60% 60% at 50% 45%,rgba(20,24,38,.35),rgba(6,8,14,.75));opacity:1;transition:opacity 350ms ease-out;";
+  const canvas = document.createElement("canvas");
+  canvas.style.cssText = "max-width:min(70vmin,620px);max-height:70vh;border-radius:8px;box-shadow:0 10px 40px rgba(0,0,0,.5);image-rendering:auto;";
+  const cap = document.createElement("div");
+  cap.style.cssText = "font:600 12px ui-monospace,Menlo,monospace;color:#9fe9ff;text-shadow:0 0 4px #000;";
+  wrap.appendChild(canvas);
+  wrap.appendChild(cap);
+  const hostPos = getComputedStyle(host).position;
+  if (hostPos === "static") host.style.position = "relative";
+  host.appendChild(wrap);
+  const ctx = canvas.getContext("2d");
+  const tmp = document.createElement("canvas");
+  const tctx = tmp.getContext("2d");
+  let cols = 1, rows = 1, cw = 0, ch = 0, count = 0, filled = 0;
+  const layout = (n, aspect = 1) => {
+    count = Math.max(1, n);
+    cols = Math.ceil(Math.sqrt(count));
+    rows = Math.ceil(count / cols);
+    const cellW = 96;
+    cw = cellW;
+    ch = Math.round(cellW / aspect);
+    canvas.width = cols * cw;
+    canvas.height = rows * ch;
+    ctx.fillStyle = "#0b0e14";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  };
+  return {
+    setCount(n) {
+      layout(n);
+    },
+    thumb(n, w, h, rgba) {
+      if (!count || cols * rows < count) layout(Math.max(count, n), w / h);
+      if (ch !== Math.round(cw / (w / h))) {
+        ch = Math.round(cw / (w / h));
+        canvas.height = rows * ch;
+        ctx.fillStyle = "#0b0e14";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+      }
+      tmp.width = w;
+      tmp.height = h;
+      tctx.putImageData(new ImageData(new Uint8ClampedArray(rgba), w, h), 0, 0);
+      const idx = Math.max(0, (n | 0) - 1) % (cols * rows);
+      const cx = idx % cols * cw, cy = Math.floor(idx / cols) * ch;
+      ctx.drawImage(tmp, cx, cy, cw, ch);
+      filled++;
+      cap.textContent = `streaming ${filled}${count ? " / " + count : ""} slices\u2026`;
+    },
+    status(msg) {
+      cap.textContent = msg;
+    },
+    done() {
+      wrap.style.opacity = "0";
+      setTimeout(() => wrap.remove(), 400);
+    },
+    reset() {
+      filled = 0;
+      count = 0;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      wrap.style.opacity = "1";
+      if (!wrap.isConnected) host.appendChild(wrap);
+    }
+  };
+}
+
 // render/vendor/idc_tools/s3.js
 var idcS3 = (bucket) => "https://" + (bucket || "idc-open-data") + ".s3.us-east-1.amazonaws.com/";
 async function fetchRetry(url, opts, tries = 6) {
@@ -2265,6 +2535,9 @@ async function s3ListKeys(prefix, bucket) {
     token = more ? xml.getElementsByTagName("NextContinuationToken")[0]?.textContent ?? null : null;
   }
   return keys;
+}
+function ohifViewerURL(studyInstanceUID) {
+  return studyInstanceUID ? `https://viewer.imaging.datacommons.cancer.gov/viewer/${studyInstanceUID}` : null;
 }
 
 // render/vendor/idc_tools/roulette.js
@@ -2446,6 +2719,30 @@ async function main() {
   globalThis.addEventListener("resize", resize);
   const grid = attachViewGrid(document.getElementById("grid"), names, resize);
   attachDoubleClick(cv.threeD, () => grid.toggleMax("threeD"));
+  const layers = { volume: true, seg: true };
+  const applyLayers = () => {
+    rs?.setLayers(layers.volume, layers.seg);
+    draw3d();
+    xhair?.redraw();
+  };
+  const controls = [
+    { label: "Volume render", get: () => layers.volume, set: (on) => {
+      layers.volume = on;
+      applyLayers();
+    } },
+    { label: "Segmentation", get: () => layers.seg, set: (on) => {
+      layers.seg = on;
+      applyLayers();
+    }, disabled: () => !rs?.hasSeg }
+  ];
+  const chrome = installChrome({ controls });
+  const mosaic = createMosaic(document.querySelector("main"));
+  let lastEntry;
+  installIdcInfo(el("details-host"), {
+    getEntry: () => lastEntry,
+    getSegments: () => rs?.segments ?? [],
+    ohifURL: ohifViewerURL
+  });
   const showMeta = (entry, sc) => {
     const info = el("info");
     if (!info) return;
@@ -2453,21 +2750,30 @@ async function main() {
     info.innerHTML = `<span class="col">${entry?.col ?? "IDC"}</span><span class="mod">${entry?.m ?? ""}</span><span class="sd">${entry?.sd ?? "segmentation"}</span><span class="n">\xB7 ${n} segment${n === 1 ? "" : "s"}${entry?.lic ? " \xB7 " + entry.lic : ""}</span>`;
   };
   const spinBtn = el("spin");
-  const onProgress = (p) => status(`${p.msg}${p.frac ? ` \u2014 ${Math.round(p.frac * 100)}%` : ""}`);
+  const handlers = {
+    onProgress: (p) => {
+      status(`${p.msg}${p.frac ? ` \u2014 ${Math.round(p.frac * 100)}%` : ""}`);
+      mosaic.status(p.msg);
+    },
+    onSliceCount: (n) => mosaic.setCount(n),
+    onThumb: (n, w, h, rgba) => mosaic.thumb(n, w, h, rgba)
+  };
   async function pickAndLoad() {
     if (SEG_PARAM) {
       cachedManifest ??= await loadManifest(MANIFEST);
       const entry = cachedManifest.rows.find((e) => e.s === SEG_PARAM || (e.s ?? "").startsWith(SEG_PARAM));
       if (!entry) throw new Error(`SEG series "${SEG_PARAM}" not found in the manifest`);
-      return loadSeries(entry, { onProgress });
+      return loadSeries(entry, handlers);
     }
-    return spinRandom({ onProgress }, { manifestUrl: MANIFEST, filter: COL_PARAM ? (e) => e.col === COL_PARAM : void 0 });
+    return spinRandom(handlers, { manifestUrl: MANIFEST, filter: COL_PARAM ? (e) => e.col === COL_PARAM : void 0 });
   }
   async function spin() {
     spinBtn.disabled = true;
+    mosaic.reset();
     status(SEG_PARAM ? "loading the requested SEG series\u2026" : COL_PARAM ? `spinning within ${COL_PARAM}\u2026` : "spinning\u2026 picking a random IDC series");
     try {
       const res = await pickAndLoad();
+      lastEntry = res.entry;
       status("baking segmentation iso shells\u2026");
       rs = buildSegrouletteScene(gpu, srgb, res.ct, res.seg);
       sliceIx = new SliceInteractor({ ijkToRAS: rs.ijkToRAS, rasLo: rs.rasLo, rasHi: rs.rasHi });
@@ -2477,13 +2783,19 @@ async function main() {
       camera.focalPoint = framed.focalPoint;
       camera.viewUp = framed.viewUp;
       camera.viewAngle = framed.viewAngle;
+      layers.volume = true;
+      layers.seg = rs.hasSeg;
+      chrome.refresh();
       showMeta(res.entry, rs);
       const d3 = document.querySelector(".lab.d3");
       if (d3) d3.textContent = rs.mode === "colorized" ? "3D \xB7 colorized volume" : rs.mode === "iso" ? "3D \xB7 SegmentField iso" : "3D \xB7 volume";
       resize();
+      mosaic.done();
       const modeNote = rs.mode === "colorized" ? ` (colorized \u2014 too many for per-segment iso)` : "";
       status(`${res.entry?.col ?? "IDC"} \xB7 ${res.entry?.m ?? ""} \xB7 ${rs.segments.length} segment${rs.segments.length === 1 ? "" : "s"}${modeNote} \xB7 scroll a slice, drag 3D to orbit \xB7 Spin for another`);
     } catch (e) {
+      mosaic.status("load failed \u2014 try Spin again");
+      mosaic.done();
       status("load failed: " + (e?.message ?? e) + " \u2014 try Spin again", true);
     } finally {
       spinBtn.disabled = false;
@@ -2530,7 +2842,13 @@ async function main() {
     camera: () => ({ position: [...camera.position], focalPoint: [...camera.focalPoint], viewUp: [...camera.viewUp] }),
     mode: () => rs?.mode ?? null,
     params: () => ({ s: SEG_PARAM, col: COL_PARAM }),
-    sliceZoom: (o) => rs?.slice.zoom(o) ?? 1
+    sliceZoom: (o) => rs?.slice.zoom(o) ?? 1,
+    hasSeg: () => rs?.hasSeg ?? false,
+    setLayers: (v, s) => {
+      rs?.setLayers(v, s);
+      draw3d();
+      xhair?.redraw();
+    }
   };
   status("SlicerLive SEGRoulette \u2014 click Spin to load a random IDC segmentation");
   await spin();
