@@ -482,6 +482,103 @@ var SliceRenderer = class {
   }
 };
 
+// render/slice-interactor.ts
+var NORMAL = {
+  axial: { axis: 2, sign: 1 },
+  // sliceToRAS col2 = +S
+  coronal: { axis: 1, sign: 1 },
+  // sliceToRAS col2 = +A
+  sagittal: { axis: 0, sign: -1 }
+  // sliceToRAS col2 = -R
+};
+function ijkAxisForRasAxis2(ijkToRAS, rasAxis) {
+  let best = 0, bestMag = -1;
+  for (let c = 0; c < 3; c++) {
+    const mag = Math.abs(ijkToRAS[rasAxis * 4 + c]);
+    if (mag > bestMag) {
+      bestMag = mag;
+      best = c;
+    }
+  }
+  return best;
+}
+function sliceSpacingFor(orient, ijkToRAS) {
+  const n = NORMAL[orient].axis;
+  const a = ijkAxisForRasAxis2(ijkToRAS, n);
+  return Math.hypot(ijkToRAS[a], ijkToRAS[4 + a], ijkToRAS[8 + a]);
+}
+function sliceBoundsFor(orient, rasLo, rasHi) {
+  const { axis, sign } = NORMAL[orient];
+  return sign > 0 ? [rasLo[axis], rasHi[axis]] : [-rasHi[axis], -rasLo[axis]];
+}
+function offset01ToMm(orient, offset01, rasLo, rasHi) {
+  const { axis, sign } = NORMAL[orient];
+  return sign * (rasLo[axis] + offset01 * (rasHi[axis] - rasLo[axis]));
+}
+function mmToOffset01(orient, mm, rasLo, rasHi) {
+  const { axis, sign } = NORMAL[orient];
+  const ras = sign * mm;
+  const span = rasHi[axis] - rasLo[axis];
+  return span === 0 ? 0.5 : (ras - rasLo[axis]) / span;
+}
+var SliceInteractor = class {
+  constructor(geom) {
+    this.geom = geom;
+  }
+  geom;
+  setGeometry(g) {
+    this.geom = g;
+  }
+  spacing(orient) {
+    return sliceSpacingFor(orient, this.geom.ijkToRAS);
+  }
+  bounds(orient) {
+    return sliceBoundsFor(orient, this.geom.rasLo, this.geom.rasHi);
+  }
+  /** vtkMRMLSliceIntersectionWidget::MoveSlice — returns the NEW offset01, or the
+   *  unchanged one if the step would leave the slice bounds (Slicer rejects, not clamps). */
+  moveSlice(orient, offset01, deltaMm) {
+    const { rasLo, rasHi } = this.geom;
+    const cur = offset01ToMm(orient, offset01, rasLo, rasHi);
+    const next = cur + deltaMm;
+    const [lo, hi] = this.bounds(orient);
+    if (next < lo || next > hi) return offset01;
+    return mmToOffset01(orient, next, rasLo, rasHi);
+  }
+  incrementSlice(orient, offset01) {
+    return this.moveSlice(orient, offset01, this.spacing(orient));
+  }
+  decrementSlice(orient, offset01) {
+    return this.moveSlice(orient, offset01, -this.spacing(orient));
+  }
+  /** Map a wheel event to a step. Returns the new offset01. */
+  wheel(orient, offset01, forward) {
+    return forward ? this.incrementSlice(orient, offset01) : this.decrementSlice(orient, offset01);
+  }
+  /** Slicer's slice-view keyboard bindings. Returns the new offset01 (unchanged if the
+   *  key isn't a stepping key). `key` is a DOM KeyboardEvent.key value. */
+  key(orient, offset01, key) {
+    switch (key) {
+      case "f":
+      case "F":
+      case "ArrowRight":
+      case "ArrowUp":
+        return this.incrementSlice(orient, offset01);
+      case "b":
+      case "B":
+      case "ArrowLeft":
+      case "ArrowDown":
+        return this.decrementSlice(orient, offset01);
+      default:
+        return offset01;
+    }
+  }
+  /** True if this key is one Slicer's slice view consumes for stepping. */
+  static isStepKey(key) {
+    return ["f", "F", "b", "B", "ArrowRight", "ArrowLeft", "ArrowUp", "ArrowDown"].includes(key);
+  }
+};
+
 // render/scene-renderer.ts
 var DEFAULT_FORMAT2 = "rgba8unorm-srgb";
 var SCENE_FLOATS = 16;
@@ -1966,6 +2063,135 @@ function framedCamera(center, radius, distMul = 2.6) {
   );
 }
 
+// render/demos/slice-control.ts
+function attachSliceControls(canvas, cfg) {
+  const SCROLL_PX = cfg.scrollPx ?? 7;
+  const h = cfg.hooks ?? {};
+  const uv = (e) => {
+    const r = canvas.getBoundingClientRect();
+    return { u: (e.clientX - r.left) / r.width, v: (e.clientY - r.top) / r.height, w: r.width, h: r.height };
+  };
+  let lastDown = 0, lastX = 0, lastY = 0;
+  let view = null;
+  let scroll = null;
+  let grabbed = null;
+  const onContext = (e) => e.preventDefault();
+  const onWheel = (e) => {
+    e.preventDefault();
+    if (e.ctrlKey || e.metaKey) {
+      const { u, v, w, h: hh } = uv(e);
+      cfg.getSlice().zoomAbout(cfg.orient, Math.exp(-e.deltaY * 15e-4), u, v, w, hh);
+      cfg.redraw();
+      h.onZoom?.();
+      return;
+    }
+    cfg.step(e.deltaY < 0);
+    cfg.redraw();
+    h.onScroll?.(e.deltaY < 0);
+  };
+  const onDown = (e) => {
+    if (e.button === 0) {
+      const now = e.timeStamp, dbl = now - lastDown < 350 && Math.hypot(e.clientX - lastX, e.clientY - lastY) < 6;
+      lastDown = dbl ? 0 : now;
+      lastX = e.clientX;
+      lastY = e.clientY;
+      if (dbl && h.onDoubleClick?.()) {
+        e.preventDefault();
+        return;
+      }
+    }
+    const wantPan = e.button === 1 || e.button === 0 && e.shiftKey;
+    const wantZoom = e.button === 2;
+    if (wantPan || wantZoom) {
+      e.preventDefault();
+      const { u: u2, v: v2 } = uv(e);
+      view = { mode: wantZoom ? "zoom" : "pan", x: e.clientX, y: e.clientY, pu: u2, pv: v2 };
+      canvas.style.cursor = wantZoom ? "ns-resize" : "grabbing";
+      canvas.setPointerCapture(e.pointerId);
+      return;
+    }
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const { u, v, w, h: hh } = uv(e);
+    if (h.onLeftGrab?.(u, v, w, hh)) {
+      grabbed = { moved: 0 };
+    } else scroll = { x: e.clientX, y: e.clientY, acc: 0 };
+    canvas.setPointerCapture(e.pointerId);
+  };
+  const onMove = (e) => {
+    if (view) {
+      const dx = e.clientX - view.x, dy = e.clientY - view.y;
+      const r = canvas.getBoundingClientRect();
+      if (view.mode === "pan") cfg.getSlice().panByPixels(cfg.orient, dx, dy, r.width, r.height);
+      else cfg.getSlice().zoomAbout(cfg.orient, Math.exp(dy * 6e-3), view.pu, view.pv, r.width, r.height);
+      view.x = e.clientX;
+      view.y = e.clientY;
+      cfg.redraw();
+      return;
+    }
+    if (grabbed) {
+      grabbed.moved += Math.abs(e.movementX) + Math.abs(e.movementY);
+      const { u, v, w, h: hh } = uv(e);
+      h.onLeftDrag?.(u, v, w, hh);
+      return;
+    }
+    if (scroll) {
+      scroll.acc += e.clientX - scroll.x - (e.clientY - scroll.y);
+      scroll.x = e.clientX;
+      scroll.y = e.clientY;
+      while (Math.abs(scroll.acc) >= SCROLL_PX) {
+        const f = scroll.acc > 0;
+        cfg.step(f);
+        scroll.acc -= f ? SCROLL_PX : -SCROLL_PX;
+      }
+      cfg.redraw();
+      return;
+    }
+    if (e.buttons === 0 && h.onHover) {
+      const { u, v, w, h: hh } = uv(e);
+      h.onHover(u, v, w, hh);
+    }
+  };
+  const onUp = (e) => {
+    try {
+      canvas.releasePointerCapture(e.pointerId);
+    } catch {
+    }
+    if (view) {
+      view = null;
+      canvas.style.cursor = "default";
+      return;
+    }
+    if (grabbed) {
+      const m = grabbed.moved;
+      grabbed = null;
+      h.onLeftDrop?.(m);
+      return;
+    }
+    scroll = null;
+  };
+  canvas.addEventListener("contextmenu", onContext);
+  canvas.addEventListener("wheel", onWheel, { passive: false });
+  canvas.addEventListener("pointerdown", onDown);
+  canvas.addEventListener("pointermove", onMove);
+  canvas.addEventListener("pointerup", onUp);
+  canvas.addEventListener("pointercancel", onUp);
+  return {
+    resetView() {
+      cfg.getSlice().resetView(cfg.orient);
+      cfg.redraw();
+    },
+    detach() {
+      canvas.removeEventListener("contextmenu", onContext);
+      canvas.removeEventListener("wheel", onWheel);
+      canvas.removeEventListener("pointerdown", onDown);
+      canvas.removeEventListener("pointermove", onMove);
+      canvas.removeEventListener("pointerup", onUp);
+      canvas.removeEventListener("pointercancel", onUp);
+    }
+  };
+}
+
 // render/vendor/idc_tools/s3.js
 var idcS3 = (bucket) => "https://" + (bucket || "idc-open-data") + ".s3.us-east-1.amazonaws.com/";
 async function fetchRetry(url, opts, tries = 6) {
@@ -2150,6 +2376,7 @@ async function main() {
     { cell: "sagittal", orient: "sagittal" }
   ];
   let rs = null;
+  let sliceIx = null;
   const off = { axial: 0.5, coronal: 0.5, sagittal: 0.5 };
   const camera = framedCamera([0, 0, 0], 100);
   const drawSlice = (p) => {
@@ -2210,6 +2437,7 @@ async function main() {
       const res = await pickAndLoad();
       status("baking segmentation iso shells\u2026");
       rs = buildSegrouletteScene(gpu, srgb, res.ct, res.seg);
+      sliceIx = new SliceInteractor({ ijkToRAS: rs.ijkToRAS, rasLo: rs.rasLo, rasHi: rs.rasHi });
       for (const p of planes) off[p.cell] = slicerDefaultOffset01(p.orient, rs.dims, rs.ijkToRAS, rs.rasLo, rs.rasHi);
       const framed = framedCamera(rs.center, rs.radius);
       camera.position = framed.position;
@@ -2232,12 +2460,17 @@ async function main() {
   if (SEG_PARAM) spinBtn.textContent = "\u21BB Reload";
   else if (COL_PARAM) spinBtn.textContent = `\u{1F3B2} ${COL_PARAM}`;
   for (const p of planes) {
-    cv[p.cell].addEventListener("wheel", (e) => {
-      e.preventDefault();
-      off[p.cell] = Math.max(0, Math.min(1, off[p.cell] + (e.deltaY > 0 ? 0.015 : -0.015)));
-      drawSlice(p);
-      xhair?.redraw();
-    }, { passive: false });
+    attachSliceControls(cv[p.cell], {
+      orient: p.orient,
+      getSlice: () => rs.slice,
+      step: (fwd) => {
+        if (sliceIx) off[p.cell] = sliceIx.wheel(p.orient, off[p.cell], fwd);
+      },
+      redraw: () => {
+        drawSlice(p);
+        xhair?.redraw();
+      }
+    });
   }
   attachCameraControls(cv.threeD, camera, { onChange: () => {
     draw3d();
@@ -2259,7 +2492,8 @@ async function main() {
     pick3D: (u, v) => rs?.scene.pick(u, v) ?? null,
     camera: () => ({ position: [...camera.position], focalPoint: [...camera.focalPoint], viewUp: [...camera.viewUp] }),
     mode: () => rs?.mode ?? null,
-    params: () => ({ s: SEG_PARAM, col: COL_PARAM })
+    params: () => ({ s: SEG_PARAM, col: COL_PARAM }),
+    sliceZoom: (o) => rs?.slice.zoom(o) ?? 1
   };
   status("SlicerLive SEGRoulette \u2014 click Spin to load a random IDC segmentation");
   await spin();
