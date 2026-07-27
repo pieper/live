@@ -173,7 +173,7 @@ struct U {
   origin : vec4<f32>,    // RAS of the plane center (for the current scrub offset)
   uvec : vec4<f32>,      // RAS vector spanning the view width  (isotropic mm)
   vvec : vec4<f32>,      // RAS vector spanning the view height (isotropic mm)
-  params : vec4<f32>,    // win, lev, overlayOpacity, _
+  params : vec4<f32>,    // win, lev, overlayOpacity, outlineMode(0/1)
   size : vec4<f32>,      // sizeX, sizeY, _, _
 };
 @group(0) @binding(0) var<uniform> u : U;
@@ -192,6 +192,11 @@ fn srgb2physical(c : vec3<f32>) -> vec3<f32> {
   let lo = c / 12.92; let hi = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
   return select(lo, hi, c > vec3<f32>(0.04045));
 }
+fn ov_at(ras : vec3<f32>) -> vec4<f32> {   // overlay at a RAS point (0 outside the volume)
+  let t = (u.p2t * vec4<f32>(ras, 1.0)).xyz;
+  if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { return vec4<f32>(0.0); }
+  return textureSampleLevel(t_overlay, s_lin, t, 0.0);
+}
 @fragment
 fn fs_main(v : V) -> @location(0) vec4<f32> {
   let uv = v.position.xy / u.size.xy;                 // [0,1], y down
@@ -204,7 +209,16 @@ fn fs_main(v : V) -> @location(0) vec4<f32> {
   let g = clamp((val - (u.params.y - win * 0.5)) / win, 0.0, 1.0);
   var col = vec3<f32>(g);
   let ov = textureSampleLevel(t_overlay, s_lin, tex, 0.0);
-  col = mix(col, ov.rgb, clamp(ov.a * u.params.z, 0.0, 1.0));
+  var ovA = clamp(ov.a * u.params.z, 0.0, 1.0);
+  if (u.params.w > 0.5) {   // OUTLINE mode: keep the overlay only at segment boundaries (screen-space)
+    let du = u.uvec.xyz / u.size.x * 1.5;   // ~1.5 px right, in RAS
+    let dv = u.vvec.xyz / u.size.y * 1.5;   // ~1.5 px up
+    let n0 = ov_at(ras + du); let n1 = ov_at(ras - du); let n2 = ov_at(ras + dv); let n3 = ov_at(ras - dv);
+    let e = max(max(distance(n0.rgb, ov.rgb) + abs(n0.a - ov.a), distance(n1.rgb, ov.rgb) + abs(n1.a - ov.a)),
+                max(distance(n2.rgb, ov.rgb) + abs(n2.a - ov.a), distance(n3.rgb, ov.rgb) + abs(n3.a - ov.a)));
+    ovA = ovA * clamp((e - 0.03) * 12.0, 0.0, 1.0);   // 0 in the interior, full at a colour/label edge
+  }
+  col = mix(col, ov.rgb, ovA);
   return vec4<f32>(srgb2physical(col), 1.0);
 }
 `
@@ -323,6 +337,10 @@ var SliceRenderer = class {
   }
   setOverlayOpacity(o) {
     this.u[30] = o;
+  }
+  /** Overlay draw mode: false = FILL (solid coloured regions), true = OUTLINE (segment boundaries only). */
+  setOverlayOutline(on) {
+    this.u[31] = on ? 1 : 0;
   }
   /** Physical size (mm) of the square view for the current plane (isotropic, letterboxed).
    *  Matches Slicer's FitSliceToBackground: the field of view is exactly the volume's
@@ -2729,9 +2747,14 @@ async function main() {
   const grid = attachViewGrid(document.getElementById("grid"), names, resize);
   attachDoubleClick(cv.threeD, () => grid.toggleMax("threeD"));
   const layers = { volume: true, seg: true };
+  let sliceOutline = false;
   const applyLayers = () => {
     rs?.setLayers(layers.volume, layers.seg);
     draw3d();
+    xhair?.redraw();
+  };
+  const redrawSlices = () => {
+    for (const p of planes) drawSlice(p);
     xhair?.redraw();
   };
   const controls = [
@@ -2742,6 +2765,11 @@ async function main() {
     { label: "Segmentation", get: () => layers.seg, set: (on) => {
       layers.seg = on;
       applyLayers();
+    }, disabled: () => !rs?.hasSeg },
+    { label: "Slice outline", get: () => sliceOutline, set: (on) => {
+      sliceOutline = on;
+      rs?.slice.setOverlayOutline(on);
+      redrawSlices();
     }, disabled: () => !rs?.hasSeg }
   ];
   const chrome = installChrome({ controls });
@@ -2794,6 +2822,7 @@ async function main() {
       camera.viewAngle = framed.viewAngle;
       layers.volume = true;
       layers.seg = rs.hasSeg;
+      rs.slice.setOverlayOutline(sliceOutline);
       chrome.refresh();
       showMeta(res.entry, rs);
       const d3 = document.querySelector(".lab.d3");
@@ -2857,6 +2886,10 @@ async function main() {
       rs?.setLayers(v, s);
       draw3d();
       xhair?.redraw();
+    },
+    setOutline: (on) => {
+      rs?.slice.setOverlayOutline(on);
+      for (const p of planes) drawSlice(p);
     }
   };
   status("SlicerLive SEGRoulette \u2014 click Spin to load a random IDC segmentation");
