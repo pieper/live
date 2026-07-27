@@ -177,6 +177,15 @@ var SceneRenderer = class _SceneRenderer {
   matBuf;
   mat;
   bind;
+  // PICK pass: a 1x1 ray-trace that reuses the field compositing to find the RAS point where
+  // front-to-back opacity first crosses 50% (Slicer's 3D volume pick). Ghost handles excluded.
+  pickPipeline;
+  pickBind;
+  pickOff = 0;
+  // mat[] offset of the pick_cursor uniform (NDC)
+  pickTarget;
+  // 1x1 rgba32float (wp.xyz, hit)
+  pickReadBuf;
   /** Emit a default AABB-distance skip for fields that don't supply their own bound.
    *
    *  OFF because it MEASURED AS A NET LOSS (render/test/profile-boxskip.ts, 448², M-series):
@@ -217,15 +226,24 @@ var SceneRenderer = class _SceneRenderer {
       return p;
     });
     this.clipOff = uoff;
-    this.mat = new Float32Array(uoff + CLIP_FLOATS);
-    this.matBuf = this.dev.createBuffer({ size: (uoff + CLIP_FLOATS) * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.pickOff = uoff + CLIP_FLOATS;
+    this.mat = new Float32Array(uoff + CLIP_FLOATS + 4);
+    this.matBuf = this.dev.createBuffer({ size: (uoff + CLIP_FLOATS + 4) * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const module = this.dev.createShaderModule({ code: this.wgsl() });
     this.pipeline = this.dev.createRenderPipeline({
       layout: "auto",
-      vertex: { module: this.dev.createShaderModule({ code: this.wgsl() }), entryPoint: "vs_main" },
-      fragment: { module: this.dev.createShaderModule({ code: this.wgsl() }), entryPoint: "fs_main", targets: [{ format: this.format }] },
+      vertex: { module, entryPoint: "vs_main" },
+      fragment: { module, entryPoint: "fs_main", targets: [{ format: this.format }] },
+      primitive: { topology: "triangle-list", cullMode: "none" }
+    });
+    this.pickPipeline = this.dev.createRenderPipeline({
+      layout: "auto",
+      vertex: { module, entryPoint: "vs_main" },
+      fragment: { module, entryPoint: "fs_pick", targets: [{ format: "rgba32float" }] },
       primitive: { topology: "triangle-list", cullMode: "none" }
     });
     this.bind = this.dev.createBindGroup({ layout: this.pipeline.getBindGroupLayout(0), entries: this.bindGroupEntries() });
+    if (this.pickPipeline) this.pickBind = this.dev.createBindGroup({ layout: this.pickPipeline.getBindGroupLayout(0), entries: this.bindGroupEntries() });
     this.setBackground(0.07, 0.08, 0.12);
     const step = this.placed.length ? Math.min(...this.placed.map((p) => p.field.sampleStep())) : 1;
     this.setSampleStep(step * 0.7);
@@ -294,6 +312,9 @@ fn skip_${p.field.kind}${p.slot}(wp : vec3<f32>) -> f32 {
       (p) => ghostCanSkip.has(p.field) ? skipBranch(p, false, true) : plainBranch(p, false, true)
     ).join("\n");
     const hasGhost = ghostFields.length > 0;
+    const pickDispatch = normalReceivers.map(
+      (p) => `    ${clipGuard(p, `{ let c = sample_field_${p.field.kind}${p.slot}(wp, rd); sum += c; }`)}`
+    ).join("\n");
     return (
       /* wgsl */
       `
@@ -306,6 +327,7 @@ struct Material {
 ${members}
   clip_planes : array<vec4<f32>, 8>,   // (nx, ny, nz, offset) inward; tail so field offsets are stable
   clip_count : vec4<f32>,              // (count, _, _, _)
+  pick_cursor : vec4<f32>,             // (ndc_x, ndc_y, _, _) \u2014 the ray for fs_pick
 };
 @group(0) @binding(0) var<uniform> u_cam : Camera;
 @group(0) @binding(1) var<uniform> u_material : Material;
@@ -394,6 +416,47 @@ ${ghostDispatch}
     integrated = vec4<f32>(integrated.rgb * residual + (1.0 - fA) * g_col * ga, fA + (1.0 - fA) * ga);
   }
   return vec4<f32>(mix(bg, integrated.rgb, integrated.a), 1.0);
+}
+
+// PICK: trace the cursor ray (pick_cursor NDC) through the SAME field compositing and return the
+// world (RAS) position where front-to-back opacity first crosses 50% \u2014 Slicer's 3D volume pick.
+// Output: (wp.x, wp.y, wp.z, hit). hit=0 means the ray never reached 50% (empty/miss).
+@fragment
+fn fs_pick() -> @location(0) vec4<f32> {
+  let ro = ndc_to_world(vec4<f32>(u_material.pick_cursor.x, u_material.pick_cursor.y, 0.0, 1.0));
+  let rd = normalize(ndc_to_world(vec4<f32>(u_material.pick_cursor.x, u_material.pick_cursor.y, 1.0, 1.0)) - ro);
+  let inv = vec3<f32>(1.0) / rd;
+  let tb = (u_material.bmin.xyz - ro) * inv;
+  let tt = (u_material.bmax.xyz - ro) * inv;
+  let tmn = min(tt, tb); let tmx = max(tt, tb);
+  var t_near = max(max(tmn.x, tmn.y), tmn.z);
+  var t_far  = min(min(tmx.x, tmx.y), tmx.z);
+  if (t_far <= t_near || t_far <= 0.0) { return vec4<f32>(0.0); }
+  let step = max(u_material.scene.x, 1e-3);
+  t_near = max(t_near + step, 0.0);
+  t_far  = t_far - step;
+  var t = t_near;
+  var acc = 0.0;
+  var safety : i32 = 0;
+  loop {
+    if (t >= t_far || safety >= 5000 || acc >= 0.5) { break; }
+    let wp = ro + rd * t;
+    var clipped = false;
+    let ccount = u32(u_material.clip_count.x);
+    for (var ci = 0u; ci < ccount; ci = ci + 1u) {
+      let cp = u_material.clip_planes[ci];
+      if (dot(wp, cp.xyz) + cp.w < 0.0) { clipped = true; break; }
+    }
+    var sum = vec4<f32>(0.0);
+${pickDispatch}
+    if (sum.a > 0.0) {
+      let a_new = acc + (1.0 - acc) * clamp(sum.a, 0.0, 1.0);
+      if (a_new >= 0.5) { return vec4<f32>(wp, 1.0); }   // 50% crossing -> the pick point
+      acc = a_new;
+    }
+    t = t + step;
+  }
+  return vec4<f32>(0.0);
 }`
     );
   }
@@ -468,6 +531,7 @@ ${ghostDispatch}
    *  swapped a texture) without recompiling the pipeline. Field set/structure must be unchanged. */
   refreshBindings() {
     this.bind = this.dev.createBindGroup({ layout: this.pipeline.getBindGroupLayout(0), entries: this.bindGroupEntries() });
+    if (this.pickPipeline) this.pickBind = this.dev.createBindGroup({ layout: this.pickPipeline.getBindGroupLayout(0), entries: this.bindGroupEntries() });
   }
   /** Only fields with texture bindings use the shared sampler. `layout: "auto"` derives the
    *  layout from what the shader ACTUALLY references, so in a scene of purely procedural
@@ -502,6 +566,32 @@ ${ghostDispatch}
   }
   flush() {
     this.dev.queue.writeBuffer(this.matBuf, 0, this.mat);
+  }
+  /** Ray-trace the cursor (u,v in [0,1], y down) through the composited fields and return the
+   *  RAS point where front-to-back opacity first reaches 50% — Slicer's 3D volume pick. Traces
+   *  whatever renders (DVR volumes, SegmentField iso shells, RGBA), EXCLUDING ghost handles.
+   *  Uses the camera set by the last setCamera(); returns null if the ray never reaches 50%. */
+  async pick(u, v) {
+    if (!this.pickPipeline || !this.pickBind || !this.placed.length) return null;
+    this.mat[this.pickOff] = u * 2 - 1;
+    this.mat[this.pickOff + 1] = 1 - v * 2;
+    this.flush();
+    if (!this.pickTarget) {
+      this.pickTarget = this.dev.createTexture({ size: [1, 1], format: "rgba32float", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+      this.pickReadBuf = this.dev.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    }
+    const enc = this.dev.createCommandEncoder();
+    const pass = enc.beginRenderPass({ colorAttachments: [{ view: this.pickTarget.createView(), loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
+    pass.setPipeline(this.pickPipeline);
+    pass.setBindGroup(0, this.pickBind);
+    pass.draw(3);
+    pass.end();
+    enc.copyTextureToBuffer({ texture: this.pickTarget }, { buffer: this.pickReadBuf, bytesPerRow: 256, rowsPerImage: 1 }, [1, 1]);
+    this.dev.queue.submit([enc.finish()]);
+    await this.pickReadBuf.mapAsync(GPUMapMode.READ);
+    const r = new Float32Array(this.pickReadBuf.getMappedRange().slice(0, 16));
+    this.pickReadBuf.unmap();
+    return r[3] > 0.5 ? [r[0], r[1], r[2]] : null;
   }
   renderToView(view, width, height) {
     this.flush();
@@ -574,316 +664,6 @@ ${ghostDispatch}
     target.destroy();
     buf.destroy();
     return out;
-  }
-};
-
-// render/fiducial-field.ts
-var MAX = 64;
-var FiducialField = class {
-  kind = "fid";
-  bindingCount = 0;
-  // procedural — all state lives in the uniform block
-  spheres = new Float32Array(MAX * 4);
-  // (cx,cy,cz,radius)
-  colors = new Float32Array(MAX * 4);
-  // (r,g,b,a)
-  n = 0;
-  maxR = 0;
-  // largest radius in this field (for the skip bound)
-  clippable;
-  ghost;
-  providesSkip;
-  // off in screen-space mode (radius varies with the camera)
-  screen;
-  sh;
-  ka;
-  kd;
-  ks;
-  light;
-  constructor(spheres = [], opts = {}) {
-    this.setSpheres(spheres);
-    this.sh = opts.shininess ?? 80;
-    this.ka = opts.kAmbient ?? 0.2;
-    this.kd = opts.kDiffuse ?? 0.85;
-    this.ks = opts.kSpecular ?? 0.5;
-    this.light = opts.lightColor ?? [1, 1, 1];
-    this.clippable = opts.clippable ?? true;
-    this.ghost = opts.ghost ?? false;
-    this.screen = opts.screenSpace ?? false;
-    this.providesSkip = true;
-  }
-  setSpheres(list) {
-    this.n = Math.min(list.length, MAX);
-    this.spheres.fill(0);
-    this.colors.fill(0);
-    this.maxR = 0;
-    for (let i = 0; i < this.n; i++) {
-      const s = list[i];
-      this.spheres.set([s.center[0], s.center[1], s.center[2], s.radius], i * 4);
-      this.colors.set(s.color, i * 4);
-      this.maxR = Math.max(this.maxR, s.radius);
-    }
-  }
-  get count() {
-    return this.n;
-  }
-  uniformFloats() {
-    return 12 + MAX * 4 * 2;
-  }
-  // params(4)+params2(4)+light(4) + spheres + colors
-  sampleStep() {
-    return 1;
-  }
-  aabb() {
-    if (this.n === 0) return [[-1, -1, -1], [1, 1, 1]];
-    const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
-    for (let i = 0; i < this.n; i++) {
-      const r = this.screen ? 0 : this.spheres[i * 4 + 3];
-      for (let a = 0; a < 3; a++) {
-        lo[a] = Math.min(lo[a], this.spheres[i * 4 + a] - r);
-        hi[a] = Math.max(hi[a], this.spheres[i * 4 + a] + r);
-      }
-    }
-    if (this.screen) {
-      const diag = Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);
-      const m = Math.max(40, diag * 0.15);
-      for (let a = 0; a < 3; a++) {
-        lo[a] -= m;
-        hi[a] += m;
-      }
-    }
-    return [lo, hi];
-  }
-  structMembers(s) {
-    return [
-      `  fid${s}_params : vec4<f32>,`,
-      // n_spheres, visible, shininess, k_ambient
-      `  fid${s}_params2 : vec4<f32>,`,
-      // k_diffuse, k_specular, max_radius, _
-      `  fid${s}_light : vec4<f32>,`,
-      // light_color.rgb, _
-      `  fid${s}_spheres : array<vec4<f32>, ${MAX}>,`,
-      `  fid${s}_colors : array<vec4<f32>, ${MAX}>,`
-    ].join("\n");
-  }
-  declareBindings(_s, _base) {
-    return "";
-  }
-  bindEntries(_s, _base) {
-    return [];
-  }
-  // --- empty-space skipping -------------------------------------------------
-  // The spheres are an exact SDF, so we can hand the ray-marcher a real distance to
-  // leap. Conservative form: nearest-CENTRE distance minus the field's LARGEST radius.
-  // Since min_j(d_j) <= d_k and max_r >= r_k for every k, this never exceeds the true
-  // min_k(d_k - r_k) — so it can't skip over a sphere — and it costs only squared
-  // distances in the loop plus ONE sqrt at the end (cheaper than the sampling loop).
-  // (providesSkip is false in screen-space mode — the world radius varies with the camera.)
-  skipWGSL(s) {
-    if (this.screen) {
-      return (
-        /* wgsl */
-        `
-fn skip_fid${s}(wp : vec3<f32>) -> f32 {
-  let n = i32(u_material.fid${s}_params.x);
-  if (n <= 0) { return 1.0e6; }
-  var best = 1.0e12;
-  for (var k = 0; k < n; k = k + 1) {
-    let sp = u_material.fid${s}_spheres[k];
-    if (sp.w <= 0.0) { continue; }
-    let r = sp.w * length(u_cam.eye.xyz - sp.xyz) / max(u_cam.size.z, 1.0);
-    best = min(best, length(wp - sp.xyz) - r);
-  }
-  return max(best, 0.0);
-}`
-      );
-    }
-    return (
-      /* wgsl */
-      `
-fn skip_fid${s}(wp : vec3<f32>) -> f32 {
-  let n = i32(u_material.fid${s}_params.x);
-  if (n <= 0) { return 1.0e6; }        // nothing here: unbounded empty space
-  var min_d2 = 1.0e12;
-  for (var k = 0; k < n; k = k + 1) {
-    let sp = u_material.fid${s}_spheres[k];
-    if (sp.w <= 0.0) { continue; }
-    let dv = wp - sp.xyz;
-    min_d2 = min(min_d2, dot(dv, dv));
-  }
-  return max(sqrt(min_d2) - u_material.fid${s}_params2.z, 0.0);
-}`
-    );
-  }
-  samplingWGSL(s) {
-    return (
-      /* wgsl */
-      `
-fn sample_field_fid${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
-  // an attached TransformField warps where the spheres appear (slicer_wgpu parity)
-  let wp_r = transform_point_fid${s}(wp);
-  let n = i32(u_material.fid${s}_params.x);
-  var best_depth = -1.0;
-  var best_center = vec3<f32>(0.0);
-  var best_color = vec4<f32>(0.0);
-  var found = false;
-  for (var k = 0; k < n; k = k + 1) {
-    let sp = u_material.fid${s}_spheres[k];
-    if (sp.w <= 0.0) { continue; }
-    // screen-space: sp.w is a PIXEL radius -> world radius = px * distance(eye) / focal_px,
-    // so the sphere stays a constant size on screen. Otherwise sp.w is a world radius.
-    ${this.screen ? `let r = sp.w * length(u_cam.eye.xyz - sp.xyz) / max(u_cam.size.z, 1.0);` : `let r = sp.w;`}
-    let depth = r - length(wp_r - sp.xyz);   // > 0 -> inside this sphere
-    if (depth > best_depth) { best_depth = depth; best_center = sp.xyz; best_color = u_material.fid${s}_colors[k]; found = true; }
-  }
-  if (!found || best_depth <= 0.0) { return vec4<f32>(0.0); }
-
-  let to_wp = wp_r - best_center;
-  var n_hat = to_wp / max(length(to_wp), 1e-6);
-  if (dot(n_hat, -rd) < 0.0) { n_hat = -n_hat; }
-  let view_dir = normalize(-rd);            // headlight (== normalize(ray_origin - wp) for t>0)
-  let ldotn = max(dot(view_dir, n_hat), 0.0);
-  let refl = normalize(2.0 * ldotn * n_hat - view_dir);
-  let rdotv = max(dot(refl, view_dir), 0.0);
-
-  let sh = u_material.fid${s}_params.z;
-  let ka = u_material.fid${s}_params.w; let kd = u_material.fid${s}_params2.x; let ks = u_material.fid${s}_params2.y;
-  let base = best_color.rgb;
-  let highlight = mix(base, u_material.fid${s}_light.rgb, 0.85);
-  let lit = base * ka + base * (kd * ldotn) + highlight * (ks * pow(rdotv, sh));
-  let col = srgb2physical(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)));
-  let opacity = clamp(best_color.a, 0.0, 1.0);
-  return vec4<f32>(col * opacity, opacity);
-}`
-    );
-  }
-  fillUniforms(out, off) {
-    out[off + 0] = this.n;
-    out[off + 1] = 1;
-    out[off + 2] = this.sh;
-    out[off + 3] = this.ka;
-    out[off + 4] = this.kd;
-    out[off + 5] = this.ks;
-    out[off + 6] = this.maxR;
-    out[off + 8] = this.light[0];
-    out[off + 9] = this.light[1];
-    out[off + 10] = this.light[2];
-    out.set(this.spheres, off + 12);
-    out.set(this.colors, off + 12 + MAX * 4);
-  }
-};
-
-// render/roi-box-field.ts
-var RoiBoxField = class {
-  kind = "roi";
-  bindingCount = 0;
-  // procedural — all state in the uniform block
-  clippable = false;
-  // the frame sits on the clip planes; never clip it
-  providesSkip = true;
-  // sparse SDF -> cheap via empty-space skipping
-  center;
-  half;
-  color;
-  opacity;
-  bar;
-  constructor(center, half, opts = {}) {
-    this.center = [...center];
-    this.half = [...half];
-    this.color = opts.color ?? [1, 0.85, 0.25];
-    this.opacity = opts.opacity ?? 1;
-    this.bar = opts.barHalfMm ?? 1.5;
-  }
-  /** Update the box (a drag) — caller does scene.syncUniforms() + redraw. */
-  setBox(center, half) {
-    this.center = [...center];
-    this.half = [...half];
-  }
-  get boxCenter() {
-    return [...this.center];
-  }
-  get boxHalf() {
-    return [...this.half];
-  }
-  uniformFloats() {
-    return 16;
-  }
-  // center(4) + half(4) + color(4) + params(4)
-  sampleStep() {
-    return Math.max(0.5 * this.bar, 0.25);
-  }
-  aabb() {
-    const m = this.bar + 0.5;
-    return [
-      [this.center[0] - this.half[0] - m, this.center[1] - this.half[1] - m, this.center[2] - this.half[2] - m],
-      [this.center[0] + this.half[0] + m, this.center[1] + this.half[1] + m, this.center[2] + this.half[2] + m]
-    ];
-  }
-  structMembers(s) {
-    return [
-      `  roi${s}_center : vec4<f32>,`,
-      // cx,cy,cz,_
-      `  roi${s}_half : vec4<f32>,`,
-      // hx,hy,hz,_
-      `  roi${s}_color : vec4<f32>,`,
-      // rgb, opacity
-      `  roi${s}_params : vec4<f32>,`
-      // bar_half, _, _, _
-    ].join("\n");
-  }
-  declareBindings() {
-    return "";
-  }
-  bindEntries() {
-    return [];
-  }
-  samplingWGSL(s) {
-    return (
-      /* wgsl */
-      `
-fn sd_box_frame${s}(p0 : vec3<f32>, b : vec3<f32>, e : f32) -> f32 {
-  let p = abs(p0) - b;
-  let q = abs(p + vec3<f32>(e)) - vec3<f32>(e);
-  return min(min(
-    length(max(vec3<f32>(p.x, q.y, q.z), vec3<f32>(0.0))) + min(max(p.x, max(q.y, q.z)), 0.0),
-    length(max(vec3<f32>(q.x, p.y, q.z), vec3<f32>(0.0))) + min(max(q.x, max(p.y, q.z)), 0.0)),
-    length(max(vec3<f32>(q.x, q.y, p.z), vec3<f32>(0.0))) + min(max(q.x, max(q.y, p.z)), 0.0));
-}
-fn sd_roi${s}(wp : vec3<f32>) -> f32 {
-  return sd_box_frame${s}(wp - u_material.roi${s}_center.xyz, u_material.roi${s}_half.xyz, u_material.roi${s}_params.x);
-}
-fn skip_roi${s}(wp : vec3<f32>) -> f32 {
-  // exact exterior distance to the bars, minus a bar-width margin (stays conservative)
-  return max(sd_roi${s}(wp) - u_material.roi${s}_params.x, 0.0);
-}
-fn sample_field_roi${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
-  let op0 = u_material.roi${s}_color.a;
-  if (op0 <= 0.0) { return vec4<f32>(0.0); }
-  let sd = sd_roi${s}(wp);
-  // crisp opaque bar: ~1 inside, AA-ramp to 0 across ~half a sample step at the surface
-  let op = clamp(0.5 - sd / max(u_material.scene.x, 1e-3), 0.0, 1.0) * op0;
-  if (op <= 0.0) { return vec4<f32>(0.0); }
-  let col = srgb2physical(u_material.roi${s}_color.rgb);   // flat/unlit, the Slicer widget look
-  return vec4<f32>(col * op, op);
-}`
-    );
-  }
-  skipWGSL(s) {
-    return "";
-  }
-  // skip_roi<s> is emitted by samplingWGSL above
-  fillUniforms(out, off) {
-    out[off + 0] = this.center[0];
-    out[off + 1] = this.center[1];
-    out[off + 2] = this.center[2];
-    out[off + 4] = this.half[0];
-    out[off + 5] = this.half[1];
-    out[off + 6] = this.half[2];
-    out[off + 8] = this.color[0];
-    out[off + 9] = this.color[1];
-    out[off + 10] = this.color[2];
-    out[off + 11] = this.opacity;
-    out[off + 12] = this.bar;
   }
 };
 
@@ -1136,11 +916,29 @@ function lutFromWindowLevel() {
   }
   return lut;
 }
+function parseMarkups(nodes) {
+  const out = [];
+  for (const n of Object.values(nodes)) {
+    if (!/Markups.*Node$/.test(n.class)) continue;
+    const cps = n.attrs?.controlPoints ?? n.attrs?.markups;
+    if (!Array.isArray(cps)) continue;
+    const color = n.attrs?.color ?? [1, 0.85, 0.2];
+    cps.forEach((cp, i) => {
+      const c = cp;
+      const p = c.position ?? cp;
+      if (!Array.isArray(p) || p.length < 3) return;
+      out.push({ ras: [p[0], p[1], p[2]], label: c.label ?? `${n.name ?? "F"}-${i + 1}`, color });
+    });
+  }
+  return out;
+}
 async function loadSceneVolumeField(dev, sceneUrl, onBytes, opts = {}) {
   const raw = await (await fetch(sceneUrl)).json();
   const wrapper = raw.nodes ? raw : { nodes: raw };
   const nodes = wrapper.nodes;
-  const blobBase = wrapper.blobBase ?? sceneUrl.replace(/[^/]*$/, "") + "blobs/";
+  const pageBase = globalThis.location?.href ?? "file:///";
+  const sceneAbs = new URL(sceneUrl, pageBase).href;
+  const blobBase = new URL(wrapper.blobBase ?? "./blobs/", sceneAbs).href;
   const vol = Object.values(nodes).find((n) => n.class === "vtkMRMLScalarVolumeNode" && n.attrs?.zarr);
   if (!vol) throw new Error("no zarr ScalarVolumeNode in scene");
   const z = vol.attrs.zarr;
@@ -1183,17 +981,341 @@ async function loadSceneVolumeField(dev, sceneUrl, onBytes, opts = {}) {
   const [lo, hi] = field.aabb();
   const center = [(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2];
   const radius = Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) / 2;
-  return { field, voxels: zv.data, dims: zv.dims, ijkToRAS, name: vol.name ?? "volume", range: zv.range, center, radius, win, lev };
+  return { field, voxels: zv.data, dims: zv.dims, ijkToRAS, name: vol.name ?? "volume", range: zv.range, center, radius, win, lev, markups: parseMarkups(nodes) };
 }
 
-// render/demos/roi-scene.ts
-var MIN_HALF = 5;
-async function buildRoiScene(dev, sceneUrl = "https://pieper.github.io/live/scenes/CTACardio.json", onBytes) {
-  const sv = await loadSceneVolumeField(dev, sceneUrl, onBytes);
-  const image = sv.field;
-  const [lo, hi] = image.aabb();
+// render/fiducial-field.ts
+var MAX = 64;
+var FiducialField = class {
+  kind = "fid";
+  bindingCount = 0;
+  // procedural — all state lives in the uniform block
+  spheres = new Float32Array(MAX * 4);
+  // (cx,cy,cz,radius)
+  colors = new Float32Array(MAX * 4);
+  // (r,g,b,a)
+  n = 0;
+  maxR = 0;
+  // largest radius in this field (for the skip bound)
+  active = -1;
+  // hovered/active sphere index (ghost mode: it goes full opacity)
+  clippable;
+  ghost;
+  providesSkip;
+  // off in screen-space mode (radius varies with the camera)
+  screen;
+  sh;
+  ka;
+  kd;
+  ks;
+  light;
+  constructor(spheres = [], opts = {}) {
+    this.setSpheres(spheres);
+    this.sh = opts.shininess ?? 80;
+    this.ka = opts.kAmbient ?? 0.2;
+    this.kd = opts.kDiffuse ?? 0.85;
+    this.ks = opts.kSpecular ?? 0.5;
+    this.light = opts.lightColor ?? [1, 1, 1];
+    this.clippable = opts.clippable ?? true;
+    this.ghost = opts.ghost ?? false;
+    this.screen = opts.screenSpace ?? false;
+    this.providesSkip = true;
+  }
+  setSpheres(list) {
+    this.n = Math.min(list.length, MAX);
+    this.spheres.fill(0);
+    this.colors.fill(0);
+    this.maxR = 0;
+    for (let i = 0; i < this.n; i++) {
+      const s = list[i];
+      this.spheres.set([s.center[0], s.center[1], s.center[2], s.radius], i * 4);
+      this.colors.set(s.color, i * 4);
+      this.maxR = Math.max(this.maxR, s.radius);
+    }
+  }
+  get count() {
+    return this.n;
+  }
+  /** Hovered/active sphere (ghost mode only): it renders at full opacity while the others stay
+   *  half-visible (partially hidden inside the volume). Pass null/-1 to clear. */
+  setActive(i) {
+    this.active = i ?? -1;
+  }
+  get activeIndex() {
+    return this.active;
+  }
+  uniformFloats() {
+    return 12 + MAX * 4 * 2;
+  }
+  // params(4)+params2(4)+light(4) + spheres + colors
+  sampleStep() {
+    return 1;
+  }
+  aabb() {
+    if (this.n === 0) return [[-1, -1, -1], [1, 1, 1]];
+    const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+    for (let i = 0; i < this.n; i++) {
+      const r = this.screen ? 0 : this.spheres[i * 4 + 3];
+      for (let a = 0; a < 3; a++) {
+        lo[a] = Math.min(lo[a], this.spheres[i * 4 + a] - r);
+        hi[a] = Math.max(hi[a], this.spheres[i * 4 + a] + r);
+      }
+    }
+    if (this.screen) {
+      const diag = Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);
+      const m = Math.max(40, diag * 0.15);
+      for (let a = 0; a < 3; a++) {
+        lo[a] -= m;
+        hi[a] += m;
+      }
+    }
+    return [lo, hi];
+  }
+  structMembers(s) {
+    return [
+      `  fid${s}_params : vec4<f32>,`,
+      // n_spheres, visible, shininess, k_ambient
+      `  fid${s}_params2 : vec4<f32>,`,
+      // k_diffuse, k_specular, max_radius, _
+      `  fid${s}_light : vec4<f32>,`,
+      // light_color.rgb, _
+      `  fid${s}_spheres : array<vec4<f32>, ${MAX}>,`,
+      `  fid${s}_colors : array<vec4<f32>, ${MAX}>,`
+    ].join("\n");
+  }
+  declareBindings(_s, _base) {
+    return "";
+  }
+  bindEntries(_s, _base) {
+    return [];
+  }
+  // --- empty-space skipping -------------------------------------------------
+  // The spheres are an exact SDF, so we can hand the ray-marcher a real distance to
+  // leap. Conservative form: nearest-CENTRE distance minus the field's LARGEST radius.
+  // Since min_j(d_j) <= d_k and max_r >= r_k for every k, this never exceeds the true
+  // min_k(d_k - r_k) — so it can't skip over a sphere — and it costs only squared
+  // distances in the loop plus ONE sqrt at the end (cheaper than the sampling loop).
+  // (providesSkip is false in screen-space mode — the world radius varies with the camera.)
+  skipWGSL(s) {
+    if (this.screen) {
+      return (
+        /* wgsl */
+        `
+fn skip_fid${s}(wp : vec3<f32>) -> f32 {
+  let n = i32(u_material.fid${s}_params.x);
+  if (n <= 0) { return 1.0e6; }
+  var best = 1.0e12;
+  for (var k = 0; k < n; k = k + 1) {
+    let sp = u_material.fid${s}_spheres[k];
+    if (sp.w <= 0.0) { continue; }
+    let r = sp.w * length(u_cam.eye.xyz - sp.xyz) / max(u_cam.size.z, 1.0);
+    best = min(best, length(wp - sp.xyz) - r);
+  }
+  return max(best, 0.0);
+}`
+      );
+    }
+    return (
+      /* wgsl */
+      `
+fn skip_fid${s}(wp : vec3<f32>) -> f32 {
+  let n = i32(u_material.fid${s}_params.x);
+  if (n <= 0) { return 1.0e6; }        // nothing here: unbounded empty space
+  var min_d2 = 1.0e12;
+  for (var k = 0; k < n; k = k + 1) {
+    let sp = u_material.fid${s}_spheres[k];
+    if (sp.w <= 0.0) { continue; }
+    let dv = wp - sp.xyz;
+    min_d2 = min(min_d2, dot(dv, dv));
+  }
+  return max(sqrt(min_d2) - u_material.fid${s}_params2.z, 0.0);
+}`
+    );
+  }
+  samplingWGSL(s) {
+    return (
+      /* wgsl */
+      `
+fn sample_field_fid${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
+  // an attached TransformField warps where the spheres appear (slicer_wgpu parity)
+  let wp_r = transform_point_fid${s}(wp);
+  let n = i32(u_material.fid${s}_params.x);
+  var best_depth = -1.0;
+  var best_center = vec3<f32>(0.0);
+  var best_color = vec4<f32>(0.0);
+  var best_k = -1;
+  var found = false;
+  for (var k = 0; k < n; k = k + 1) {
+    let sp = u_material.fid${s}_spheres[k];
+    if (sp.w <= 0.0) { continue; }
+    // screen-space: sp.w is a PIXEL radius -> world radius = px * distance(eye) / focal_px,
+    // so the sphere stays a constant size on screen. Otherwise sp.w is a world radius.
+    ${this.screen ? `let r = sp.w * length(u_cam.eye.xyz - sp.xyz) / max(u_cam.size.z, 1.0);` : `let r = sp.w;`}
+    let depth = r - length(wp_r - sp.xyz);   // > 0 -> inside this sphere
+    if (depth > best_depth) { best_depth = depth; best_center = sp.xyz; best_color = u_material.fid${s}_colors[k]; best_k = k; found = true; }
+  }
+  if (!found || best_depth <= 0.0) { return vec4<f32>(0.0); }
+
+  let to_wp = wp_r - best_center;
+  var n_hat = to_wp / max(length(to_wp), 1e-6);
+  if (dot(n_hat, -rd) < 0.0) { n_hat = -n_hat; }
+  let view_dir = normalize(-rd);            // headlight (== normalize(ray_origin - wp) for t>0)
+  let ldotn = max(dot(view_dir, n_hat), 0.0);
+  let refl = normalize(2.0 * ldotn * n_hat - view_dir);
+  let rdotv = max(dot(refl, view_dir), 0.0);
+
+  let sh = u_material.fid${s}_params.z;
+  let ka = u_material.fid${s}_params.w; let kd = u_material.fid${s}_params2.x; let ks = u_material.fid${s}_params2.y;
+  let base = best_color.rgb;
+  let highlight = mix(base, u_material.fid${s}_light.rgb, 0.85);
+  let lit = base * ka + base * (kd * ldotn) + highlight * (ks * pow(rdotv, sh));
+  let col = srgb2physical(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)));
+  // Ghost mode: a non-active glyph emits HALF opacity so the ghost compositor leaves 50% of the
+  // volume in front of it (partially hidden inside the render); the hovered one emits full (0%
+  // residual -> fully visible). Same trick the transform gizmo uses for its active handle.
+  ${this.ghost ? `let ghostScale = select(0.5, 1.0, best_k == i32(u_material.fid${s}_params2.w));` : `let ghostScale = 1.0;`}
+  let opacity = clamp(best_color.a, 0.0, 1.0) * ghostScale;
+  return vec4<f32>(col * opacity, opacity);
+}`
+    );
+  }
+  fillUniforms(out, off) {
+    out[off + 0] = this.n;
+    out[off + 1] = 1;
+    out[off + 2] = this.sh;
+    out[off + 3] = this.ka;
+    out[off + 4] = this.kd;
+    out[off + 5] = this.ks;
+    out[off + 6] = this.maxR;
+    out[off + 7] = this.active;
+    out[off + 8] = this.light[0];
+    out[off + 9] = this.light[1];
+    out[off + 10] = this.light[2];
+    out.set(this.spheres, off + 12);
+    out.set(this.colors, off + 12 + MAX * 4);
+  }
+};
+
+// render/roi-box-field.ts
+var RoiBoxField = class {
+  kind = "roi";
+  bindingCount = 0;
+  // procedural — all state in the uniform block
+  clippable = false;
+  // the frame sits on the clip planes; never clip it
+  providesSkip = true;
+  // sparse SDF -> cheap via empty-space skipping
+  center;
+  half;
+  color;
+  opacity;
+  bar;
+  constructor(center, half, opts = {}) {
+    this.center = [...center];
+    this.half = [...half];
+    this.color = opts.color ?? [1, 0.85, 0.25];
+    this.opacity = opts.opacity ?? 1;
+    this.bar = opts.barHalfMm ?? 1.5;
+  }
+  /** Update the box (a drag) — caller does scene.syncUniforms() + redraw. */
+  setBox(center, half) {
+    this.center = [...center];
+    this.half = [...half];
+  }
+  get boxCenter() {
+    return [...this.center];
+  }
+  get boxHalf() {
+    return [...this.half];
+  }
+  uniformFloats() {
+    return 16;
+  }
+  // center(4) + half(4) + color(4) + params(4)
+  sampleStep() {
+    return Math.max(0.5 * this.bar, 0.25);
+  }
+  aabb() {
+    const m = this.bar + 0.5;
+    return [
+      [this.center[0] - this.half[0] - m, this.center[1] - this.half[1] - m, this.center[2] - this.half[2] - m],
+      [this.center[0] + this.half[0] + m, this.center[1] + this.half[1] + m, this.center[2] + this.half[2] + m]
+    ];
+  }
+  structMembers(s) {
+    return [
+      `  roi${s}_center : vec4<f32>,`,
+      // cx,cy,cz,_
+      `  roi${s}_half : vec4<f32>,`,
+      // hx,hy,hz,_
+      `  roi${s}_color : vec4<f32>,`,
+      // rgb, opacity
+      `  roi${s}_params : vec4<f32>,`
+      // bar_half, _, _, _
+    ].join("\n");
+  }
+  declareBindings() {
+    return "";
+  }
+  bindEntries() {
+    return [];
+  }
+  samplingWGSL(s) {
+    return (
+      /* wgsl */
+      `
+fn sd_box_frame${s}(p0 : vec3<f32>, b : vec3<f32>, e : f32) -> f32 {
+  let p = abs(p0) - b;
+  let q = abs(p + vec3<f32>(e)) - vec3<f32>(e);
+  return min(min(
+    length(max(vec3<f32>(p.x, q.y, q.z), vec3<f32>(0.0))) + min(max(p.x, max(q.y, q.z)), 0.0),
+    length(max(vec3<f32>(q.x, p.y, q.z), vec3<f32>(0.0))) + min(max(q.x, max(p.y, q.z)), 0.0)),
+    length(max(vec3<f32>(q.x, q.y, p.z), vec3<f32>(0.0))) + min(max(q.x, max(q.y, p.z)), 0.0));
+}
+fn sd_roi${s}(wp : vec3<f32>) -> f32 {
+  return sd_box_frame${s}(wp - u_material.roi${s}_center.xyz, u_material.roi${s}_half.xyz, u_material.roi${s}_params.x);
+}
+fn skip_roi${s}(wp : vec3<f32>) -> f32 {
+  // exact exterior distance to the bars, minus a bar-width margin (stays conservative)
+  return max(sd_roi${s}(wp) - u_material.roi${s}_params.x, 0.0);
+}
+fn sample_field_roi${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
+  let op0 = u_material.roi${s}_color.a;
+  if (op0 <= 0.0) { return vec4<f32>(0.0); }
+  let sd = sd_roi${s}(wp);
+  // crisp opaque bar: ~1 inside, AA-ramp to 0 across ~half a sample step at the surface
+  let op = clamp(0.5 - sd / max(u_material.scene.x, 1e-3), 0.0, 1.0) * op0;
+  if (op <= 0.0) { return vec4<f32>(0.0); }
+  let col = srgb2physical(u_material.roi${s}_color.rgb);   // flat/unlit, the Slicer widget look
+  return vec4<f32>(col * op, op);
+}`
+    );
+  }
+  skipWGSL(s) {
+    return "";
+  }
+  // skip_roi<s> is emitted by samplingWGSL above
+  fillUniforms(out, off) {
+    out[off + 0] = this.center[0];
+    out[off + 1] = this.center[1];
+    out[off + 2] = this.center[2];
+    out[off + 4] = this.half[0];
+    out[off + 5] = this.half[1];
+    out[off + 6] = this.half[2];
+    out[off + 8] = this.color[0];
+    out[off + 9] = this.color[1];
+    out[off + 10] = this.color[2];
+    out[off + 11] = this.opacity;
+    out[off + 12] = this.bar;
+  }
+};
+
+// render/demos/roi-widget.ts
+function createRoiWidget(lo, hi, opts = {}) {
+  const MIN_HALF = opts.minHalfMm ?? 5;
+  const cov = opts.coverage ?? 0.35;
   const center = [(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2];
-  const half = [(hi[0] - lo[0]) * 0.35, (hi[1] - lo[1]) * 0.35, (hi[2] - lo[2]) * 0.35];
+  const half = [(hi[0] - lo[0]) * cov, (hi[1] - lo[1]) * cov, (hi[2] - lo[2]) * cov];
   const hR = Math.max(3, Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) * 0.012);
   const bar = Math.max(1.2, hR * 0.35);
   const box = new RoiBoxField(center, half, { color: [1, 0.85, 0.25], barHalfMm: bar });
@@ -1227,9 +1349,7 @@ async function buildRoiScene(dev, sceneUrl = "https://pieper.github.io/live/scen
     face = sign > 0 ? Math.max(face, opp + 2 * MIN_HALF) : Math.min(face, opp - 2 * MIN_HALF);
     return [(face + opp) / 2, Math.abs(face - opp) / 2];
   };
-  const scene = {
-    sv,
-    image,
+  return {
     box,
     handles,
     center,
@@ -1263,9 +1383,25 @@ async function buildRoiScene(dev, sceneUrl = "https://pieper.github.io/live/scen
       hover = i;
       refreshHandles();
     },
-    snapshot: () => ({ center: [...center], half: [...half] })
+    snapshot: () => ({ center: [...center], half: [...half] }),
+    setBox(c, h) {
+      for (let a = 0; a < 3; a++) {
+        center[a] = c[a];
+        half[a] = h[a];
+      }
+      box.setBox(center, half);
+      refreshHandles();
+    }
   };
-  return scene;
+}
+
+// render/demos/roi-scene.ts
+async function buildRoiScene(dev, sceneUrl = "https://pieper.github.io/live/scenes/CTACardio.json", onBytes) {
+  const sv = await loadSceneVolumeField(dev, sceneUrl, onBytes);
+  const image = sv.field;
+  const [lo, hi] = image.aabb();
+  const w = createRoiWidget(lo, hi, { coverage: 0.35 });
+  return { sv, image, ...w };
 }
 
 // render/vtk-camera.ts

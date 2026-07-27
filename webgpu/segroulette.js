@@ -1263,6 +1263,7 @@ var SegmentField = class {
   kind = "seg";
   bindingCount = 1;
   // smoothed-presence texture (sampler shared)
+  clippable;
   tex;
   p2t;
   box;
@@ -1289,6 +1290,7 @@ var SegmentField = class {
     this.shade = opts.shade ?? [0.2, 0.85, 0.3, 32];
     this.bandMm = opts.bandMm ?? voxelMm;
     this.stepMm = opts.sampleStepMm ?? Math.max(0.5 * voxelMm, 0.1);
+    this.clippable = opts.clippable ?? true;
   }
   uniformFloats() {
     return 28;
@@ -1383,6 +1385,7 @@ var RGBAVolumeField = class {
   kind = "rgba";
   bindingCount = 1;
   // baked rgba texture (sampler shared)
+  clippable;
   tex;
   p2t;
   shade;
@@ -1403,6 +1406,7 @@ var RGBAVolumeField = class {
     }
     this.shade = opts.shade ?? [0.3, 0.75, 0.45, 24];
     this.unit = opts.opacityUnitDistance ?? this.stepMm;
+    this.clippable = opts.clippable ?? true;
   }
   uniformFloats() {
     return 24;
@@ -1605,6 +1609,417 @@ function bakeSegmentPresence(dev, mask, dims, sigmaVoxels = 1.5) {
   return bakeColorizeRGBA(dev, mask, dims, palette, sigmaVoxels);
 }
 
+// render/fiducial-field.ts
+var MAX = 64;
+var FiducialField = class {
+  kind = "fid";
+  bindingCount = 0;
+  // procedural — all state lives in the uniform block
+  spheres = new Float32Array(MAX * 4);
+  // (cx,cy,cz,radius)
+  colors = new Float32Array(MAX * 4);
+  // (r,g,b,a)
+  n = 0;
+  maxR = 0;
+  // largest radius in this field (for the skip bound)
+  active = -1;
+  // hovered/active sphere index (ghost mode: it goes full opacity)
+  clippable;
+  ghost;
+  providesSkip;
+  // off in screen-space mode (radius varies with the camera)
+  screen;
+  sh;
+  ka;
+  kd;
+  ks;
+  light;
+  constructor(spheres = [], opts = {}) {
+    this.setSpheres(spheres);
+    this.sh = opts.shininess ?? 80;
+    this.ka = opts.kAmbient ?? 0.2;
+    this.kd = opts.kDiffuse ?? 0.85;
+    this.ks = opts.kSpecular ?? 0.5;
+    this.light = opts.lightColor ?? [1, 1, 1];
+    this.clippable = opts.clippable ?? true;
+    this.ghost = opts.ghost ?? false;
+    this.screen = opts.screenSpace ?? false;
+    this.providesSkip = true;
+  }
+  setSpheres(list) {
+    this.n = Math.min(list.length, MAX);
+    this.spheres.fill(0);
+    this.colors.fill(0);
+    this.maxR = 0;
+    for (let i = 0; i < this.n; i++) {
+      const s = list[i];
+      this.spheres.set([s.center[0], s.center[1], s.center[2], s.radius], i * 4);
+      this.colors.set(s.color, i * 4);
+      this.maxR = Math.max(this.maxR, s.radius);
+    }
+  }
+  get count() {
+    return this.n;
+  }
+  /** Hovered/active sphere (ghost mode only): it renders at full opacity while the others stay
+   *  half-visible (partially hidden inside the volume). Pass null/-1 to clear. */
+  setActive(i) {
+    this.active = i ?? -1;
+  }
+  get activeIndex() {
+    return this.active;
+  }
+  uniformFloats() {
+    return 12 + MAX * 4 * 2;
+  }
+  // params(4)+params2(4)+light(4) + spheres + colors
+  sampleStep() {
+    return 1;
+  }
+  aabb() {
+    if (this.n === 0) return [[-1, -1, -1], [1, 1, 1]];
+    const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+    for (let i = 0; i < this.n; i++) {
+      const r = this.screen ? 0 : this.spheres[i * 4 + 3];
+      for (let a = 0; a < 3; a++) {
+        lo[a] = Math.min(lo[a], this.spheres[i * 4 + a] - r);
+        hi[a] = Math.max(hi[a], this.spheres[i * 4 + a] + r);
+      }
+    }
+    if (this.screen) {
+      const diag = Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);
+      const m = Math.max(40, diag * 0.15);
+      for (let a = 0; a < 3; a++) {
+        lo[a] -= m;
+        hi[a] += m;
+      }
+    }
+    return [lo, hi];
+  }
+  structMembers(s) {
+    return [
+      `  fid${s}_params : vec4<f32>,`,
+      // n_spheres, visible, shininess, k_ambient
+      `  fid${s}_params2 : vec4<f32>,`,
+      // k_diffuse, k_specular, max_radius, _
+      `  fid${s}_light : vec4<f32>,`,
+      // light_color.rgb, _
+      `  fid${s}_spheres : array<vec4<f32>, ${MAX}>,`,
+      `  fid${s}_colors : array<vec4<f32>, ${MAX}>,`
+    ].join("\n");
+  }
+  declareBindings(_s, _base) {
+    return "";
+  }
+  bindEntries(_s, _base) {
+    return [];
+  }
+  // --- empty-space skipping -------------------------------------------------
+  // The spheres are an exact SDF, so we can hand the ray-marcher a real distance to
+  // leap. Conservative form: nearest-CENTRE distance minus the field's LARGEST radius.
+  // Since min_j(d_j) <= d_k and max_r >= r_k for every k, this never exceeds the true
+  // min_k(d_k - r_k) — so it can't skip over a sphere — and it costs only squared
+  // distances in the loop plus ONE sqrt at the end (cheaper than the sampling loop).
+  // (providesSkip is false in screen-space mode — the world radius varies with the camera.)
+  skipWGSL(s) {
+    if (this.screen) {
+      return (
+        /* wgsl */
+        `
+fn skip_fid${s}(wp : vec3<f32>) -> f32 {
+  let n = i32(u_material.fid${s}_params.x);
+  if (n <= 0) { return 1.0e6; }
+  var best = 1.0e12;
+  for (var k = 0; k < n; k = k + 1) {
+    let sp = u_material.fid${s}_spheres[k];
+    if (sp.w <= 0.0) { continue; }
+    let r = sp.w * length(u_cam.eye.xyz - sp.xyz) / max(u_cam.size.z, 1.0);
+    best = min(best, length(wp - sp.xyz) - r);
+  }
+  return max(best, 0.0);
+}`
+      );
+    }
+    return (
+      /* wgsl */
+      `
+fn skip_fid${s}(wp : vec3<f32>) -> f32 {
+  let n = i32(u_material.fid${s}_params.x);
+  if (n <= 0) { return 1.0e6; }        // nothing here: unbounded empty space
+  var min_d2 = 1.0e12;
+  for (var k = 0; k < n; k = k + 1) {
+    let sp = u_material.fid${s}_spheres[k];
+    if (sp.w <= 0.0) { continue; }
+    let dv = wp - sp.xyz;
+    min_d2 = min(min_d2, dot(dv, dv));
+  }
+  return max(sqrt(min_d2) - u_material.fid${s}_params2.z, 0.0);
+}`
+    );
+  }
+  samplingWGSL(s) {
+    return (
+      /* wgsl */
+      `
+fn sample_field_fid${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
+  // an attached TransformField warps where the spheres appear (slicer_wgpu parity)
+  let wp_r = transform_point_fid${s}(wp);
+  let n = i32(u_material.fid${s}_params.x);
+  var best_depth = -1.0;
+  var best_center = vec3<f32>(0.0);
+  var best_color = vec4<f32>(0.0);
+  var best_k = -1;
+  var found = false;
+  for (var k = 0; k < n; k = k + 1) {
+    let sp = u_material.fid${s}_spheres[k];
+    if (sp.w <= 0.0) { continue; }
+    // screen-space: sp.w is a PIXEL radius -> world radius = px * distance(eye) / focal_px,
+    // so the sphere stays a constant size on screen. Otherwise sp.w is a world radius.
+    ${this.screen ? `let r = sp.w * length(u_cam.eye.xyz - sp.xyz) / max(u_cam.size.z, 1.0);` : `let r = sp.w;`}
+    let depth = r - length(wp_r - sp.xyz);   // > 0 -> inside this sphere
+    if (depth > best_depth) { best_depth = depth; best_center = sp.xyz; best_color = u_material.fid${s}_colors[k]; best_k = k; found = true; }
+  }
+  if (!found || best_depth <= 0.0) { return vec4<f32>(0.0); }
+
+  let to_wp = wp_r - best_center;
+  var n_hat = to_wp / max(length(to_wp), 1e-6);
+  if (dot(n_hat, -rd) < 0.0) { n_hat = -n_hat; }
+  let view_dir = normalize(-rd);            // headlight (== normalize(ray_origin - wp) for t>0)
+  let ldotn = max(dot(view_dir, n_hat), 0.0);
+  let refl = normalize(2.0 * ldotn * n_hat - view_dir);
+  let rdotv = max(dot(refl, view_dir), 0.0);
+
+  let sh = u_material.fid${s}_params.z;
+  let ka = u_material.fid${s}_params.w; let kd = u_material.fid${s}_params2.x; let ks = u_material.fid${s}_params2.y;
+  let base = best_color.rgb;
+  let highlight = mix(base, u_material.fid${s}_light.rgb, 0.85);
+  let lit = base * ka + base * (kd * ldotn) + highlight * (ks * pow(rdotv, sh));
+  let col = srgb2physical(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)));
+  // Ghost mode: a non-active glyph emits HALF opacity so the ghost compositor leaves 50% of the
+  // volume in front of it (partially hidden inside the render); the hovered one emits full (0%
+  // residual -> fully visible). Same trick the transform gizmo uses for its active handle.
+  ${this.ghost ? `let ghostScale = select(0.5, 1.0, best_k == i32(u_material.fid${s}_params2.w));` : `let ghostScale = 1.0;`}
+  let opacity = clamp(best_color.a, 0.0, 1.0) * ghostScale;
+  return vec4<f32>(col * opacity, opacity);
+}`
+    );
+  }
+  fillUniforms(out, off) {
+    out[off + 0] = this.n;
+    out[off + 1] = 1;
+    out[off + 2] = this.sh;
+    out[off + 3] = this.ka;
+    out[off + 4] = this.kd;
+    out[off + 5] = this.ks;
+    out[off + 6] = this.maxR;
+    out[off + 7] = this.active;
+    out[off + 8] = this.light[0];
+    out[off + 9] = this.light[1];
+    out[off + 10] = this.light[2];
+    out.set(this.spheres, off + 12);
+    out.set(this.colors, off + 12 + MAX * 4);
+  }
+};
+
+// render/roi-box-field.ts
+var RoiBoxField = class {
+  kind = "roi";
+  bindingCount = 0;
+  // procedural — all state in the uniform block
+  clippable = false;
+  // the frame sits on the clip planes; never clip it
+  providesSkip = true;
+  // sparse SDF -> cheap via empty-space skipping
+  center;
+  half;
+  color;
+  opacity;
+  bar;
+  constructor(center, half, opts = {}) {
+    this.center = [...center];
+    this.half = [...half];
+    this.color = opts.color ?? [1, 0.85, 0.25];
+    this.opacity = opts.opacity ?? 1;
+    this.bar = opts.barHalfMm ?? 1.5;
+  }
+  /** Update the box (a drag) — caller does scene.syncUniforms() + redraw. */
+  setBox(center, half) {
+    this.center = [...center];
+    this.half = [...half];
+  }
+  get boxCenter() {
+    return [...this.center];
+  }
+  get boxHalf() {
+    return [...this.half];
+  }
+  uniformFloats() {
+    return 16;
+  }
+  // center(4) + half(4) + color(4) + params(4)
+  sampleStep() {
+    return Math.max(0.5 * this.bar, 0.25);
+  }
+  aabb() {
+    const m = this.bar + 0.5;
+    return [
+      [this.center[0] - this.half[0] - m, this.center[1] - this.half[1] - m, this.center[2] - this.half[2] - m],
+      [this.center[0] + this.half[0] + m, this.center[1] + this.half[1] + m, this.center[2] + this.half[2] + m]
+    ];
+  }
+  structMembers(s) {
+    return [
+      `  roi${s}_center : vec4<f32>,`,
+      // cx,cy,cz,_
+      `  roi${s}_half : vec4<f32>,`,
+      // hx,hy,hz,_
+      `  roi${s}_color : vec4<f32>,`,
+      // rgb, opacity
+      `  roi${s}_params : vec4<f32>,`
+      // bar_half, _, _, _
+    ].join("\n");
+  }
+  declareBindings() {
+    return "";
+  }
+  bindEntries() {
+    return [];
+  }
+  samplingWGSL(s) {
+    return (
+      /* wgsl */
+      `
+fn sd_box_frame${s}(p0 : vec3<f32>, b : vec3<f32>, e : f32) -> f32 {
+  let p = abs(p0) - b;
+  let q = abs(p + vec3<f32>(e)) - vec3<f32>(e);
+  return min(min(
+    length(max(vec3<f32>(p.x, q.y, q.z), vec3<f32>(0.0))) + min(max(p.x, max(q.y, q.z)), 0.0),
+    length(max(vec3<f32>(q.x, p.y, q.z), vec3<f32>(0.0))) + min(max(q.x, max(p.y, q.z)), 0.0)),
+    length(max(vec3<f32>(q.x, q.y, p.z), vec3<f32>(0.0))) + min(max(q.x, max(q.y, p.z)), 0.0));
+}
+fn sd_roi${s}(wp : vec3<f32>) -> f32 {
+  return sd_box_frame${s}(wp - u_material.roi${s}_center.xyz, u_material.roi${s}_half.xyz, u_material.roi${s}_params.x);
+}
+fn skip_roi${s}(wp : vec3<f32>) -> f32 {
+  // exact exterior distance to the bars, minus a bar-width margin (stays conservative)
+  return max(sd_roi${s}(wp) - u_material.roi${s}_params.x, 0.0);
+}
+fn sample_field_roi${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
+  let op0 = u_material.roi${s}_color.a;
+  if (op0 <= 0.0) { return vec4<f32>(0.0); }
+  let sd = sd_roi${s}(wp);
+  // crisp opaque bar: ~1 inside, AA-ramp to 0 across ~half a sample step at the surface
+  let op = clamp(0.5 - sd / max(u_material.scene.x, 1e-3), 0.0, 1.0) * op0;
+  if (op <= 0.0) { return vec4<f32>(0.0); }
+  let col = srgb2physical(u_material.roi${s}_color.rgb);   // flat/unlit, the Slicer widget look
+  return vec4<f32>(col * op, op);
+}`
+    );
+  }
+  skipWGSL(s) {
+    return "";
+  }
+  // skip_roi<s> is emitted by samplingWGSL above
+  fillUniforms(out, off) {
+    out[off + 0] = this.center[0];
+    out[off + 1] = this.center[1];
+    out[off + 2] = this.center[2];
+    out[off + 4] = this.half[0];
+    out[off + 5] = this.half[1];
+    out[off + 6] = this.half[2];
+    out[off + 8] = this.color[0];
+    out[off + 9] = this.color[1];
+    out[off + 10] = this.color[2];
+    out[off + 11] = this.opacity;
+    out[off + 12] = this.bar;
+  }
+};
+
+// render/demos/roi-widget.ts
+function createRoiWidget(lo, hi, opts = {}) {
+  const MIN_HALF = opts.minHalfMm ?? 5;
+  const cov = opts.coverage ?? 0.35;
+  const center = [(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2];
+  const half = [(hi[0] - lo[0]) * cov, (hi[1] - lo[1]) * cov, (hi[2] - lo[2]) * cov];
+  const hR = Math.max(3, Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) * 0.012);
+  const bar = Math.max(1.2, hR * 0.35);
+  const box = new RoiBoxField(center, half, { color: [1, 0.85, 0.25], barHalfMm: bar });
+  const handles = new FiducialField([], { shininess: 60, kSpecular: 0.4, clippable: false, screenSpace: true, ghost: true });
+  let hover = null;
+  const metas = [];
+  for (let axis = 0; axis < 3; axis++) for (const sign of [-1, 1]) metas.push({ kind: "face", axis, sign });
+  for (const sx of [-1, 1]) for (const sy of [-1, 1]) for (const sz of [-1, 1]) metas.push({ kind: "corner", s: [sx, sy, sz] });
+  metas.push({ kind: "center" });
+  const worldOf = (m) => {
+    if (m.kind === "center") return [...center];
+    if (m.kind === "face") {
+      const w = [...center];
+      w[m.axis] += m.sign * half[m.axis];
+      return w;
+    }
+    return [center[0] + m.s[0] * half[0], center[1] + m.s[1] * half[1], center[2] + m.s[2] * half[2]];
+  };
+  const refreshHandles = () => {
+    const pins = metas.map((m, i) => {
+      const on = i === hover;
+      const base = m.kind === "center" ? [0.4, 1, 0.5] : [0.35, 0.8, 1];
+      return { center: worldOf(m), radius: on ? 13 : 8, color: on ? [1, 0.9, 0.3, 1] : [base[0], base[1], base[2], 0.5] };
+    });
+    handles.setSpheres(pins);
+  };
+  refreshHandles();
+  const moveFace = (axis, sign, box0, deltaAxis) => {
+    const opp = box0.center[axis] - sign * box0.half[axis];
+    let face = box0.center[axis] + sign * box0.half[axis] + deltaAxis;
+    face = sign > 0 ? Math.max(face, opp + 2 * MIN_HALF) : Math.min(face, opp - 2 * MIN_HALF);
+    return [(face + opp) / 2, Math.abs(face - opp) / 2];
+  };
+  return {
+    box,
+    handles,
+    center,
+    half,
+    lo: () => [center[0] - half[0], center[1] - half[1], center[2] - half[2]],
+    hi: () => [center[0] + half[0], center[1] + half[1], center[2] + half[2]],
+    handleList: () => metas.map((m, i) => ({
+      id: i,
+      world: worldOf(m),
+      data: m,
+      cursor: m.kind === "center" ? "move" : "grab"
+    })),
+    applyDrag(meta, box0, delta) {
+      if (meta.kind === "center") {
+        for (let a = 0; a < 3; a++) center[a] = box0.center[a] + delta[a];
+      } else if (meta.kind === "face") {
+        const [c, h] = moveFace(meta.axis, meta.sign, box0, delta[meta.axis]);
+        center[meta.axis] = c;
+        half[meta.axis] = h;
+      } else {
+        for (let a = 0; a < 3; a++) {
+          const [c, h] = moveFace(a, meta.s[a], box0, delta[a]);
+          center[a] = c;
+          half[a] = h;
+        }
+      }
+      box.setBox(center, half);
+      refreshHandles();
+    },
+    setHover(i) {
+      hover = i;
+      refreshHandles();
+    },
+    snapshot: () => ({ center: [...center], half: [...half] }),
+    setBox(c, h) {
+      for (let a = 0; a < 3; a++) {
+        center[a] = c[a];
+        half[a] = h[a];
+      }
+      box.setBox(center, half);
+      refreshHandles();
+    }
+  };
+}
+
 // render/demos/segroulette-scene.ts
 var MAX_ISO_SEGMENTS = 12;
 function modalityLUT(modality, maxAlpha = 0.42) {
@@ -1659,40 +2074,111 @@ function buildSegrouletteScene(gpu, format, ct, seg) {
       segments.push({ num, name: seg.names[num] ?? `Segment ${num}`, color: [r, g, b], voxels: n });
     }
   }
-  const colorizeTex = seg ? bakeColorizeRGBA(dev, seg.lab, dims, palette, 1.5) : void 0;
+  const hidden = /* @__PURE__ */ new Set();
+  const visPalette = () => {
+    const p = palette.slice();
+    for (const n of hidden) if (n < 256) p[n * 4 + 3] = 0;
+    return p;
+  };
+  let colorTex = seg ? bakeColorizeRGBA(dev, seg.lab, dims, visPalette(), 1.5) : void 0;
   const useIso = segments.length > 0 && segments.length <= MAX_ISO_SEGMENTS;
   let mode = "volume";
-  let segLayer = [];
+  const isoByNum = /* @__PURE__ */ new Map();
+  let colorizedField;
   if (useIso) {
-    segLayer = segments.map((s) => {
+    for (const s of segments) {
       const mask = new Uint8Array(dims[0] * dims[1] * dims[2]);
       for (let i = 0; i < seg.lab.length; i++) if (seg.lab[i] === s.num) mask[i] = 1;
       const tex = bakeSegmentPresence(dev, mask, dims, 1.5);
-      return new SegmentField(tex, dims, [1, 1, 1], { color: s.color, opacity: 1, ijkToRAS: ct.ijkToRAS });
-    });
+      isoByNum.set(s.num, new SegmentField(tex, dims, [1, 1, 1], { color: s.color, opacity: 1, ijkToRAS: ct.ijkToRAS, clippable: false }));
+    }
     mode = "iso";
-  } else if (colorizeTex) {
-    segLayer = [new RGBAVolumeField(colorizeTex, dims, [1, 1, 1], { ijkToRAS: ct.ijkToRAS, shade: [0.3, 0.78, 0.5, 28] })];
+  } else if (colorTex) {
+    colorizedField = new RGBAVolumeField(colorTex, dims, [1, 1, 1], { ijkToRAS: ct.ijkToRAS, shade: [0.3, 0.78, 0.5, 28], clippable: false });
     mode = "colorized";
   }
+  const hasSeg = isoByNum.size > 0 || !!colorizedField;
   const scene = new SceneRenderer(gpu, format);
-  const setLayers = (showVolume, showSeg) => {
+  const [rasLo, rasHi] = volumeField.aabb();
+  const roi = createRoiWidget(rasLo, rasHi, { coverage: 0.35 });
+  let showVolume = true, showSeg = hasSeg;
+  let roiEnabled = false, roiVisible = false;
+  const currentSegFields = () => {
+    if (mode === "iso") return segments.filter((s) => !hidden.has(s.num)).map((s) => isoByNum.get(s.num));
+    return colorizedField ? [colorizedField] : [];
+  };
+  const rebuild = () => {
     const f = [];
     if (showVolume) f.push(volumeField);
-    if (showSeg) f.push(...segLayer);
+    if (showSeg) f.push(...currentSegFields());
+    if (roiVisible) {
+      f.push(roi.box, roi.handles);
+    }
     scene.build(f);
     scene.setBackground(0.05, 0.06, 0.09);
+    if (roiEnabled) scene.setClipBox(roi.lo(), roi.hi());
+    else scene.clearClip();
   };
-  setLayers(true, segLayer.length > 0);
+  rebuild();
+  const rebakeColorized = () => {
+    if (!seg) return;
+    const nt = bakeColorizeRGBA(dev, seg.lab, dims, visPalette(), 1.5);
+    const old = colorTex;
+    colorTex = nt;
+    slice.setTextures(volumeField.volumeTexture(), colorTex);
+    colorizedField?.setTexture(colorTex, false);
+    old?.destroy();
+  };
   const slice = new SliceRenderer(gpu, format);
-  const [rasLo, rasHi] = volumeField.aabb();
   slice.setVolume(volumeField.patientToTexture(), rasLo, rasHi);
-  slice.setTextures(volumeField.volumeTexture(), colorizeTex);
+  slice.setTextures(volumeField.volumeTexture(), colorTex);
   slice.setWindowLevel(ct.win, ct.lev);
   slice.setOverlayOpacity(seg ? 0.5 : 0);
   const center = [(rasLo[0] + rasHi[0]) / 2, (rasLo[1] + rasHi[1]) / 2, (rasLo[2] + rasHi[2]) / 2];
   const radius = Math.hypot(rasHi[0] - rasLo[0], rasHi[1] - rasLo[1], rasHi[2] - rasLo[2]) / 2;
-  return { scene, slice, center, radius, rasLo, rasHi, ijkToRAS: ct.ijkToRAS, dims, win: ct.win, lev: ct.lev, segments, mode, hasSeg: segLayer.length > 0, setLayers };
+  return {
+    scene,
+    slice,
+    center,
+    radius,
+    rasLo,
+    rasHi,
+    ijkToRAS: ct.ijkToRAS,
+    dims,
+    win: ct.win,
+    lev: ct.lev,
+    segments,
+    mode,
+    hasSeg,
+    roi,
+    setLayers(sv, ss) {
+      showVolume = sv;
+      showSeg = ss;
+      rebuild();
+    },
+    setSegmentVisible(num, visible) {
+      if (visible) hidden.delete(num);
+      else hidden.add(num);
+      rebakeColorized();
+      rebuild();
+    },
+    isSegmentVisible: (num) => !hidden.has(num),
+    setRoiEnabled(on) {
+      roiEnabled = on;
+      rebuild();
+    },
+    setRoiVisible(on) {
+      roiVisible = on;
+      rebuild();
+    },
+    roiEnabled: () => roiEnabled,
+    roiVisible: () => roiVisible,
+    reclip() {
+      if (roiEnabled) scene.setClipBox(roi.lo(), roi.hi());
+      else scene.clearClip();
+      scene.syncUniforms();
+    }
+  };
 }
 
 // render/demos/crosshair.ts
@@ -2258,6 +2744,120 @@ function attachDoubleClick(canvas, onDbl) {
   });
 }
 
+// render/demos/widget-control.ts
+var sub2 = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+var dot2 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+function camMatrices(cam, w, h) {
+  const view = lookAt(cam.position, cam.focalPoint, cam.viewUp);
+  const proj = perspectiveZO(cam.viewAngle * Math.PI / 180, w / h, 1, 1e5);
+  const vp = multiply(proj, view);
+  return { vp, invVp: invert(vp) };
+}
+function worldToClip(vp, p) {
+  return [
+    vp[0] * p[0] + vp[4] * p[1] + vp[8] * p[2] + vp[12],
+    vp[1] * p[0] + vp[5] * p[1] + vp[9] * p[2] + vp[13],
+    vp[2] * p[0] + vp[6] * p[1] + vp[10] * p[2] + vp[14],
+    vp[3] * p[0] + vp[7] * p[1] + vp[11] * p[2] + vp[15]
+  ];
+}
+function attachWidgetControls(canvas, camera, opts) {
+  const cursorCss = (e) => {
+    const r = canvas.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top, rw: r.width, rh: r.height };
+  };
+  const project = (vp, world, rw, rh) => {
+    const c = worldToClip(vp, world);
+    if (c[3] <= 0) return null;
+    const ndcx = c[0] / c[3], ndcy = c[1] / c[3];
+    return { x: (ndcx * 0.5 + 0.5) * rw, y: (1 - (ndcy * 0.5 + 0.5)) * rh };
+  };
+  const unprojectToPlane = (invVp, px, py, rw, rh, planePt) => {
+    const ndcx = px / rw * 2 - 1, ndcy = 1 - py / rh * 2;
+    const near = applyMat4(invVp, [ndcx, ndcy, 0]);
+    const far = applyMat4(invVp, [ndcx, ndcy, 1]);
+    const ro = near, rd = sub2(far, near);
+    const n = sub2(camera.position, camera.focalPoint);
+    const denom = dot2(rd, n);
+    if (Math.abs(denom) < 1e-9) return [...planePt];
+    const t = dot2(sub2(planePt, ro), n) / denom;
+    return [ro[0] + rd[0] * t, ro[1] + rd[1] * t, ro[2] + rd[2] * t];
+  };
+  const pick = (e) => {
+    const { x, y, rw, rh } = cursorCss(e);
+    const { w, h } = opts.getSize();
+    const { vp } = camMatrices(camera, w, h);
+    let best = null, bestD = Infinity;
+    for (const hnd of opts.getHandles()) {
+      const s = project(vp, hnd.world, rw, rh);
+      if (!s) continue;
+      const d = Math.hypot(s.x - x, s.y - y), r = hnd.pickPx ?? 16;
+      if (d < r && d < bestD) {
+        bestD = d;
+        best = hnd;
+      }
+    }
+    return best;
+  };
+  let grabbed = null, hovered = null;
+  const onDown = (e) => {
+    if (e.button !== 0) return;
+    const h = pick(e);
+    if (!h) return;
+    e.stopPropagation();
+    e.preventDefault();
+    grabbed = h;
+    canvas.setPointerCapture(e.pointerId);
+    canvas.style.cursor = h.cursor ? h.cursor : "grabbing";
+    opts.onDragStart?.(h);
+    window.addEventListener("pointermove", onMove, true);
+    window.addEventListener("pointerup", onUp, true);
+  };
+  const onMove = (e) => {
+    if (!grabbed) return;
+    e.stopPropagation();
+    const { x, y, rw, rh } = cursorCss(e);
+    const { w, h } = opts.getSize();
+    const { invVp } = camMatrices(camera, w, h);
+    const world = unprojectToPlane(invVp, x, y, rw, rh, grabbed.world);
+    opts.onDrag(grabbed, world);
+    opts.onChange?.();
+  };
+  const onUp = (e) => {
+    if (!grabbed) return;
+    e.stopPropagation();
+    const g = grabbed;
+    grabbed = null;
+    try {
+      canvas.releasePointerCapture(e.pointerId);
+    } catch {
+    }
+    window.removeEventListener("pointermove", onMove, true);
+    window.removeEventListener("pointerup", onUp, true);
+    opts.onDragEnd?.(g);
+  };
+  const onHoverMove = (e) => {
+    if (grabbed) return;
+    const h = pick(e);
+    if (h !== hovered) {
+      hovered = h;
+      canvas.style.cursor = h ? h.cursor ?? "grab" : "";
+      opts.onHover?.(h);
+      opts.onChange?.();
+    }
+  };
+  canvas.addEventListener("pointerdown", onDown, true);
+  canvas.addEventListener("pointermove", onHoverMove);
+  return {
+    detach() {
+      canvas.removeEventListener("pointerdown", onDown, true);
+      canvas.removeEventListener("pointermove", onHoverMove);
+      window.removeEventListener("pointermove", onMove, true);
+      window.removeEventListener("pointerup", onUp, true);
+    }
+  };
+}
+
 // render/demos/sl-logo.ts
 var SL_LOGO = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADkAAAA8CAIAAABTt4VhAAAABGdBTUEAALGPC/xhBQAAACBjSFJNAAB6JgAAgIQAAPoAAACA6AAAdTAAAOpgAAA6mAAAF3CculE8AAAARGVYSWZNTQAqAAAACAABh2kABAAAAAEAAAAaAAAAAAADoAEAAwAAAAEAAQAAoAIABAAAAAEAAAA5oAMABAAAAAEAAAA8AAAAAH9xBdAAAAHLaVRYdFhNTDpjb20uYWRvYmUueG1wAAAAAAA8eDp4bXBtZXRhIHhtbG5zOng9ImFkb2JlOm5zOm1ldGEvIiB4OnhtcHRrPSJYTVAgQ29yZSA2LjAuMCI+CiAgIDxyZGY6UkRGIHhtbG5zOnJkZj0iaHR0cDovL3d3dy53My5vcmcvMTk5OS8wMi8yMi1yZGYtc3ludGF4LW5zIyI+CiAgICAgIDxyZGY6RGVzY3JpcHRpb24gcmRmOmFib3V0PSIiCiAgICAgICAgICAgIHhtbG5zOmV4aWY9Imh0dHA6Ly9ucy5hZG9iZS5jb20vZXhpZi8xLjAvIj4KICAgICAgICAgPGV4aWY6Q29sb3JTcGFjZT4xPC9leGlmOkNvbG9yU3BhY2U+CiAgICAgICAgIDxleGlmOlBpeGVsWERpbWVuc2lvbj41MDA8L2V4aWY6UGl4ZWxYRGltZW5zaW9uPgogICAgICAgICA8ZXhpZjpQaXhlbFlEaW1lbnNpb24+NTIwPC9leGlmOlBpeGVsWURpbWVuc2lvbj4KICAgICAgPC9yZGY6RGVzY3JpcHRpb24+CiAgIDwvcmRmOlJERj4KPC94OnhtcG1ldGE+ConTBbQAABmbSURBVGgFjZpZkB3XWcd7775919k1o2VGsjZLthw5sR3HiZ3EGMcJJqRIXKmiqAKTByh4yEN4pQJFUVBUUUWRQIViCVQZQ0IWJyGLYyeyY8lYkrXYlmxJtnbNSLPeO3fpvZvfd/pKOOSFnjt97+0+fc7//L/1fOfqjbFZjaPItCLVNU3Xdc3gj3fd0DTP1bZtsD/5yNwnfvmef/23Z1860VlY1dJcM7lrFAYnXePEWeMD/ci/HEWha3mRa0XOvzrzIS+0jAtylbci40XDnNZyq5B3+aQ+FwXf5UKhGZZhWHzmX/qnZ66XAGV0EHNNF0zcWm/3gl77Pfu2Hzv9qmvrZloYprQBpMnEmJl6VB4qDzUEGPJc5yNnBTTPcs3IDb5lZVPOQDZkPvBCe8Ys6FDgCgAQ8cctdegWX9QMNMWQ3FT3ChCYhuHYuu9oFUczbbtSqTiW5jl6bOiWyWRBWWItcUuHJVohhpdg5SVEpvDFma8pf0ZKC0CkhW7qaUY/Q7jyCA8K3BK6dKJkLV0LrxyCT+YgQKESoUKbY2sNX9805e3fv3V6Zvrgy6fTwrRNgGoiFUvOMiU4pj0Pqlmq7mVIAXoTIoCyTLCm4ABcljNKyoBZgexuwlWS5aKSP9wpphU+JXWwCtsykCioUG+YcGwAqOrokyPW3u2jO7ZtPvDcz469di0rTMfKhVRLGticBavBiw+i63QFCvQyK7IsFzqBqFAmqZamWmxqZponCUgYi3ENmYGhw7Rp6Ggw3YhGiB4Ig5kisTxZdF8OUZJiWgIUtmxT8z1jy7R//727PN+bv97pBaDQKq6JyoLSsQ3bpmGexPFgEIVRVuhukhZx1KfNxFijWa8oA9IS5J4VcWrESR4lehzroQ7jJqwqmoZwmd5NuAgEFRGzM0WPwSiHJQrB7ORrYSFNaBV11BxL91297pueYw36Sa8fMgfXFi4rHmLPozBY6iS5XhuZ2rVtz50zs7tWFuePHzmQDHrdOFq9tLBhJKj6HijLl/AK9gLNoU+hLBTicAoiVdFoU3g1DQQCHmYzhDtEClbhVb1MET0odT5Ylu7aYDJqnul7rikM5r4nU6FBp7PeT5wNs+/7yKOP7L7j3ompGdetHD/83Ksv/3Dj3I5N2/ZkSfzakefnz70wmsSmLXqH5on+pdpqR69WR5rNeoG0tVzBzZRkFVxRAww2x2UoZcALiVqWhA5tCxC4J+hSQDXXQsrwao6P1sbGm1EQjTTsRi1N1vpLq9nc3k/c/9FP37bzTsdx0ixlBudOHzl04JmK39i8dXeep8y56lc/+Uj1yc94k2OmIOUwtYtXsy9/NT56yvBdA8srncWQXTUXYVcwgga4eDOQivaXWnATq5iUbg2lbyBoDz9q6J313oWzp2a3TG/dMnH2/Fm/Pvdrv/q597z/Y7phpmmSxBEeYNDvvnH8hTgJ53bthSrRe8ZCmUTxbzoHdRHDgA68XsUBKxDQRkg1IiEO/kTaelrgK7RM/IVosKalQ5sd+iycAGqk44ag0zEN18FhQbTWWY+uXl3ZvHlza2LLvQ+9d27/b/mtqTCK0SnBhEaZ1qV3Xl9cuDQ6MeN5Xs51y0jiJEtjaFOjCIKhGBGdobmOgdWimhIsS5UFtD60+JhOgYswMoQsuqsCgIx2k1elqaipY4kBebZZcXXQOo7tN0ZTb+vcPR/d6t7WG6QAJSLghiQiaXo86IE1yZKZiRlINU1z+frFs68fXJ4/v2cy0XVXoSn1TXiDaSSmdAAlEF4hEEPiM7qqJUDSY2YmpmakWY4Ry6RktrewltI3DczfdUwClecaWOv6enDqfDFz9z3TznbbKUZsK0n0fpAPgiwU3TLnb1xaWbpWq7dc16O7teX5tcV3PvLoY1E4qAZfL4qB2I2SrRouJ3zg8iouvIrPQimEUZErnyEPt4CvykRHyRW4esuzacRYDon7OFSxJ/ChADhI39GhMNEmP3zP79rNfaud0HW1mm/7vm1ZZCD0h/YXN+bfjsLe2Mw2IKVxtL5y5Y79+x9+/LOHnvuOvohzgkZDghMHUcATh0LnjSrxBJUTKXO2yBJkSim806ucxR4JXzxLhCs1SOUugMWr2ZBqa+KqHMNz9SxLB2nr8c/+4W17HgjCSCZO+EmwpxS4vm+iBmvd3tryVRwyvBI/1teut1r1Pe+5x/ereZaeOBEvXFz3wIoQcax60etrb17Q1oP2wmqfuBDTYZrzgZ5rPtruaY6oiWp9k10BXuqy4pX7+CxIdS3TJVNxUZK0EzoPfvzJ/fc9HEdRSTxqJGZuGJ5XQI/j6v2ri0Fv1a/WLNfN8QvR+ty22Y2z2wiuzP6iN3O8vrPwHMlfoAatNIJG5dIHvcHeCQ/CEDSEM4eXLnXPDiIbZw5nkkVIWig3RBUM8gc5iiGvotigRJMwUkvPuqG2bc/DDz76RBbH0pz4LpqihClaispIgOl3FopsUG+Mo4W9oOs41syW2Ypfy1S8d2cn6w9s11pVBgcrfMXX2yNZ8IFs9Vd2jyghy2VMi4zg+uWImKOyR5UIKE1QMaSARzmwfvUmgUB4BautR3Hm1Gcf/dTv2KaJJgBxeICaQ0IGc8NEsjxYdu3cqzfwROGgU6/7k9ObyvboH27HSBMjlsjKRZI3DFsX3sRuJAcT8oj2wiVai99FUXISXFEaU/EDzMyIlXUKr5JJig64eCvUpcjDzH3woU/PbNyaJJHcEnzqrKByIgA6tuO6ccUJm3XH8v2E/DMNmiMbGiPjknGopJ1YYNEvmi6iFIQSGjF5rnBwFlqV9SvLxk74qlIG8a44LeWARYgKhdIBZoEQbVtSliQuWlO33/fAY6jfLaDSNYcaIsvzGOJtLDcZHXEnJ0YCw0n7oWXmrdaI79eAypggkexWnhF0opsEMz5zCZZ5Q4cFrjQRazElmDFJ1g5K19Rgco9Qp8RS6gCXeRbp83ysVR64/+P15ojEz5v4pEFJreqBcXECg07btu2JDdNrfbfbbaPojdaIaVpERnlOVji6acmbkrp8BRj4FVbVtUxAeVjSZfFl3MQ0WMYRI5iaoAY3CiZTHtqW+FchlVy42tpy5/4PlqSqptJM/hVKnpJE2zFJSRcXFhbnr3jNyVartrhwuVpx6s0WvnBImcTzXB9E0IJJih5wI4iZZZDlnVDWh6Wp4h9CyOSruGwWaASFgvQQrKaZu5iWUI/DLW2LSQC2yJPc2rHzfSPjk2kSl6SWQAWq4hVxMkuiKylpd319ZbU9WZ30G0TiXDfdarXO9IczxFhPX/BefQ3wspCB21zDGvtB9JSWffOtNqsGXBLZCfq9FqS91Dh1LeGSePG8kNVOWmRJNDPVwI5Up6XPktgrXk0za7vuuLfksRzy3Wexk5JlIY/0fhCEKZGtbpnVipnpVsX3S6wwQYcP+v5DFaeJvDB55TDnw/Qn9vrohPPAhqr4VyaWSch85uyN7+n3J9uf0L0max8UDF1OoqBz8K9M85Kon5LqMHcRdSh0vzG1acuOoZ9St8EmpArJqJaIgyhgu5bGiiWLmF6sXECrUclNslkyFdoOHYFvGWOm07JsoRQiioKgUo3MlmfN1ByqA9JpVtiG1nQM26gWjUnDHUO8KmTpWhSYdsVhTNFeOYb+lXmTK05MztWbo9K1Okq0fBS46ookYg7GwUFCnRFmcDFREFarrlUBlXjIUglKr4W7vPmwqBy30CLOQjQdStMyoaYVOs01EpZyYkyZxBXzEBnSLU1RJtqxuGFQc3JqzrJthWp4EogKpuKXWUg7wYGqa6lKGomvdsWvVKo+CaGotaiKWBiwRBDDLyIXeYmHEMg3LUA6lkvyJy+aq2/DrwRUMSVuqFvyJnqu22OSg0qj4fG/n4YXUPwwTHECzN7QEvxUrVaR2JiReOJJBGt5CAABd2tkASfHrSvDccoH1GU1NN/LS9KQ8IFPHnYpa0NhVqAaOJ3RoQzVLG+OerOtij2ie6ziqR74BqtcX1KTrNdZa7gteJWkQ/5wF3AqVRmxMrnAY+I+cbi2wdIDkUv+hYWxbqe2wEx1y9UdT5IDmuZ4vIwuZHbclWOYuzAEKyjL86tiBD9/DKel3mAK7mRMwxyfmjKN0PEtsvc4iuM4AR/kpcyFSJknl/udF9LYN230RkJmXqxEydlB75pmkWSSnIiNyAKwOL7Y6xanU/1bpldP44wkETWPozBpXzWmUbYh2GF9QKYoM8Dkfh4rEEuUcl+0EHsKw0TLY6cyMrXZ0e1We2WZp8AjKk9BRtfOvXFw8dLr1p73XW9M4JqUKLgpvmYaq8yKC8AU+QCKa8X4Lv0xLeuszL/6ysENm2+vtybgLnGTE2a/34soTMEBT9/yWaKzjDaEpqgVkDIH8VZIDNqk2GHiWQvKLL2FS426Pr5lDgJcqjSS0kjKeePiievvHLrvQ4/ddd/jlo0X+/8eT/3T3/Qi8/HPfmF60w4MqdNZ+os/+tyNS0dTTRZtgFG8ok64NVYPqaTV7z5KW+EMXRWP9IJUTWOmcaK3O2EU9OqTA782Um00yGXo4ezJFxbePrT37kd33vUI0/p5Gb27Y/l8a6iV5cWn/+XLL7/44mOf/nxrbJqKjunYF8+9QegOo6TAMynNHPIKGkJs0O8qQx12Kpyq/jAP0sVqxSYwBv00UdXJdjdei1ZGZ5Zbo5Ou6wRZeubYs5fPHNl3z8d27HsYoP8X2rvAlbdYEF25eO6F57934NnvVurTTzz5x5u37SFvwEMlUfSz5/8TlSNxG6gUGomXWLmLx4w7ndVbc72FV9hXwxC4Cd/EbHISPAERK+xH/V7YGNHwyldePxDl9fse/Mzu/R8dPvsLb7KG6/dWlheuXDh37MiLb7/5xura+uTMzo/9+hd27n2/5bhpmmH6eN/vf+Pvz711bPfeexcuHhksD8qewKroE+1NVxav/qLU5Iq4IQ5RVgk5fCUl1Vg1gJ5ZZzguM1tyLXdt6cLRF//DIzEo9F4/CPphf9Drddc7a8urK0urq8u9bjfLdNcf2bxt/4Mf/4ONc7vrzQkaU2vCXBzHW19f/vbTXzr002c+9RufX1ldWb58WHyvHGWuTRop4SFbWrgYRQF1PLFYoVo1UWeUAd+eoKpizuIzSFVt03I9CjTR2NSWOz/4uUsXrl5552wQDlzPxpGtrQUR9RMWO07Nr8/M7b5rb3OiOTJVq4+7fs0yHeaZMt2c3M9iqb+6ev3oS99//vtPkcz+9u//6Z3v+/A//90XWYxJ3FJcyRpGOJPVRb66fLmzsjQ+NSOZGYe6BUrJUVItCDIUXRZtgtv0XIoItu/lKIBR3bYJf7u9CMKM+hDuhFwPhVHec9jT0HOJ78JdMeFcSsx53qb48darJw8/f/bNo65Xf+jRJ/bd+0u2V11dW1ycP2+TwKG2Uk26WX+FRqiO+8uXLp6enNlS5vYKrYyEL4yoUElEKXMOKrVEV+qGPVOLdWdbWjTJvOjBccRiw1A6EHCCWcQjCwDeSfuLPA7D9fby5fNvXDh3kvPq8oLr1bbffu9v/t6fTc/uYr3e6barGMDFc8H6jaZyeqUeqhhLB7laCxWDM6+/8t77HhGANw+GZGIyttIKhsQtoDPNVi1OSAoW29f+e3F+vjD8xti0ZXuF7iQpNdqAtJoENwwHfTx6t9NpL62t3GivLGDBlML9amty4233fOiTc9vvGp3cjDJQGFnrLKIUCM51/TOvHzGLLhESfRSKWLnwzovp08IysitvH1+8fmVyw2ZSXlFZhCXuTJIcnpGgwEVZ8+Tj03d4mzY6btFbu9bvzK+tXO8utyyTOnFg2NVOp3vt2o3lVVwFqYBrOnXPH5mcnt2x9wOt8U0jY9ONkSnLcoT5HJRtJJ5mlBbFjhyn0mu3z5896lmUupwsT2jG6EP/SrxOMqlZ9/sLJw7/5LFPPYlh3mRWJsOBDIENXFJB1vJ16m3eBPO2/F07Rx+MQtZJGRlsGW4lj9H1KMolHstiFb8xrKmI92DXQ9bDIV0TQQZBT+wAz6oGoueXD/xX0L4yUiWDkS07IbKMXTRgiRPH8Gy6ZnTy8A+Xb8xLxULZ1q0zzQBKRbJeNeuUBWydZVkah6QrttRxkiSFVOmExdAgZM+jIPay6QDZOG9CTSqvME0jkAkAgaCHYRhFAyVYIY99tCgIjr/8o4odwoOsO8rSnYgWHVAuE3dEVkEFrr924eBPvknapSYpHap/xavUxIlh7MwZJETRgGIcvBSsbLnITEoIfOBiGGe8sPVG1W7WbCr6koiJTqlD+pUKX7/fRlmHjGhaqzV++KUfri+dpWIJnoikSykAzcHKWfwLtZxQseLb6YlXvvvOmZOGI/p062AMSV/YaWQhiRQpEMtOFUU3yZfQH1Y4Mj56b4s7QsvDMO8PWD9mTJyCISUItQ12q0ut11sP40BZj5Baq43cmL/yyoFv1NyYmgFABSteTh0q4ZUcSVZ5Ucw9IamIrv/gm18ZdNfF5ktNUApAzYtKVlamw2p3hnSaxXGMULAJxVwUp1yxHanQYZOULHv9dL1LcCiASw9lGMJIB2G/P+iINxbBivRd2/3Bt/6hCOc9147TIkyKNFELXigo2AesNGCDujtLRlkhienIxsby4rVeP96z736ZklqUU0RyqAQVuYxH7FA1lSQpgohqIrVO2aBDXlEoO29MybJMqKI+gvvHHhgFr0xn3MXpxkm01l6KE2xfgJqmPT624dnvPvXmkWdGG7INisaTkYdJ3h0Amlaa6QrWguE9h5xWvBQ4bJvNwezi+TOGVdu+e7/Ka6U2g7PDpFlmIWmaAQIRR5iK4BDRE6mQGhMAEFegFj5lvU9YZheO9QpyyrU4zVbXrkdxKEFMgFoT45uOHPzxT7/3ldFabJpOEOZBDFCknVNgpQrBIbzyRq4MtaiMLFCGBkSMjt86fdL1R+e23yHkiPdTBVqEyxLANJKsYGsTKExa7dBiK6JIYmFlqUq1pBn4FLOF45DkZ+vd1W6/SxtaWqY9ObHp5JEXv/P0X7a8vuu4gzgbwGgEnVS9tUEsEZ7JgrWupIMHkDgr61v546AiDd3hqZNHTNvfumMfRsxq3WP3EDnGFIVAruOk8ASIFs8AkTCK3mPWokvskNEglRK7BCOokHNGjTlNCWokLoXr+ePjmw7/7EfffurPW26v4ntBlPdDfEheGg8SCGMtUT84oLTRQDo4UwSICig75g0Sh3AdMzx14tCg179t936/wu6shFz2iOGVFxIX7TQpMuP+hWlWOGgtD7MWR4OhmMb0BotR0o8Ga6aZsCcFmkp1vOK1fvTMvz737b8eq8aViofoYTTAG7JMQpdSIlQepSiSToQ3SW1QUoa3JGoIQNEEtIvOuY8qOw4VoGvnjyxdfWvL3M6xiQ0sNMFHLsuM8BuJ1AYk9SmnihcTy0abdKKlbEHCaxhHvd7aoL8G0bJB7lT8+vTywo2n//FPXnv561OjFiuzQYToxVIxgIiAi4hwv5kWZ7htYdF0PIp7yJPtJrDKv1CreEXp1FeUwZoac2v6dbe47Pq+4UzabgW9plofBPzOQsIg6QNPUs5gomxpQy2Mor4sw5Kk224v9QckImatRuVzynUqLz//79/46hc7i6fZ8kUwfYCK6DPUFKBRIls00g/7c9K/xAHTFl5BhxMQrCVQSBGgwjH2rrEqvG1z8yMPbB+pJm+/9tzlc8ebo2N+fTLOXbIIqcLIIbMkHFDEQMmIt0EYkDpFYcd1igqa6I3Um1PY55VzR8+f/Nq5Y1/TsoFhV9BONvewejRVRD8EmknPKHqBDFmMCLhhIAUT9Eh1RPZZuYFtmypjlqIIKQ6lYAzjjdOXmq1GEZ+7dvJvTx8eC/VtzZm7JzbuqtZHTEruLAIkjJLni4sypHLokZJ7ZKNG3Lv89qGDPz519Plg/Z27947duXv62BsLK71gEGb9EHsHJT6ESSIWAYqgZLtPORmhQWEVOsXJqAqwxjCSg0MwgsV95ZEsHSRqtdfDziC3K/xew/XMYKX9+pm3f3r24pcKZ3JseufG2Z2bNs7Obtk4MTWJ3SyvdLu4pc5K0LlSs1Y3TmYLl86cOXk6ilEff2E5uWtfa9NMcHUxxAGHsUhfWZIAJXxgDzg6ASq5tRKZYBWogrrMqWnEFoTQCjPiYwyP3/1QHPDddifIdWdhJUqj0NuzwXKrptWfnHD6Qbdz7dDyxQOnjGJqrHrnHXOMcfy1CzdW+mQwjZp51+7JPVPbalvclZWpMxf764MMZ7yy1t26ZfzM+dVrSxFJotgov+CQX5ugoyVQngaoYJMDXNiWsl+UUwK/cgMKPcahdkqoDGyc9G/fMbGy2tMN+613VtbWIxxts1ltd5P5ZRwlqy/X8/x6vdqoOfxEhh9GIFam6VaqFZ+9V61R9xr1yko7WGCnMciIi9UK6YE9PjFyfam/uBqhCfAqQCVvk7CnGBUmyTJLOpW+ivsTtkHK5gKCV7RK9i8Pi96I11xY6jdHmgQ9FoBhInkJ/bIOG4TMCh0lcuqUDVHTMNWYxlovgS1+4sGPdAjoCzfW6brZ9NZ6HeTeaLZOnLpG4Z4opVyp+GxxxIpU8EqchE2BJaRygFW+wKksp8TqpZEUd9SeDe+o/Hova/eSxbVwEGu3bZs69tolSi8EQ5vapMCVWEWyQneu50IDsJbbUW+QkyslhD629Ayj0+1R8JmbHcWD9np9KphBbBw7cXWxk+EH3g1UlgiCRSmrAqpg6/8DnlUhNsYFwKsAAAAASUVORK5CYII=";
 
@@ -2353,7 +2953,7 @@ function installChrome(opts) {
   globalThis.addEventListener("resize", place);
   if (opts.anchor && "ResizeObserver" in globalThis) new ResizeObserver(place).observe(opts.anchor);
   const pop = document.createElement("div");
-  pop.style.cssText = "position:fixed;z-index:73;min-width:190px;padding:10px 12px;border-radius:12px;color:#eaf0ff;font:13px -apple-system,system-ui,sans-serif;opacity:0;pointer-events:none;transform:translateY(-6px);transition:opacity 120ms ease-out,transform 120ms ease-out;";
+  pop.style.cssText = "position:fixed;z-index:73;min-width:210px;max-width:300px;max-height:84vh;overflow-y:auto;padding:10px 12px;border-radius:12px;color:#eaf0ff;font:13px -apple-system,system-ui,sans-serif;opacity:0;pointer-events:none;transform:translateY(-6px);transition:opacity 120ms ease-out,transform 120ms ease-out;";
   glass(pop);
   document.body.appendChild(pop);
   const rows = [];
@@ -2380,15 +2980,65 @@ function installChrome(opts) {
       pop.appendChild(row);
       rows.push({ c, row, sw });
     }
-  } else if (opts.about === false) {
+  } else if (opts.about === false && !opts.segments) {
     pop.textContent = "SlicerLive \u2014 WebGPU renderer";
+  }
+  const segHost = document.createElement("div");
+  pop.appendChild(segHost);
+  const segRows = [];
+  const paintSw = (sw, on) => {
+    sw.style.background = on ? "linear-gradient(180deg,#9fe9ff,#54c6f0)" : "rgba(255,255,255,.18)";
+    sw.innerHTML = `<span style="position:absolute;top:2px;left:${on ? 17 : 2}px;width:15px;height:15px;border-radius:50%;background:#fff;transition:left 120ms;box-shadow:0 1px 3px rgba(0,0,0,.4)"></span>`;
+  };
+  function buildSegments() {
+    const S = opts.segments;
+    segRows.length = 0;
+    segHost.innerHTML = "";
+    if (!S) return;
+    const list = S.list();
+    if (!list.length) return;
+    const wrap = document.createElement("div");
+    wrap.style.cssText = "margin-top:6px;border-top:1px solid rgba(255,255,255,.12);padding-top:6px;" + (list.length > 6 ? "max-height:210px;overflow-y:auto;" : "");
+    for (const s of list) {
+      const row = document.createElement("div");
+      row.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:12px;padding:4px 2px;cursor:pointer;";
+      const left = document.createElement("span");
+      left.style.cssText = "display:flex;align-items:center;gap:8px;min-width:0;";
+      const swatch = document.createElement("span");
+      swatch.style.cssText = `flex:0 0 auto;width:11px;height:11px;border-radius:3px;box-shadow:0 0 0 1px rgba(255,255,255,.25);background:rgb(${Math.round(s.color[0] * 255)},${Math.round(s.color[1] * 255)},${Math.round(s.color[2] * 255)})`;
+      const lab = document.createElement("span");
+      lab.textContent = s.name;
+      lab.style.cssText = "font:500 12.5px -apple-system,system-ui,sans-serif;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
+      left.appendChild(swatch);
+      left.appendChild(lab);
+      const sw = document.createElement("span");
+      sw.style.cssText = "width:34px;height:19px;border-radius:999px;position:relative;transition:background 120ms;flex:0 0 auto;";
+      row.appendChild(left);
+      row.appendChild(sw);
+      row.onclick = () => {
+        if (S.enabled && !S.enabled()) return;
+        S.set(s.num, !S.get(s.num));
+        refresh();
+      };
+      wrap.appendChild(row);
+      segRows.push({ num: s.num, sw });
+    }
+    segHost.appendChild(wrap);
+    paintSegments();
+  }
+  function paintSegments() {
+    const S = opts.segments;
+    if (!S) return;
+    const dis = S.enabled ? !S.enabled() : false;
+    segHost.style.opacity = dis ? "0.4" : "1";
+    for (const { num, sw } of segRows) paintSw(sw, S.get(num));
   }
   if (opts.about !== false) {
     const about = document.createElement("div");
     const aLabel = opts.about?.label ?? "About SlicerLive";
     const aURL = opts.about?.url ?? "https://github.com/pieper/SlicerLive";
     about.textContent = aLabel;
-    about.style.cssText = "cursor:pointer;border-radius:9px;padding:9px 8px 3px;margin-top:4px;" + (controls.length ? "border-top:1px solid rgba(255,255,255,.12);" : "") + "font:600 13px -apple-system,system-ui,sans-serif;color:#9fe9ff;";
+    about.style.cssText = "cursor:pointer;border-radius:9px;padding:9px 8px 3px;margin-top:4px;" + (controls.length || opts.segments ? "border-top:1px solid rgba(255,255,255,.12);" : "") + "font:600 13px -apple-system,system-ui,sans-serif;color:#9fe9ff;";
     about.onmouseenter = () => {
       about.style.background = "rgba(255,255,255,.07)";
     };
@@ -2409,9 +3059,12 @@ function installChrome(opts) {
       sw.style.background = on ? "linear-gradient(180deg,#9fe9ff,#54c6f0)" : "rgba(255,255,255,.18)";
       sw.innerHTML = `<span style="position:absolute;top:2px;left:${on ? 17 : 2}px;width:15px;height:15px;border-radius:50%;background:#fff;transition:left 120ms;box-shadow:0 1px 3px rgba(0,0,0,.4)"></span>`;
     }
+    paintSegments();
   }
   refresh();
   const show = () => {
+    buildSegments();
+    refresh();
     const b = logo.getBoundingClientRect();
     pop.style.top = Math.round(b.bottom + 6) + "px";
     pop.style.right = Math.round(window.innerWidth - b.right) + "px";
@@ -2791,6 +3444,7 @@ async function main() {
   attachDoubleClick(cv.threeD, () => grid.toggleMax("threeD"));
   const layers = { volume: true, seg: true };
   let sliceOutline = false;
+  let roiEnabled = false, roiVisible = false, roiFirstEnable = true;
   const applyLayers = () => {
     rs?.setLayers(layers.volume, layers.seg);
     draw3d();
@@ -2798,6 +3452,12 @@ async function main() {
   };
   const redrawSlices = () => {
     for (const p of planes) drawSlice(p);
+    xhair?.redraw();
+  };
+  const applyRoi = () => {
+    rs?.setRoiEnabled(roiEnabled);
+    rs?.setRoiVisible(roiVisible);
+    draw3d();
     xhair?.redraw();
   };
   const controls = [
@@ -2813,9 +3473,37 @@ async function main() {
       sliceOutline = on;
       rs?.slice.setOverlayOutline(on);
       redrawSlices();
-    }, disabled: () => !rs?.hasSeg }
+    }, disabled: () => !rs?.hasSeg },
+    { label: "Crop volume", get: () => roiEnabled, set: (on) => {
+      roiEnabled = on;
+      if (on && roiFirstEnable) {
+        roiVisible = true;
+        roiFirstEnable = false;
+      }
+      applyRoi();
+    }, disabled: () => !layers.volume },
+    { label: "Show ROI box", get: () => roiVisible, set: (on) => {
+      roiVisible = on;
+      rs?.setRoiVisible(on);
+      draw3d();
+      xhair?.redraw();
+    } }
   ];
-  const chrome = installChrome({ controls, anchor: cv.threeD.parentElement ?? void 0 });
+  const chrome = installChrome({
+    controls,
+    anchor: cv.threeD.parentElement ?? void 0,
+    segments: {
+      list: () => (rs?.segments ?? []).map((s) => ({ num: s.num, name: s.name, color: s.color })),
+      get: (num) => rs?.isSegmentVisible(num) ?? true,
+      set: (num, on) => {
+        rs?.setSegmentVisible(num, on);
+        redrawSlices();
+        draw3d();
+        xhair?.redraw();
+      },
+      enabled: () => !!rs?.hasSeg && (layers.seg || layers.volume)
+    }
+  });
   const mosaic = createMosaic(document.querySelector("main"));
   let lastEntry;
   installIdcInfo(el("details-host"), {
@@ -2866,6 +3554,8 @@ async function main() {
       layers.volume = true;
       layers.seg = rs.hasSeg;
       rs.slice.setOverlayOutline(sliceOutline);
+      rs.setRoiEnabled(roiEnabled);
+      rs.setRoiVisible(roiVisible);
       chrome.refresh();
       showMeta(res.entry, rs);
       const d3 = document.querySelector(".lab.d3");
@@ -2902,6 +3592,30 @@ async function main() {
       } }
     });
   }
+  let roiBox0 = null;
+  attachWidgetControls(cv.threeD, camera, {
+    getHandles: () => rs && rs.roiVisible() ? rs.roi.handleList().map((h) => ({ id: h.id, world: h.world, data: h.data, cursor: h.cursor })) : [],
+    getSize: () => ({ w: cv.threeD.width, h: cv.threeD.height }),
+    onDragStart: () => {
+      roiBox0 = rs.roi.snapshot();
+    },
+    onDrag: (h, world) => {
+      if (!rs || !roiBox0) return;
+      const d = [world[0] - h.world[0], world[1] - h.world[1], world[2] - h.world[2]];
+      rs.roi.applyDrag(h.data, roiBox0, d);
+      rs.reclip();
+      draw3d();
+      xhair?.redraw();
+    },
+    onHover: (h) => {
+      rs?.roi.setHover(h ? h.id : null);
+      rs?.scene.syncUniforms();
+      draw3d();
+    },
+    onChange: () => {
+      draw3d();
+    }
+  });
   attachCameraControls(cv.threeD, camera, { onChange: () => {
     draw3d();
     xhair?.redraw();
@@ -2933,6 +3647,21 @@ async function main() {
     setOutline: (on) => {
       rs?.slice.setOverlayOutline(on);
       for (const p of planes) drawSlice(p);
+    },
+    segVis: (num) => rs?.isSegmentVisible(num) ?? null,
+    setSegVis: (num, on) => {
+      rs?.setSegmentVisible(num, on);
+      for (const p of planes) drawSlice(p);
+      draw3d();
+    },
+    roi: () => rs ? { enabled: rs.roiEnabled(), visible: rs.roiVisible(), lo: rs.roi.lo(), hi: rs.roi.hi(), handles: rs.roi.handleList().length } : null,
+    setRoi: (en, vis) => {
+      roiEnabled = en;
+      roiVisible = vis;
+      if (en) roiFirstEnable = false;
+      rs?.setRoiEnabled(en);
+      rs?.setRoiVisible(vis);
+      draw3d();
     }
   };
   status("SlicerLive SEGRoulette \u2014 click Spin to load a random IDC segmentation");
