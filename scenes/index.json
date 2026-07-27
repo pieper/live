@@ -13,6 +13,12 @@
   "desc": "A REAL SlicerLive scene, live: the chunked OME-Zarr volume is streamed from the Jetstream2 bucket and gunzipped in your browser, then rendered by the TS/WebGPU backbone \u2014 3 orthogonal MPR planes + a 3D volume render using the scene's own transfer function and true rotated IJK\u2192RAS geometry. The direct replacement for the legacy vtk.js MRHead. Scroll a slice to scrub; drag 3D to orbit."
  },
  {
+  "name": "SlicerLive \u2014 SEGRoulette",
+  "page": "webgpu/segroulette.html",
+  "thumb": "segroulette.png",
+  "desc": "Spin a random segmentation out of 190k+ IDC DICOM SEGs (36 collections): the source CT/MR/PET and the DICOM SEG stream straight from the Imaging Data Commons buckets and are parsed in your browser (dcmjs), then rendered by the TS/WebGPU backbone \u2014 3 MPR planes (grayscale + colored overlay) + a 3D view where the segmentation is the SegmentField iso band-shell (step-derived isosurface), the WebGPU-native replacement for vtk.js surface models. Hit Spin for another case."
+ },
+ {
   "name": "LiveStory (prototype) \u2014 narrated MR head",
   "page": "webgpu/story.html?scene=../legacy/scenes/MRHead.json",
   "thumb": "livestory.png",
@@ -74,5 +80,12 @@
   "thumb": "MRHead.png",
   "legacy": true,
   "desc": "MR head \u2014 volume rendering + 4-up (axial / sagittal / coronal)"
+ },
+ {
+  "name": "SEGRoulette (vtk.js)",
+  "page": "legacy/viewer.html?segroulette",
+  "thumb": "segroulette-legacy.png",
+  "legacy": true,
+  "desc": "The original vtk.js SEGRoulette \u2014 spin a random IDC DICOM SEG + its source series, loaded client-side and rendered with surface models + MPR overlays. Superseded by the WebGPU SlicerLive SEGRoulette above."
  }
 ]
