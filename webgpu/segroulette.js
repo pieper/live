@@ -1264,6 +1264,116 @@ fn sample_field_seg${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
     return [{ binding: base, resource: this.tex.createView() }];
   }
 };
+var RGBAVolumeField = class {
+  kind = "rgba";
+  bindingCount = 1;
+  // baked rgba texture (sampler shared)
+  tex;
+  p2t;
+  shade;
+  unit;
+  stepMm;
+  box;
+  constructor(tex, dims, spacing, opts = {}) {
+    const center = opts.center ?? [0, 0, 0];
+    this.tex = tex;
+    if (opts.ijkToRAS) {
+      this.p2t = patientToTextureFromIjkToRAS(opts.ijkToRAS, dims);
+      this.box = volumeAABBFromIjkToRAS(opts.ijkToRAS, dims);
+      this.stepMm = Math.min(...spacingFromIjkToRAS(opts.ijkToRAS));
+    } else {
+      this.p2t = patientToTexture(dims, spacing, center);
+      this.box = volumeAABB(dims, spacing, center);
+      this.stepMm = Math.min(...spacing);
+    }
+    this.shade = opts.shade ?? [0.3, 0.75, 0.45, 24];
+    this.unit = opts.opacityUnitDistance ?? this.stepMm;
+  }
+  uniformFloats() {
+    return 24;
+  }
+  // mat4(16) + params(4) + shade(4)
+  aabb() {
+    return this.box;
+  }
+  sampleStep() {
+    return this.stepMm;
+  }
+  /** Swap the baked texture in place (e.g. after re-baking an updated mask). The
+   *  geometry is unchanged; the caller refreshes the SceneRenderer bind group. */
+  setTexture(tex, destroyPrev = true) {
+    if (destroyPrev && this.tex !== tex) this.tex.destroy();
+    this.tex = tex;
+  }
+  get texture() {
+    return this.tex;
+  }
+  structMembers(s) {
+    return [
+      `  rgba${s}_p2t : mat4x4<f32>,`,
+      `  rgba${s}_params : vec4<f32>,`,
+      // opacity_unit_distance, _, _, _
+      `  rgba${s}_shade : vec4<f32>,`
+      // ka, kd, ks, shininess
+    ].join("\n");
+  }
+  declareBindings(s, base) {
+    return `@group(0) @binding(${base}) var t_rgba${s} : texture_3d<f32>;`;
+  }
+  samplingWGSL(s) {
+    return (
+      /* wgsl */
+      `
+fn alpha_rgba${s}(wp : vec3<f32>) -> f32 {
+  let t4 = u_material.rgba${s}_p2t * vec4<f32>(transform_point_rgba${s}(wp), 1.0);
+  return textureSampleLevel(t_rgba${s}, s_lin, clamp(t4.xyz, vec3<f32>(0.0), vec3<f32>(1.0)), 0.0).a;
+}
+fn sample_field_rgba${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
+  let t4 = u_material.rgba${s}_p2t * vec4<f32>(transform_point_rgba${s}(wp), 1.0);
+  let tex = t4.xyz;
+  if (any(tex < vec3<f32>(0.0)) || any(tex > vec3<f32>(1.0))) { return vec4<f32>(0.0); }
+  let c = textureSampleLevel(t_rgba${s}, s_lin, tex, 0.0);
+  let step = u_material.scene.x;
+  let unit = max(u_material.rgba${s}_params.x, 1e-3);
+  let opacity = clamp(1.0 - pow(1.0 - clamp(c.a, 0.0, 1.0), step / unit), 0.0, 1.0);
+  if (opacity <= 0.001) { return vec4<f32>(0.0); }
+  let h = step * 2.0;   // wider central difference -> smoother normals (less shading aliasing on coarse volumes)
+  let g = vec3<f32>(
+    alpha_rgba${s}(wp + vec3<f32>(h,0,0)) - alpha_rgba${s}(wp - vec3<f32>(h,0,0)),
+    alpha_rgba${s}(wp + vec3<f32>(0,h,0)) - alpha_rgba${s}(wp - vec3<f32>(0,h,0)),
+    alpha_rgba${s}(wp + vec3<f32>(0,0,h)) - alpha_rgba${s}(wp - vec3<f32>(0,0,h))) / (2.0 * h);
+  let glen = length(g);
+  let ka = u_material.rgba${s}_shade.x; let kd = u_material.rgba${s}_shade.y;
+  let ks = u_material.rgba${s}_shade.z; let sh = u_material.rgba${s}_shade.w;
+  var lit_srgb = c.rgb * ka;
+  if (glen > 1e-6) {
+    var n = g / glen;
+    if (dot(n, -rd) < 0.0) { n = -n; }
+    let view_dir = normalize(-rd);
+    let ldotn = dot(view_dir, n);
+    if (ldotn > 0.0) {
+      let refl = normalize(2.0 * ldotn * n - view_dir);
+      let rdotv = max(0.0, dot(refl, view_dir));
+      lit_srgb = c.rgb * (ka + kd * ldotn) + vec3<f32>(ks * pow(rdotv, sh));
+    }
+  }
+  let lit = srgb2physical(clamp(lit_srgb, vec3<f32>(0.0), vec3<f32>(1.0)));
+  return vec4<f32>(lit * opacity, opacity);
+}`
+    );
+  }
+  fillUniforms(out, off) {
+    out.set(this.p2t, off);
+    out[off + 16] = this.unit;
+    out[off + 20] = this.shade[0];
+    out[off + 21] = this.shade[1];
+    out[off + 22] = this.shade[2];
+    out[off + 23] = this.shade[3];
+  }
+  bindEntries(_s, base) {
+    return [{ binding: base, resource: this.tex.createView() }];
+  }
+};
 
 // render/bake.ts
 var INIT_WGSL = (
@@ -1381,6 +1491,7 @@ function bakeSegmentPresence(dev, mask, dims, sigmaVoxels = 1.5) {
 }
 
 // render/demos/segroulette-scene.ts
+var MAX_ISO_SEGMENTS = 12;
 function grayLUT() {
   const lut = new Uint8Array(256 * 4);
   for (let i = 0; i < 256; i++) {
@@ -1401,44 +1512,55 @@ function buildSegrouletteScene(gpu, format, ct, seg) {
     ijkToRAS: ct.ijkToRAS,
     shade: [0.25, 0.7, 0.45, 20]
   });
-  const segFields = [];
   const segments = [];
   const palette = new Float32Array(256 * 4);
   if (seg) {
     const total = dims[0] * dims[1] * dims[2];
     for (const [num, r, g, b] of seg.colors) {
       if (num === 0 || r === 0 && g === 0 && b === 0) continue;
-      const mask = new Uint8Array(total);
       let n = 0;
-      for (let i = 0; i < seg.lab.length; i++) if (seg.lab[i] === num) {
-        mask[i] = 1;
-        n++;
-      }
+      for (let i = 0; i < seg.lab.length; i++) if (seg.lab[i] === num) n++;
       if (!n || n > total * 0.6) continue;
-      const tex = bakeSegmentPresence(dev, mask, dims, 1.5);
-      segFields.push(new SegmentField(tex, dims, [1, 1, 1], { color: [r, g, b], opacity: 1, ijkToRAS: ct.ijkToRAS }));
       if (num < 256) {
         palette[num * 4] = r;
         palette[num * 4 + 1] = g;
         palette[num * 4 + 2] = b;
         palette[num * 4 + 3] = 1;
       }
-      segments.push({ name: seg.names[num] ?? `Segment ${num}`, color: [r, g, b], voxels: n });
+      segments.push({ num, name: seg.names[num] ?? `Segment ${num}`, color: [r, g, b], voxels: n });
     }
   }
+  const colorizeTex = seg ? bakeColorizeRGBA(dev, seg.lab, dims, palette, 1.5) : void 0;
+  const useIso = segments.length > 0 && segments.length <= MAX_ISO_SEGMENTS;
+  let mode = "volume";
+  let fields3d;
+  if (useIso) {
+    fields3d = segments.map((s) => {
+      const mask = new Uint8Array(dims[0] * dims[1] * dims[2]);
+      for (let i = 0; i < seg.lab.length; i++) if (seg.lab[i] === s.num) mask[i] = 1;
+      const tex = bakeSegmentPresence(dev, mask, dims, 1.5);
+      return new SegmentField(tex, dims, [1, 1, 1], { color: s.color, opacity: 1, ijkToRAS: ct.ijkToRAS });
+    });
+    mode = "iso";
+  } else if (colorizeTex) {
+    fields3d = [new RGBAVolumeField(colorizeTex, dims, [1, 1, 1], { ijkToRAS: ct.ijkToRAS, shade: [0.3, 0.78, 0.5, 28] })];
+    mode = "colorized";
+  } else {
+    fields3d = [ctField];
+    mode = "volume";
+  }
   const scene = new SceneRenderer(gpu, format);
-  scene.build(segFields.length ? segFields : [ctField]);
+  scene.build(fields3d);
   scene.setBackground(0.05, 0.06, 0.09);
   const slice = new SliceRenderer(gpu, format);
   const [rasLo, rasHi] = ctField.aabb();
   slice.setVolume(ctField.patientToTexture(), rasLo, rasHi);
-  const overlay = seg ? bakeColorizeRGBA(dev, seg.lab, dims, palette, 1.5) : void 0;
-  slice.setTextures(ctField.volumeTexture(), overlay);
+  slice.setTextures(ctField.volumeTexture(), colorizeTex);
   slice.setWindowLevel(ct.win, ct.lev);
   slice.setOverlayOpacity(seg ? 0.5 : 0);
   const center = [(rasLo[0] + rasHi[0]) / 2, (rasLo[1] + rasHi[1]) / 2, (rasLo[2] + rasHi[2]) / 2];
   const radius = Math.hypot(rasHi[0] - rasLo[0], rasHi[1] - rasLo[1], rasHi[2] - rasLo[2]) / 2;
-  return { scene, slice, center, radius, rasLo, rasHi, ijkToRAS: ct.ijkToRAS, dims, win: ct.win, lev: ct.lev, segments };
+  return { scene, slice, center, radius, rasLo, rasHi, ijkToRAS: ct.ijkToRAS, dims, win: ct.win, lev: ct.lev, segments, mode };
 }
 
 // render/demos/crosshair.ts
