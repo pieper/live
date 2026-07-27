@@ -2116,6 +2116,10 @@ async function spinRandom(handlers = {}, opts) {
 
 // render/demos/segroulette-browser.ts
 var MANIFEST = "../legacy/segroulette.json";
+var PARAMS = new URLSearchParams(location.search);
+var SEG_PARAM = PARAMS.get("s") || PARAMS.get("seg") || "";
+var COL_PARAM = PARAMS.get("col") || "";
+var cachedManifest = null;
 var status = (msg, err = false) => {
   const el2 = document.getElementById("status");
   if (el2) {
@@ -2189,14 +2193,21 @@ async function main() {
     info.innerHTML = `<div class="col">${entry?.col ?? ""} <span class="mod">${entry?.m ?? ""}</span></div><div class="sd">${entry?.sd ?? "segmentation"}</div><div class="segs">${segs || "<i>no segments</i>"}</div>` + (entry?.lic ? `<div class="lic">${entry.lic}</div>` : "");
   };
   const spinBtn = el("spin");
+  const onProgress = (p) => status(`${p.msg}${p.frac ? ` \u2014 ${Math.round(p.frac * 100)}%` : ""}`);
+  async function pickAndLoad() {
+    if (SEG_PARAM) {
+      cachedManifest ??= await loadManifest(MANIFEST);
+      const entry = cachedManifest.rows.find((e) => e.s === SEG_PARAM || (e.s ?? "").startsWith(SEG_PARAM));
+      if (!entry) throw new Error(`SEG series "${SEG_PARAM}" not found in the manifest`);
+      return loadSeries(entry, { onProgress });
+    }
+    return spinRandom({ onProgress }, { manifestUrl: MANIFEST, filter: COL_PARAM ? (e) => e.col === COL_PARAM : void 0 });
+  }
   async function spin() {
     spinBtn.disabled = true;
-    status("spinning\u2026 picking a random IDC series");
+    status(SEG_PARAM ? "loading the requested SEG series\u2026" : COL_PARAM ? `spinning within ${COL_PARAM}\u2026` : "spinning\u2026 picking a random IDC series");
     try {
-      const res = await spinRandom(
-        { onProgress: (p) => status(`${p.msg}${p.frac ? ` \u2014 ${Math.round(p.frac * 100)}%` : ""}`) },
-        { manifestUrl: MANIFEST }
-      );
+      const res = await pickAndLoad();
       status("baking segmentation iso shells\u2026");
       rs = buildSegrouletteScene(gpu, srgb, res.ct, res.seg);
       for (const p of planes) off[p.cell] = slicerDefaultOffset01(p.orient, rs.dims, rs.ijkToRAS, rs.rasLo, rs.rasHi);
@@ -2206,8 +2217,11 @@ async function main() {
       camera.viewUp = framed.viewUp;
       camera.viewAngle = framed.viewAngle;
       showMeta(res.entry, rs);
+      const d3 = document.querySelector(".lab.d3");
+      if (d3) d3.textContent = rs.mode === "colorized" ? "3D \xB7 colorized volume" : rs.mode === "iso" ? "3D \xB7 SegmentField iso" : "3D \xB7 volume";
       resize();
-      status(`${res.entry?.col ?? "IDC"} \xB7 ${res.entry?.m ?? ""} \xB7 ${rs.segments.length} segment${rs.segments.length === 1 ? "" : "s"} \xB7 scroll a slice, drag 3D to orbit \xB7 Spin for another`);
+      const modeNote = rs.mode === "colorized" ? ` (colorized \u2014 too many for per-segment iso)` : "";
+      status(`${res.entry?.col ?? "IDC"} \xB7 ${res.entry?.m ?? ""} \xB7 ${rs.segments.length} segment${rs.segments.length === 1 ? "" : "s"}${modeNote} \xB7 scroll a slice, drag 3D to orbit \xB7 Spin for another`);
     } catch (e) {
       status("load failed: " + (e?.message ?? e) + " \u2014 try Spin again", true);
     } finally {
@@ -2215,6 +2229,8 @@ async function main() {
     }
   }
   spinBtn.addEventListener("click", spin);
+  if (SEG_PARAM) spinBtn.textContent = "\u21BB Reload";
+  else if (COL_PARAM) spinBtn.textContent = `\u{1F3B2} ${COL_PARAM}`;
   for (const p of planes) {
     cv[p.cell].addEventListener("wheel", (e) => {
       e.preventDefault();
@@ -2241,7 +2257,9 @@ async function main() {
     center: () => rs?.center ?? null,
     crosshair: () => xhair?.state.ras ?? null,
     pick3D: (u, v) => rs?.scene.pick(u, v) ?? null,
-    camera: () => ({ position: [...camera.position], focalPoint: [...camera.focalPoint], viewUp: [...camera.viewUp] })
+    camera: () => ({ position: [...camera.position], focalPoint: [...camera.focalPoint], viewUp: [...camera.viewUp] }),
+    mode: () => rs?.mode ?? null,
+    params: () => ({ s: SEG_PARAM, col: COL_PARAM })
   };
   status("SlicerLive SEGRoulette \u2014 click Spin to load a random IDC segmentation");
   await spin();
