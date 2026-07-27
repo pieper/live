@@ -2192,6 +2192,37 @@ function attachSliceControls(canvas, cfg) {
   };
 }
 
+// render/demos/view-grid.ts
+function attachViewGrid(grid, cells, onResize) {
+  let maxed = null;
+  const cellDiv = (cell) => grid.querySelector(`.cell[data-cell="${cell}"]`);
+  return {
+    toggleMax(cell) {
+      maxed = maxed === cell ? null : cell;
+      for (const n of cells) cellDiv(n).classList.toggle("max", n === maxed);
+      grid.classList.toggle("has-max", maxed !== null);
+      requestAnimationFrame(onResize);
+    },
+    isMax(cell) {
+      return maxed === cell;
+    },
+    maxCell: () => maxed
+  };
+}
+function attachDoubleClick(canvas, onDbl) {
+  let last = 0, lx = 0, ly = 0;
+  canvas.addEventListener("pointerdown", (e) => {
+    const dbl = e.timeStamp - last < 350 && Math.hypot(e.clientX - lx, e.clientY - ly) < 6;
+    last = dbl ? 0 : e.timeStamp;
+    lx = e.clientX;
+    ly = e.clientY;
+    if (dbl) {
+      e.preventDefault();
+      onDbl();
+    }
+  });
+}
+
 // render/vendor/idc_tools/s3.js
 var idcS3 = (bucket) => "https://" + (bucket || "idc-open-data") + ".s3.us-east-1.amazonaws.com/";
 async function fetchRetry(url, opts, tries = 6) {
@@ -2413,11 +2444,13 @@ async function main() {
     drawAll();
   };
   globalThis.addEventListener("resize", resize);
+  const grid = attachViewGrid(document.getElementById("grid"), names, resize);
+  attachDoubleClick(cv.threeD, () => grid.toggleMax("threeD"));
   const showMeta = (entry, sc) => {
     const info = el("info");
     if (!info) return;
-    const segs = sc.segments.map((s) => `<span class="chip" style="border-color:rgb(${s.color.map((c) => Math.round(c * 255)).join(",")})">${s.name}</span>`).join(" ");
-    info.innerHTML = `<div class="col">${entry?.col ?? ""} <span class="mod">${entry?.m ?? ""}</span></div><div class="sd">${entry?.sd ?? "segmentation"}</div><div class="segs">${segs || "<i>no segments</i>"}</div>` + (entry?.lic ? `<div class="lic">${entry.lic}</div>` : "");
+    const n = sc.segments.length;
+    info.innerHTML = `<span class="col">${entry?.col ?? "IDC"}</span><span class="mod">${entry?.m ?? ""}</span><span class="sd">${entry?.sd ?? "segmentation"}</span><span class="n">\xB7 ${n} segment${n === 1 ? "" : "s"}${entry?.lic ? " \xB7 " + entry.lic : ""}</span>`;
   };
   const spinBtn = el("spin");
   const onProgress = (p) => status(`${p.msg}${p.frac ? ` \u2014 ${Math.round(p.frac * 100)}%` : ""}`);
@@ -2469,7 +2502,11 @@ async function main() {
       redraw: () => {
         drawSlice(p);
         xhair?.redraw();
-      }
+      },
+      hooks: { onDoubleClick: () => {
+        grid.toggleMax(p.cell);
+        return true;
+      } }
     });
   }
   attachCameraControls(cv.threeD, camera, { onChange: () => {

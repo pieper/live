@@ -7,57 +7,52 @@
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
-  body { margin: 0; background: #0e0e16; color: #d8d8e0; font-family: -apple-system, system-ui, sans-serif; }
-  header { padding: 16px 22px; border-bottom: 1px solid #2a2a3a; }
-  h1 { margin: 0; font-size: 19px; }
-  .sub { opacity: .65; font-size: 13px; margin-top: 5px; max-width: 860px; line-height: 1.5; }
-  .badge { display: inline-block; font-size: 11px; color: #04121c; background: linear-gradient(180deg, #9fe9ff, #54c6f0);
-           font-weight: 700; border-radius: 5px; padding: 1px 7px; vertical-align: middle; margin-left: 6px; }
+  html, body { height: 100%; }
+  body { margin: 0; background: #000; color: #d8d8e0; font-family: -apple-system, system-ui, sans-serif; display: flex; flex-direction: column; }
+  header { flex: 0 0 auto; display: flex; align-items: center; gap: 12px; padding: 7px 12px; border-bottom: 1px solid #23232f; background: #0e0e16; }
+  h1 { margin: 0; font-size: 15px; white-space: nowrap; }
+  .badge { display: inline-block; font-size: 10px; color: #04121c; background: linear-gradient(180deg, #9fe9ff, #54c6f0);
+           font-weight: 700; border-radius: 5px; padding: 1px 6px; vertical-align: middle; margin-left: 4px; }
   a { color: #7fa8e0; }
-  main { display: flex; flex-direction: column; align-items: center; padding: 18px; gap: 10px; }
-  .bar { display: flex; align-items: center; gap: 14px; width: min(760px, 94vw); flex-wrap: wrap; }
-  button#spin { font: 600 14px/1 -apple-system, system-ui, sans-serif; color: #04121c; cursor: pointer;
-    background: linear-gradient(180deg, #9fe9ff, #54c6f0); border: 0; border-radius: 8px; padding: 9px 16px; }
+  button#spin { font: 600 13px -apple-system, system-ui, sans-serif; color: #04121c; cursor: pointer; white-space: nowrap;
+    background: linear-gradient(180deg, #9fe9ff, #54c6f0); border: 0; border-radius: 7px; padding: 6px 13px; }
   button#spin:disabled { opacity: .5; cursor: default; }
-  #info { font-size: 13px; line-height: 1.45; flex: 1; min-width: 240px; }
+  #info { font-size: 12px; line-height: 1.35; flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
   #info .col { font-weight: 650; text-transform: uppercase; letter-spacing: .3px; }
-  #info .mod { font-weight: 600; color: #9fe9ff; margin-left: 6px; }
-  #info .sd { opacity: .8; }
-  #info .segs { margin-top: 4px; display: flex; flex-wrap: wrap; gap: 5px; }
-  #info .chip { font-size: 11px; border: 1px solid #666; border-radius: 999px; padding: 1px 9px; }
-  #info .lic { opacity: .5; font-size: 11px; margin-top: 3px; }
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; width: min(760px, 94vw); }
-  .cell { position: relative; aspect-ratio: 1; }
-  .cell canvas { width: 100%; height: 100%; display: block; border-radius: 6px; background: #000; touch-action: none; }
-  .cell .lab { position: absolute; top: 6px; left: 8px; font-size: 11px; font-weight: 700; letter-spacing: .3px; opacity: .9; }
-  #c-axial { cursor: ns-resize; } #c-coronal { cursor: ns-resize; } #c-sagittal { cursor: ns-resize; } #c-threeD { cursor: grab; }
+  #info .mod { font-weight: 600; color: #9fe9ff; margin: 0 6px; }
+  #info .sd { opacity: .75; margin-left: 6px; }
+  #info .n { opacity: .6; margin-left: 6px; }
+  .sub { font-size: 11px; opacity: .6; white-space: nowrap; }
+  /* the 4-up IS the page */
+  main { flex: 1 1 auto; min-height: 0; padding: 4px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 4px; width: 100%; height: 100%; }
+  .cell { position: relative; min-width: 0; min-height: 0; }
+  .cell canvas { width: 100%; height: 100%; display: block; border-radius: 5px; background: #000; touch-action: none; }
+  .cell .lab { position: absolute; top: 6px; left: 8px; font-size: 11px; font-weight: 700; letter-spacing: .3px; opacity: .9; pointer-events: none; }
+  .grid.has-max > .cell { display: none; }
+  .grid.has-max > .cell.max { display: block; grid-area: 1 / 1 / -1 / -1; }
+  #c-axial, #c-coronal, #c-sagittal { cursor: ns-resize; } #c-threeD { cursor: grab; }
   .lab.red { color: #f05a5a; } .lab.green { color: #5ad07a; } .lab.yellow { color: #e8c85a; } .lab.d3 { color: #9fe9ff; }
-  #status { font-size: 12px; color: #9fb3d0; min-height: 1.4em; font-family: ui-monospace, monospace; text-align: center; }
+  #status { position: fixed; bottom: 6px; left: 10px; font-size: 11px; color: #9fb3d0; font-family: ui-monospace, monospace; pointer-events: none; text-shadow: 0 0 3px #000; }
 </style>
 </head>
 <body>
 <header>
-  <h1>SlicerLive — SEGRoulette <span class="badge">WebGPU</span></h1>
-  <div class="sub">Spin a random segmentation out of <b>190k+ IDC DICOM SEGs</b> (36 collections): its source CT/MR/PET
-    and the DICOM SEG stream straight from the public <a href="https://imaging.datacommons.cancer.gov/" target="_blank">Imaging Data Commons</a>
-    buckets and are parsed in your browser (dcmjs). The segmentation renders with the SlicerLive <b>SegmentField</b> —
-    the step-derived <i>iso</i> band-shell (an isosurface of the smoothed presence field), the WebGPU-native
-    replacement for vtk.js surface models. Scroll a slice to scrub; drag the 3D view to orbit.
-    &nbsp;·&nbsp; <a href="https://github.com/pieper/SlicerLive" target="_blank">SlicerLive</a></div>
+  <h1>SEGRoulette<span class="badge">WebGPU</span></h1>
+  <button id="spin">🎲 Spin</button>
+  <div id="info"></div>
+  <span class="sub">scroll a slice · right-drag zoom · double-click maximize · drag 3D to orbit ·
+    <a href="https://github.com/pieper/SlicerLive" target="_blank">SlicerLive</a></span>
 </header>
 <main>
-  <div class="bar">
-    <button id="spin">🎲 Spin</button>
-    <div id="info"></div>
+  <div class="grid" id="grid">
+    <div class="cell" data-cell="axial"><span class="lab red">AXIAL</span><canvas id="c-axial"></canvas></div>
+    <div class="cell" data-cell="threeD"><span class="lab d3" id="lab-threeD">3D · SegmentField iso</span><canvas id="c-threeD"></canvas></div>
+    <div class="cell" data-cell="coronal"><span class="lab green">CORONAL</span><canvas id="c-coronal"></canvas></div>
+    <div class="cell" data-cell="sagittal"><span class="lab yellow">SAGITTAL</span><canvas id="c-sagittal"></canvas></div>
   </div>
-  <div class="grid">
-    <div class="cell"><span class="lab red">AXIAL</span><canvas id="c-axial"></canvas></div>
-    <div class="cell"><span class="lab d3">3D · SegmentField iso</span><canvas id="c-threeD"></canvas></div>
-    <div class="cell"><span class="lab green">CORONAL</span><canvas id="c-coronal"></canvas></div>
-    <div class="cell"><span class="lab yellow">SAGITTAL</span><canvas id="c-sagittal"></canvas></div>
-  </div>
-  <div id="status">loading…</div>
 </main>
+<div id="status">loading…</div>
 <script type="module" src="./segroulette.js"></script>
 </body>
 </html>
