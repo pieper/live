@@ -177,6 +177,26 @@ var SceneRenderer = class _SceneRenderer {
   matBuf;
   mat;
   bind;
+  // PICK pass: a 1x1 ray-trace that reuses the field compositing to find the RAS point where
+  // front-to-back opacity first crosses 50% (Slicer's 3D volume pick). Ghost handles excluded.
+  pickPipeline;
+  pickBind;
+  pickOff = 0;
+  // mat[] offset of the pick_cursor uniform (NDC)
+  pickTarget;
+  // 1x1 rgba32float (wp.xyz, hit)
+  pickReadBuf;
+  // PRODUCER→RECONSTRUCTOR seam (docs/UNIFIED-RENDERING-PLAN.md M1). The ray-march writes the
+  // premultiplied composited sample into `traceTex` (rgba32float, lossless); `resolvePipeline`
+  // composites it over the background into the output view. 1:1 for now (byte-identical); the
+  // resolve pass is where spatial upsample + temporal accumulation (time-averaged AA) will live.
+  resolvePipeline;
+  resolveBind;
+  resolveBgBuf;
+  traceTex;
+  traceView;
+  traceW = 0;
+  traceH = 0;
   /** Emit a default AABB-distance skip for fields that don't supply their own bound.
    *
    *  OFF because it MEASURED AS A NET LOSS (render/test/profile-boxskip.ts, 448², M-series):
@@ -203,6 +223,74 @@ var SceneRenderer = class _SceneRenderer {
     this.canTime = gpu.features.has("timestamp-query");
     this.sampler = this.dev.createSampler({ magFilter: "linear", minFilter: "linear", addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge", addressModeW: "clamp-to-edge" });
     this.camBuf = this.dev.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.resolveBgBuf = this.dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const rmod = this.dev.createShaderModule({ code: this.resolveWgsl() });
+    this.resolvePipeline = this.dev.createRenderPipeline({
+      layout: "auto",
+      vertex: { module: rmod, entryPoint: "vs_resolve" },
+      fragment: { module: rmod, entryPoint: "fs_resolve", targets: [{ format: this.format }] },
+      primitive: { topology: "triangle-list", cullMode: "none" }
+    });
+  }
+  /** RECONSTRUCTOR (M1: identity resolve). Composites the traced premultiplied sample over the
+   *  background — the exact `mix(bg, rgb, a)` the fused fs_main used. `textureLoad` at integer
+   *  coords is a 1:1 fetch (no filtering), so the output is byte-identical to the fused path.
+   *  M2 replaces this with a spatial-upsample + temporal-accumulate resolve. */
+  resolveWgsl() {
+    return (
+      /* wgsl */
+      `
+@group(0) @binding(0) var t_trace : texture_2d<f32>;
+@group(0) @binding(1) var<uniform> u_bg : vec4<f32>;
+fn srgb2physical(c : vec3<f32>) -> vec3<f32> {
+  let lo = c / 12.92;
+  let hi = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+  return select(lo, hi, c > vec3<f32>(0.04045));
+}
+struct RV { @builtin(position) position : vec4<f32> };
+@vertex
+fn vs_resolve(@builtin(vertex_index) vi : u32) -> RV {
+  let x = select(-1.0, 3.0, vi == 1u);
+  let y = select(-1.0, 3.0, vi == 2u);
+  var o : RV; o.position = vec4<f32>(x, y, 0.0, 1.0); return o;
+}
+@fragment
+fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
+  let s = textureLoad(t_trace, vec2<i32>(v.position.xy), 0);
+  let bg = srgb2physical(u_bg.rgb);
+  return vec4<f32>(mix(bg, s.rgb, s.a), 1.0);
+}`
+    );
+  }
+  /** (Re)allocate the trace target + resolve bind group when the view size changes. */
+  ensureTrace(width, height) {
+    if (this.traceTex && this.traceW === width && this.traceH === height) return;
+    this.traceTex?.destroy();
+    this.traceTex = this.dev.createTexture({
+      size: [width, height],
+      format: "rgba32float",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
+    });
+    this.traceView = this.traceTex.createView();
+    this.traceW = width;
+    this.traceH = height;
+    this.resolveBind = this.dev.createBindGroup({
+      layout: this.resolvePipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: this.traceView }, { binding: 1, resource: { buffer: this.resolveBgBuf } }]
+    });
+  }
+  /** Encode trace (producer) + resolve (reconstructor) into `enc`, output to `outView`. */
+  encodeFrame(enc, outView) {
+    const tp = enc.beginRenderPass({ colorAttachments: [{ view: this.traceView, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
+    tp.setPipeline(this.pipeline);
+    tp.setBindGroup(0, this.bind);
+    tp.draw(3);
+    tp.end();
+    const rp = enc.beginRenderPass({ colorAttachments: [{ view: outView, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }] });
+    rp.setPipeline(this.resolvePipeline);
+    rp.setBindGroup(0, this.resolveBind);
+    rp.draw(3);
+    rp.end();
   }
   /** (Re)build the pipeline for a set of fields. */
   build(fields) {
@@ -217,15 +305,24 @@ var SceneRenderer = class _SceneRenderer {
       return p;
     });
     this.clipOff = uoff;
-    this.mat = new Float32Array(uoff + CLIP_FLOATS);
-    this.matBuf = this.dev.createBuffer({ size: (uoff + CLIP_FLOATS) * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.pickOff = uoff + CLIP_FLOATS;
+    this.mat = new Float32Array(uoff + CLIP_FLOATS + 4);
+    this.matBuf = this.dev.createBuffer({ size: (uoff + CLIP_FLOATS + 4) * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const module = this.dev.createShaderModule({ code: this.wgsl() });
     this.pipeline = this.dev.createRenderPipeline({
       layout: "auto",
-      vertex: { module: this.dev.createShaderModule({ code: this.wgsl() }), entryPoint: "vs_main" },
-      fragment: { module: this.dev.createShaderModule({ code: this.wgsl() }), entryPoint: "fs_main", targets: [{ format: this.format }] },
+      vertex: { module, entryPoint: "vs_main" },
+      fragment: { module, entryPoint: "fs_trace", targets: [{ format: "rgba32float" }] },
+      primitive: { topology: "triangle-list", cullMode: "none" }
+    });
+    this.pickPipeline = this.dev.createRenderPipeline({
+      layout: "auto",
+      vertex: { module, entryPoint: "vs_main" },
+      fragment: { module, entryPoint: "fs_pick", targets: [{ format: "rgba32float" }] },
       primitive: { topology: "triangle-list", cullMode: "none" }
     });
     this.bind = this.dev.createBindGroup({ layout: this.pipeline.getBindGroupLayout(0), entries: this.bindGroupEntries() });
+    if (this.pickPipeline) this.pickBind = this.dev.createBindGroup({ layout: this.pickPipeline.getBindGroupLayout(0), entries: this.bindGroupEntries() });
     this.setBackground(0.07, 0.08, 0.12);
     const step = this.placed.length ? Math.min(...this.placed.map((p) => p.field.sampleStep())) : 1;
     this.setSampleStep(step * 0.7);
@@ -294,6 +391,9 @@ fn skip_${p.field.kind}${p.slot}(wp : vec3<f32>) -> f32 {
       (p) => ghostCanSkip.has(p.field) ? skipBranch(p, false, true) : plainBranch(p, false, true)
     ).join("\n");
     const hasGhost = ghostFields.length > 0;
+    const pickDispatch = normalReceivers.map(
+      (p) => `    ${clipGuard(p, `{ let c = sample_field_${p.field.kind}${p.slot}(wp, rd); sum += c; }`)}`
+    ).join("\n");
     return (
       /* wgsl */
       `
@@ -306,6 +406,7 @@ struct Material {
 ${members}
   clip_planes : array<vec4<f32>, 8>,   // (nx, ny, nz, offset) inward; tail so field offsets are stable
   clip_count : vec4<f32>,              // (count, _, _, _)
+  pick_cursor : vec4<f32>,             // (ndc_x, ndc_y, _, _) \u2014 the ray for fs_pick
 };
 @group(0) @binding(0) var<uniform> u_cam : Camera;
 @group(0) @binding(1) var<uniform> u_material : Material;
@@ -328,14 +429,19 @@ fn ndc_to_world(ndc : vec4<f32>) -> vec3<f32> { let w = u_cam.inv_view_proj * nd
 fn ign(p : vec2<f32>) -> f32 { return fract(52.9829189 * fract(dot(p, vec2<f32>(0.06711056, 0.00583715)))); }
 ${fns}
 
+// PRODUCER (fs_trace): march the ray and return the composited PREMULTIPLIED sample
+// (integrated.rgb, integrated.a) BEFORE the background composite \u2014 a "traced pixel". The
+// Reconstructor (fs_resolve / reconstructor.ts) composites it over the background. Splitting
+// trace from assemble is the seam the unified local/remote pipeline turns on (see
+// docs/UNIFIED-RENDERING-PLAN.md); the background composite is identical to the fused path, so
+// output is byte-identical at full density. An empty slab returns transparent (0) \u2192 resolve = bg.
 @fragment
-fn fs_main(v : Varyings) -> @location(0) vec4<f32> {
+fn fs_trace(v : Varyings) -> @location(0) vec4<f32> {
   let size = u_cam.size.xy;
   let ndc_x = (v.position.x / size.x) * 2.0 - 1.0;
   let ndc_y = 1.0 - (v.position.y / size.y) * 2.0;
   let ro = ndc_to_world(vec4<f32>(ndc_x, ndc_y, 0.0, 1.0));
   let rd = normalize(ndc_to_world(vec4<f32>(ndc_x, ndc_y, 1.0, 1.0)) - ro);
-  let bg = srgb2physical(u_material.bg.rgb);
 
   let inv = vec3<f32>(1.0) / rd;
   let tb = (u_material.bmin.xyz - ro) * inv;
@@ -343,12 +449,12 @@ fn fs_main(v : Varyings) -> @location(0) vec4<f32> {
   let tmn = min(tt, tb); let tmx = max(tt, tb);
   var t_near = max(max(tmn.x, tmn.y), tmn.z);
   var t_far  = min(min(tmx.x, tmx.y), tmx.z);
-  if (t_far <= t_near || t_far <= 0.0) { return vec4<f32>(bg, 1.0); }
+  if (t_far <= t_near || t_far <= 0.0) { return vec4<f32>(0.0); }
 
   let step = max(u_material.scene.x, 1e-3);
   t_near = max(t_near + step, 0.0);
   t_far  = t_far - step;
-  if (t_far <= t_near) { return vec4<f32>(bg, 1.0); }
+  if (t_far <= t_near) { return vec4<f32>(0.0); }
   let seed = ign(v.position.xy);
   var t = t_near;
   var integrated = vec4<f32>(0.0);
@@ -393,7 +499,48 @@ ${ghostDispatch}
     let fA = integrated.a * residual;
     integrated = vec4<f32>(integrated.rgb * residual + (1.0 - fA) * g_col * ga, fA + (1.0 - fA) * ga);
   }
-  return vec4<f32>(mix(bg, integrated.rgb, integrated.a), 1.0);
+  return integrated;   // premultiplied (rgb, a); resolve composites over the background
+}
+
+// PICK: trace the cursor ray (pick_cursor NDC) through the SAME field compositing and return the
+// world (RAS) position where front-to-back opacity first crosses 50% \u2014 Slicer's 3D volume pick.
+// Output: (wp.x, wp.y, wp.z, hit). hit=0 means the ray never reached 50% (empty/miss).
+@fragment
+fn fs_pick() -> @location(0) vec4<f32> {
+  let ro = ndc_to_world(vec4<f32>(u_material.pick_cursor.x, u_material.pick_cursor.y, 0.0, 1.0));
+  let rd = normalize(ndc_to_world(vec4<f32>(u_material.pick_cursor.x, u_material.pick_cursor.y, 1.0, 1.0)) - ro);
+  let inv = vec3<f32>(1.0) / rd;
+  let tb = (u_material.bmin.xyz - ro) * inv;
+  let tt = (u_material.bmax.xyz - ro) * inv;
+  let tmn = min(tt, tb); let tmx = max(tt, tb);
+  var t_near = max(max(tmn.x, tmn.y), tmn.z);
+  var t_far  = min(min(tmx.x, tmx.y), tmx.z);
+  if (t_far <= t_near || t_far <= 0.0) { return vec4<f32>(0.0); }
+  let step = max(u_material.scene.x, 1e-3);
+  t_near = max(t_near + step, 0.0);
+  t_far  = t_far - step;
+  var t = t_near;
+  var acc = 0.0;
+  var safety : i32 = 0;
+  loop {
+    if (t >= t_far || safety >= 5000 || acc >= 0.5) { break; }
+    let wp = ro + rd * t;
+    var clipped = false;
+    let ccount = u32(u_material.clip_count.x);
+    for (var ci = 0u; ci < ccount; ci = ci + 1u) {
+      let cp = u_material.clip_planes[ci];
+      if (dot(wp, cp.xyz) + cp.w < 0.0) { clipped = true; break; }
+    }
+    var sum = vec4<f32>(0.0);
+${pickDispatch}
+    if (sum.a > 0.0) {
+      let a_new = acc + (1.0 - acc) * clamp(sum.a, 0.0, 1.0);
+      if (a_new >= 0.5) { return vec4<f32>(wp, 1.0); }   // 50% crossing -> the pick point
+      acc = a_new;
+    }
+    t = t + step;
+  }
+  return vec4<f32>(0.0);
 }`
     );
   }
@@ -468,6 +615,7 @@ ${ghostDispatch}
    *  swapped a texture) without recompiling the pipeline. Field set/structure must be unchanged. */
   refreshBindings() {
     this.bind = this.dev.createBindGroup({ layout: this.pipeline.getBindGroupLayout(0), entries: this.bindGroupEntries() });
+    if (this.pickPipeline) this.pickBind = this.dev.createBindGroup({ layout: this.pickPipeline.getBindGroupLayout(0), entries: this.bindGroupEntries() });
   }
   /** Only fields with texture bindings use the shared sampler. `layout: "auto"` derives the
    *  layout from what the shader ACTUALLY references, so in a scene of purely procedural
@@ -503,14 +651,38 @@ ${ghostDispatch}
   flush() {
     this.dev.queue.writeBuffer(this.matBuf, 0, this.mat);
   }
-  renderToView(view, width, height) {
+  /** Ray-trace the cursor (u,v in [0,1], y down) through the composited fields and return the
+   *  RAS point where front-to-back opacity first reaches 50% — Slicer's 3D volume pick. Traces
+   *  whatever renders (DVR volumes, SegmentField iso shells, RGBA), EXCLUDING ghost handles.
+   *  Uses the camera set by the last setCamera(); returns null if the ray never reaches 50%. */
+  async pick(u, v) {
+    if (!this.pickPipeline || !this.pickBind || !this.placed.length) return null;
+    this.mat[this.pickOff] = u * 2 - 1;
+    this.mat[this.pickOff + 1] = 1 - v * 2;
     this.flush();
+    if (!this.pickTarget) {
+      this.pickTarget = this.dev.createTexture({ size: [1, 1], format: "rgba32float", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+      this.pickReadBuf = this.dev.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    }
     const enc = this.dev.createCommandEncoder();
-    const pass = enc.beginRenderPass({ colorAttachments: [{ view, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }] });
-    pass.setPipeline(this.pipeline);
-    pass.setBindGroup(0, this.bind);
+    const pass = enc.beginRenderPass({ colorAttachments: [{ view: this.pickTarget.createView(), loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
+    pass.setPipeline(this.pickPipeline);
+    pass.setBindGroup(0, this.pickBind);
     pass.draw(3);
     pass.end();
+    enc.copyTextureToBuffer({ texture: this.pickTarget }, { buffer: this.pickReadBuf, bytesPerRow: 256, rowsPerImage: 1 }, [1, 1]);
+    this.dev.queue.submit([enc.finish()]);
+    await this.pickReadBuf.mapAsync(GPUMapMode.READ);
+    const r = new Float32Array(this.pickReadBuf.getMappedRange().slice(0, 16));
+    this.pickReadBuf.unmap();
+    return r[3] > 0.5 ? [r[0], r[1], r[2]] : null;
+  }
+  renderToView(view, width, height) {
+    this.ensureTrace(width, height);
+    this.flush();
+    this.dev.queue.writeBuffer(this.resolveBgBuf, 0, this.mat.subarray(12, 16));
+    const enc = this.dev.createCommandEncoder();
+    this.encodeFrame(enc, view);
     this.dev.queue.submit([enc.finish()]);
   }
   /** Exact GPU time of the ray-march pass (median ms over `iters`), via timestamp-query.
@@ -520,7 +692,7 @@ ${ghostDispatch}
   async timePass(width, height, iters = 40) {
     if (!this.canTime) return NaN;
     this.flush();
-    const target = this.dev.createTexture({ size: [width, height], format: this.format, usage: GPUTextureUsage.RENDER_ATTACHMENT });
+    const target = this.dev.createTexture({ size: [width, height], format: "rgba32float", usage: GPUTextureUsage.RENDER_ATTACHMENT });
     const view = target.createView();
     const qs = this.dev.createQuerySet({ type: "timestamp", count: 2 });
     const resolve = this.dev.createBuffer({ size: 16, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
@@ -554,14 +726,12 @@ ${ghostDispatch}
     return samples[samples.length >> 1];
   }
   async renderToRGBA(width, height) {
+    this.ensureTrace(width, height);
     this.flush();
+    this.dev.queue.writeBuffer(this.resolveBgBuf, 0, this.mat.subarray(12, 16));
     const target = this.dev.createTexture({ size: [width, height], format: this.format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
     const enc = this.dev.createCommandEncoder();
-    const pass = enc.beginRenderPass({ colorAttachments: [{ view: target.createView(), loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }] });
-    pass.setPipeline(this.pipeline);
-    pass.setBindGroup(0, this.bind);
-    pass.draw(3);
-    pass.end();
+    this.encodeFrame(enc, target.createView());
     const bpr = Math.ceil(width * 4 / 256) * 256;
     const buf = this.dev.createBuffer({ size: bpr * height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     enc.copyTextureToBuffer({ texture: target }, { buffer: buf, bytesPerRow: bpr, rowsPerImage: height }, [width, height]);
@@ -590,6 +760,8 @@ var FiducialField = class {
   n = 0;
   maxR = 0;
   // largest radius in this field (for the skip bound)
+  active = -1;
+  // hovered/active sphere index (ghost mode: it goes full opacity)
   clippable;
   ghost;
   providesSkip;
@@ -626,6 +798,14 @@ var FiducialField = class {
   }
   get count() {
     return this.n;
+  }
+  /** Hovered/active sphere (ghost mode only): it renders at full opacity while the others stay
+   *  half-visible (partially hidden inside the volume). Pass null/-1 to clear. */
+  setActive(i) {
+    this.active = i ?? -1;
+  }
+  get activeIndex() {
+    return this.active;
   }
   uniformFloats() {
     return 12 + MAX * 4 * 2;
@@ -726,6 +906,7 @@ fn sample_field_fid${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
   var best_depth = -1.0;
   var best_center = vec3<f32>(0.0);
   var best_color = vec4<f32>(0.0);
+  var best_k = -1;
   var found = false;
   for (var k = 0; k < n; k = k + 1) {
     let sp = u_material.fid${s}_spheres[k];
@@ -734,7 +915,7 @@ fn sample_field_fid${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
     // so the sphere stays a constant size on screen. Otherwise sp.w is a world radius.
     ${this.screen ? `let r = sp.w * length(u_cam.eye.xyz - sp.xyz) / max(u_cam.size.z, 1.0);` : `let r = sp.w;`}
     let depth = r - length(wp_r - sp.xyz);   // > 0 -> inside this sphere
-    if (depth > best_depth) { best_depth = depth; best_center = sp.xyz; best_color = u_material.fid${s}_colors[k]; found = true; }
+    if (depth > best_depth) { best_depth = depth; best_center = sp.xyz; best_color = u_material.fid${s}_colors[k]; best_k = k; found = true; }
   }
   if (!found || best_depth <= 0.0) { return vec4<f32>(0.0); }
 
@@ -752,7 +933,11 @@ fn sample_field_fid${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
   let highlight = mix(base, u_material.fid${s}_light.rgb, 0.85);
   let lit = base * ka + base * (kd * ldotn) + highlight * (ks * pow(rdotv, sh));
   let col = srgb2physical(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)));
-  let opacity = clamp(best_color.a, 0.0, 1.0);
+  // Ghost mode: a non-active glyph emits HALF opacity so the ghost compositor leaves 50% of the
+  // volume in front of it (partially hidden inside the render); the hovered one emits full (0%
+  // residual -> fully visible). Same trick the transform gizmo uses for its active handle.
+  ${this.ghost ? `let ghostScale = select(0.5, 1.0, best_k == i32(u_material.fid${s}_params2.w));` : `let ghostScale = 1.0;`}
+  let opacity = clamp(best_color.a, 0.0, 1.0) * ghostScale;
   return vec4<f32>(col * opacity, opacity);
 }`
     );
@@ -765,6 +950,7 @@ fn sample_field_fid${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
     out[off + 4] = this.kd;
     out[off + 5] = this.ks;
     out[off + 6] = this.maxR;
+    out[off + 7] = this.active;
     out[off + 8] = this.light[0];
     out[off + 9] = this.light[1];
     out[off + 10] = this.light[2];
@@ -1198,11 +1384,29 @@ function lutFromWindowLevel() {
   }
   return lut;
 }
+function parseMarkups(nodes) {
+  const out = [];
+  for (const n of Object.values(nodes)) {
+    if (!/Markups.*Node$/.test(n.class)) continue;
+    const cps = n.attrs?.controlPoints ?? n.attrs?.markups;
+    if (!Array.isArray(cps)) continue;
+    const color = n.attrs?.color ?? [1, 0.85, 0.2];
+    cps.forEach((cp, i) => {
+      const c = cp;
+      const p = c.position ?? cp;
+      if (!Array.isArray(p) || p.length < 3) return;
+      out.push({ ras: [p[0], p[1], p[2]], label: c.label ?? `${n.name ?? "F"}-${i + 1}`, color });
+    });
+  }
+  return out;
+}
 async function loadSceneVolumeField(dev, sceneUrl, onBytes, opts = {}) {
   const raw = await (await fetch(sceneUrl)).json();
   const wrapper = raw.nodes ? raw : { nodes: raw };
   const nodes = wrapper.nodes;
-  const blobBase = wrapper.blobBase ?? sceneUrl.replace(/[^/]*$/, "") + "blobs/";
+  const pageBase = globalThis.location?.href ?? "file:///";
+  const sceneAbs = new URL(sceneUrl, pageBase).href;
+  const blobBase = new URL(wrapper.blobBase ?? "./blobs/", sceneAbs).href;
   const vol = Object.values(nodes).find((n) => n.class === "vtkMRMLScalarVolumeNode" && n.attrs?.zarr);
   if (!vol) throw new Error("no zarr ScalarVolumeNode in scene");
   const z = vol.attrs.zarr;
@@ -1245,7 +1449,7 @@ async function loadSceneVolumeField(dev, sceneUrl, onBytes, opts = {}) {
   const [lo, hi] = field.aabb();
   const center = [(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2];
   const radius = Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) / 2;
-  return { field, voxels: zv.data, dims: zv.dims, ijkToRAS, name: vol.name ?? "volume", range: zv.range, center, radius, win, lev };
+  return { field, voxels: zv.data, dims: zv.dims, ijkToRAS, name: vol.name ?? "volume", range: zv.range, center, radius, win, lev, markups: parseMarkups(nodes) };
 }
 
 // render/demos/deform-scene.ts
