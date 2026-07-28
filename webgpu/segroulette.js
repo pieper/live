@@ -3215,35 +3215,34 @@ function attachWidgetControls(canvas, camera, opts) {
 // render/demos/accum-loop.ts
 function mountAdaptiveLoop(opts) {
   const target = opts.target ?? 32;
-  const idleGap = opts.idleGapMs ?? 90;
-  let settleRaf = 0;
-  let idleTimer = 0;
-  const stopSettle = () => {
-    if (settleRaf) cancelAnimationFrame(settleRaf);
-    settleRaf = 0;
-  };
-  const settleTick = () => {
-    settleRaf = 0;
-    if (opts.count() >= target) return;
-    opts.renderSettled(false);
-    settleRaf = requestAnimationFrame(settleTick);
-  };
-  const startSettle = () => {
-    idleTimer = 0;
-    opts.renderSettled(true);
-    if (!settleRaf) settleRaf = requestAnimationFrame(settleTick);
+  const idleGap = opts.idleGapMs ?? 100;
+  let raf = 0;
+  let lastKick = -1e12;
+  let wasMoving = false;
+  const tick = () => {
+    if (performance.now() - lastKick < idleGap) {
+      opts.renderMoving();
+      wasMoving = true;
+      raf = requestAnimationFrame(tick);
+    } else if (wasMoving) {
+      wasMoving = false;
+      opts.renderSettled(true);
+      raf = requestAnimationFrame(tick);
+    } else if (opts.count() < target) {
+      opts.renderSettled(false);
+      raf = requestAnimationFrame(tick);
+    } else {
+      raf = 0;
+    }
   };
   return {
     kick() {
-      stopSettle();
-      if (idleTimer) clearTimeout(idleTimer);
-      opts.renderMoving();
-      idleTimer = setTimeout(startSettle, idleGap);
+      lastKick = performance.now();
+      if (!raf) raf = requestAnimationFrame(tick);
     },
     stop() {
-      stopSettle();
-      if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = 0;
+      if (raf) cancelAnimationFrame(raf);
+      raf = 0;
     }
   };
 }
@@ -3264,7 +3263,7 @@ var BudgetController = class {
    *  loop is stable, and bounded to [minPx, maxPx]. Faster-than-target grows it; slower shrinks it. */
   update(measuredMs) {
     if (!(measuredMs > 0) || !Number.isFinite(measuredMs)) return;
-    const adj = Math.max(0.8, Math.min(1.25, this.targetMs / measuredMs));
+    const adj = Math.max(0.6, Math.min(1.2, this.targetMs / measuredMs));
     this.budgetPx = Math.max(this.minPx, Math.min(this.maxPx, this.budgetPx * adj));
   }
   /** Resolution scale for a `w×h` view: sqrt(budget / area), clamped to [0.25, 1]. 1 when the view
@@ -4085,6 +4084,34 @@ async function main() {
     },
     accum: () => rs?.scene.accumCount() ?? -1,
     scale3d: () => budget3d.scale(cv.threeD.width, cv.threeD.height),
+    frameMs: async () => {
+      if (!rs) return -1;
+      const w = cv.threeD.width, h = cv.threeD.height;
+      set3dCam(w, h);
+      const t0 = performance.now();
+      rs.scene.renderToView(view3d(), w, h);
+      await gpu.device.queue.onSubmittedWorkDone();
+      return +(performance.now() - t0).toFixed(1);
+    },
+    benchMoving: async (n) => {
+      const out = [];
+      for (let i = 0; i < n; i++) {
+        if (!rs) break;
+        const vw = cv.threeD.width, vh = cv.threeD.height, s = budget3d.scale(vw, vh), t0 = performance.now();
+        if (s > 0.98) {
+          set3dCam(vw, vh);
+          rs.scene.renderToView(view3d(), vw, vh);
+        } else {
+          const rw = Math.max(16, Math.round(vw * s)), rh = Math.max(16, Math.round(vh * s));
+          set3dCam(rw, rh);
+          rs.scene.renderUpscaled(view3d(), rw, rh, vw, vh);
+        }
+        await gpu.device.queue.onSubmittedWorkDone();
+        budget3d.update(performance.now() - t0);
+        out.push([+(performance.now() - t0).toFixed(1), +budget3d.scale(vw, vh).toFixed(2)]);
+      }
+      return out;
+    },
     converge3d: (n) => {
       render3dSettled(true);
       for (let i = 1; i < n; i++) render3dSettled(false);

@@ -2154,35 +2154,34 @@ function attachWidgetControls(canvas, camera, opts) {
 // render/demos/accum-loop.ts
 function mountAdaptiveLoop(opts) {
   const target = opts.target ?? 32;
-  const idleGap = opts.idleGapMs ?? 90;
-  let settleRaf = 0;
-  let idleTimer = 0;
-  const stopSettle = () => {
-    if (settleRaf) cancelAnimationFrame(settleRaf);
-    settleRaf = 0;
-  };
-  const settleTick = () => {
-    settleRaf = 0;
-    if (opts.count() >= target) return;
-    opts.renderSettled(false);
-    settleRaf = requestAnimationFrame(settleTick);
-  };
-  const startSettle = () => {
-    idleTimer = 0;
-    opts.renderSettled(true);
-    if (!settleRaf) settleRaf = requestAnimationFrame(settleTick);
+  const idleGap = opts.idleGapMs ?? 100;
+  let raf = 0;
+  let lastKick = -1e12;
+  let wasMoving = false;
+  const tick = () => {
+    if (performance.now() - lastKick < idleGap) {
+      opts.renderMoving();
+      wasMoving = true;
+      raf = requestAnimationFrame(tick);
+    } else if (wasMoving) {
+      wasMoving = false;
+      opts.renderSettled(true);
+      raf = requestAnimationFrame(tick);
+    } else if (opts.count() < target) {
+      opts.renderSettled(false);
+      raf = requestAnimationFrame(tick);
+    } else {
+      raf = 0;
+    }
   };
   return {
     kick() {
-      stopSettle();
-      if (idleTimer) clearTimeout(idleTimer);
-      opts.renderMoving();
-      idleTimer = setTimeout(startSettle, idleGap);
+      lastKick = performance.now();
+      if (!raf) raf = requestAnimationFrame(tick);
     },
     stop() {
-      stopSettle();
-      if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = 0;
+      if (raf) cancelAnimationFrame(raf);
+      raf = 0;
     }
   };
 }
@@ -2203,7 +2202,7 @@ var BudgetController = class {
    *  loop is stable, and bounded to [minPx, maxPx]. Faster-than-target grows it; slower shrinks it. */
   update(measuredMs) {
     if (!(measuredMs > 0) || !Number.isFinite(measuredMs)) return;
-    const adj = Math.max(0.8, Math.min(1.25, this.targetMs / measuredMs));
+    const adj = Math.max(0.6, Math.min(1.2, this.targetMs / measuredMs));
     this.budgetPx = Math.max(this.minPx, Math.min(this.maxPx, this.budgetPx * adj));
   }
   /** Resolution scale for a `w×h` view: sqrt(budget / area), clamped to [0.25, 1]. 1 when the view
