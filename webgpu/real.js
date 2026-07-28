@@ -218,6 +218,10 @@ var SceneRenderer = class _SceneRenderer {
   // camera (invVP) of the last accumulated frame
   lastAccumValid = false;
   // false forces a reset (after a rebuild / first frame)
+  streamPipeline;
+  // trace -> rgba8unorm, for compact sample readback (remote)
+  streamBind;
+  // its OWN bind group (auto-layout differs from this.pipeline's)
   // RESOLUTION-SCALED reconstruction (M2b): while interacting, trace at a fraction of the view
   // (BudgetController) and Catmull-Rom UPSAMPLE the low-res trace to the view — the client-superres
   // ported from the Python spike. A settled view renders native + accumulates instead.
@@ -593,7 +597,14 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
       fragment: { module, entryPoint: "fs_pick", targets: [{ format: "rgba32float" }] },
       primitive: { topology: "triangle-list", cullMode: "none" }
     });
+    this.streamPipeline = this.dev.createRenderPipeline({
+      layout: "auto",
+      vertex: { module, entryPoint: "vs_main" },
+      fragment: { module, entryPoint: "fs_trace", targets: [{ format: "rgba8unorm" }] },
+      primitive: { topology: "triangle-list", cullMode: "none" }
+    });
     this.bind = this.dev.createBindGroup({ layout: this.pipeline.getBindGroupLayout(0), entries: this.bindGroupEntries() });
+    this.streamBind = this.dev.createBindGroup({ layout: this.streamPipeline.getBindGroupLayout(0), entries: this.bindGroupEntries() });
     if (this.pickPipeline) this.pickBind = this.dev.createBindGroup({ layout: this.pickPipeline.getBindGroupLayout(0), entries: this.bindGroupEntries() });
     this.setBackground(0.07, 0.08, 0.12);
     const step = this.placed.length ? Math.min(...this.placed.map((p) => p.field.sampleStep())) : 1;
@@ -899,6 +910,7 @@ ${pickDispatch}
    *  swapped a texture) without recompiling the pipeline. Field set/structure must be unchanged. */
   refreshBindings() {
     this.bind = this.dev.createBindGroup({ layout: this.pipeline.getBindGroupLayout(0), entries: this.bindGroupEntries() });
+    this.streamBind = this.dev.createBindGroup({ layout: this.streamPipeline.getBindGroupLayout(0), entries: this.bindGroupEntries() });
     if (this.pickPipeline) this.pickBind = this.dev.createBindGroup({ layout: this.pickPipeline.getBindGroupLayout(0), entries: this.bindGroupEntries() });
   }
   /** Only fields with texture bindings use the shared sampler. `layout: "auto"` derives the
@@ -1018,6 +1030,32 @@ ${pickDispatch}
     const target = this.dev.createTexture({ size: [width, height], format: this.format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
     const enc = this.dev.createCommandEncoder();
     this.encodeFrame(enc, target.createView());
+    const bpr = Math.ceil(width * 4 / 256) * 256;
+    const buf = this.dev.createBuffer({ size: bpr * height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    enc.copyTextureToBuffer({ texture: target }, { buffer: buf, bytesPerRow: bpr, rowsPerImage: height }, [width, height]);
+    this.dev.queue.submit([enc.finish()]);
+    await buf.mapAsync(GPUMapMode.READ);
+    const padded = new Uint8Array(buf.getMappedRange());
+    const out = new Uint8Array(width * height * 4);
+    for (let y = 0; y < height; y++) out.set(padded.subarray(y * bpr, y * bpr + width * 4), y * width * 4);
+    buf.unmap();
+    target.destroy();
+    buf.destroy();
+    return out;
+  }
+  /** REMOTE PRODUCER (M3): trace at width×height and read back the PREMULTIPLIED sample (pre-
+   *  background) as tightly-packed rgba8 — the bytes streamed to the remote client, which runs the
+   *  same reconstruction (upsample + background composite) the local resolve does. The caller sets
+   *  the camera to width×height first (like renderUpscaled). Returns width*height*4 bytes. */
+  async traceSamples(width, height) {
+    this.flush();
+    const target = this.dev.createTexture({ size: [width, height], format: "rgba8unorm", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+    const enc = this.dev.createCommandEncoder();
+    const tp = enc.beginRenderPass({ colorAttachments: [{ view: target.createView(), loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
+    tp.setPipeline(this.streamPipeline);
+    tp.setBindGroup(0, this.streamBind);
+    tp.draw(3);
+    tp.end();
     const bpr = Math.ceil(width * 4 / 256) * 256;
     const buf = this.dev.createBuffer({ size: bpr * height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     enc.copyTextureToBuffer({ texture: target }, { buffer: buf, bytesPerRow: bpr, rowsPerImage: height }, [width, height]);
