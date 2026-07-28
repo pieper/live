@@ -203,6 +203,8 @@ var SceneRenderer = class _SceneRenderer {
   // running mean, converging to a supersampled, time-averaged-AA image. Ping-pong accum + running n.
   baseInvVP = new Float32Array(16);
   // last setCamera invVP (unjittered)
+  focalPx = 1;
+  // last setCamera focal (view→pixels); used to keep screen-space handles view-sized under low-res trace
   accumPipeline;
   // MRT: trace + prev-accum -> new-accum + presented view
   accumBind = [void 0, void 0];
@@ -451,7 +453,7 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
   renderUpscaled(view, renderW, renderH, viewW, viewH) {
     this.ensureLow(renderW, renderH);
     this.flush();
-    this.dev.queue.writeBuffer(this.resolveBgBuf, 0, this.mat.subarray(12, 16));
+    this.dev.queue.writeBuffer(this.camBuf, 72, new Float32Array([this.focalPx * (viewH / renderH)]));
     this.dev.queue.writeBuffer(this.superresBuf, 0, new Float32Array([renderW, renderH, viewW, viewH]));
     const enc = this.dev.createCommandEncoder();
     const tp = enc.beginRenderPass({ colorAttachments: [{ view: this.lowView, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
@@ -911,6 +913,7 @@ ${pickDispatch}
     this.baseInvVP = invVP;
     const cam = new Float32Array(24);
     cam.set(invVP, 0);
+    this.focalPx = height / 2 / Math.tan(fovyDeg * Math.PI / 360);
     cam[16] = width;
     cam[17] = height;
     cam[18] = height / 2 / Math.tan(fovyDeg * Math.PI / 360);
