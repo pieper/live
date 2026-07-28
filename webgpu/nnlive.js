@@ -221,6 +221,10 @@ var SceneRenderer = class _SceneRenderer {
   accumView = [void 0, void 0];
   accumPing = 0;
   accumN = 0;
+  lastAccumCam = new Float32Array(16);
+  // camera (invVP) of the last accumulated frame
+  lastAccumValid = false;
+  // false forces a reset (after a rebuild / first frame)
   // RESOLUTION-SCALED reconstruction (M2b): while interacting, trace at a fraction of the view
   // (BudgetController) and Catmull-Rom UPSAMPLE the low-res trace to the view — the client-superres
   // ported from the Python spike. A settled view renders native + accumulates instead.
@@ -528,6 +532,12 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
   renderAccum(view, width, height, reset) {
     this.ensureTrace(width, height);
     this.ensureAccum(width, height);
+    let camChanged = !this.lastAccumValid;
+    const cam = this.baseInvVP;
+    for (let i = 0; i < 16 && !camChanged; i++) if (cam[i] !== this.lastAccumCam[i]) camChanged = true;
+    if (camChanged) reset = true;
+    this.lastAccumCam.set(cam);
+    this.lastAccumValid = true;
     if (reset) this.accumN = 0;
     this.accumN += 1;
     const n = this.accumN;
@@ -597,6 +607,8 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
     this.setSampleStep(step * 0.7);
     this.recomputeBounds();
     for (const p of this.placed) p.field.fillUniforms(this.mat, p.uoff);
+    this.accumN = 0;
+    this.lastAccumValid = false;
   }
   wgsl() {
     const members = this.placed.map((p) => p.field.structMembers(p.slot)).join("\n");
