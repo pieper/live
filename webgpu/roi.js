@@ -2151,41 +2151,6 @@ function attachWidgetControls(canvas, camera, opts) {
   };
 }
 
-// render/demos/accum-loop.ts
-function mountAdaptiveLoop(opts) {
-  const target = opts.target ?? 32;
-  const idleGap = opts.idleGapMs ?? 100;
-  let raf = 0;
-  let lastKick = -1e12;
-  let wasMoving = false;
-  const tick = () => {
-    if (performance.now() - lastKick < idleGap) {
-      opts.renderMoving();
-      wasMoving = true;
-      raf = requestAnimationFrame(tick);
-    } else if (wasMoving) {
-      wasMoving = false;
-      opts.renderSettled(true);
-      raf = requestAnimationFrame(tick);
-    } else if (opts.count() < target) {
-      opts.renderSettled(false);
-      raf = requestAnimationFrame(tick);
-    } else {
-      raf = 0;
-    }
-  };
-  return {
-    kick() {
-      lastKick = performance.now();
-      if (!raf) raf = requestAnimationFrame(tick);
-    },
-    stop() {
-      if (raf) cancelAnimationFrame(raf);
-      raf = 0;
-    }
-  };
-}
-
 // render/budget-controller.ts
 var BudgetController = class {
   budgetPx;
@@ -2212,6 +2177,86 @@ var BudgetController = class {
     return Math.max(0.25, Math.min(1, Math.sqrt(this.budgetPx / area)));
   }
 };
+
+// render/demos/accum-loop.ts
+function mountAdaptiveLoop(opts) {
+  const target = opts.target ?? 32;
+  const idleGap = opts.idleGapMs ?? 120;
+  const raf = () => new Promise((r) => requestAnimationFrame(() => r()));
+  const sync = opts.sync ?? (() => Promise.resolve());
+  let running = false, stopped = false, lastKick = -1e12, wasMoving = false;
+  const step = () => {
+    if (performance.now() - lastKick < idleGap) {
+      opts.renderMoving();
+      wasMoving = true;
+      return true;
+    }
+    if (wasMoving) {
+      wasMoving = false;
+      opts.renderSettled(true);
+      return true;
+    }
+    if (opts.count() < target) {
+      opts.renderSettled(false);
+      return true;
+    }
+    return false;
+  };
+  const run = async () => {
+    running = true;
+    stopped = false;
+    while (!stopped && step()) await Promise.all([sync(), raf()]);
+    running = false;
+  };
+  return {
+    kick() {
+      lastKick = performance.now();
+      if (!running) run();
+    },
+    // run() renders the 1st frame synchronously
+    stop() {
+      stopped = true;
+    }
+  };
+}
+function mountAdaptive3d(opts) {
+  const budget = new BudgetController({ targetMs: opts.targetMs ?? 16 });
+  const renderMoving = () => {
+    const sc = opts.scene();
+    if (!sc) return;
+    const { w: vw, h: vh } = opts.size();
+    if (!vw || !vh) return;
+    const s = budget.scale(vw, vh), t0 = performance.now();
+    if (s > 0.98) {
+      opts.setCamera(sc, vw, vh);
+      sc.renderToView(opts.view(), vw, vh);
+    } else {
+      const rw = Math.max(16, Math.round(vw * s)), rh = Math.max(16, Math.round(vh * s));
+      opts.setCamera(sc, rw, rh);
+      sc.renderUpscaled(opts.view(), rw, rh, vw, vh);
+    }
+    opts.gpu.device.queue.onSubmittedWorkDone().then(() => budget.update(performance.now() - t0));
+    opts.onFrame?.();
+  };
+  const renderSettled = (reset) => {
+    const sc = opts.scene();
+    if (!sc) return;
+    const { w: vw, h: vh } = opts.size();
+    if (!vw || !vh) return;
+    opts.setCamera(sc, vw, vh);
+    sc.renderAccum(opts.view(), vw, vh, reset);
+    opts.onFrame?.();
+  };
+  const loop = mountAdaptiveLoop({
+    renderMoving,
+    renderSettled,
+    count: () => opts.scene()?.accumCount() ?? 1e9,
+    target: opts.target ?? 24,
+    sync: () => opts.gpu.device.queue.onSubmittedWorkDone()
+    // GPU-paced: no backlog, input preempts
+  });
+  return { draw: () => loop.kick(), budget, renderSettled, renderMoving, loop };
+}
 
 // render/introspect.ts
 var LOG_MAX = 500;
@@ -2288,38 +2333,22 @@ async function main() {
   scene.setClipBox(roi.lo(), roi.hi());
   const camera = framedCamera(roi.sv.center, roi.sv.radius, 2.8);
   let msg = "drag a handle to crop \xB7 drag empty space to rotate";
-  const budget = new BudgetController({ targetMs: 16 });
-  const view = () => ctx.getCurrentTexture().createView({ format: srgb });
-  const setCam = (w, h) => scene.setCamera(camera.position, camera.focalPoint, camera.viewUp, camera.viewAngle, w, h);
-  const renderMoving = () => {
-    const vw = canvas.width, vh = canvas.height;
-    const s = budget.scale(vw, vh);
-    const t0 = performance.now();
-    if (s > 0.98) {
-      setCam(vw, vh);
-      scene.renderToView(view(), vw, vh);
-    } else {
-      const rw = Math.max(16, Math.round(vw * s)), rh = Math.max(16, Math.round(vh * s));
-      setCam(rw, rh);
-      scene.renderUpscaled(view(), rw, rh, vw, vh);
-    }
-    gpu.device.queue.onSubmittedWorkDone().then(() => budget.update(performance.now() - t0));
-    status(`${roi.sv.name} \xB7 ROI crop \xB7 ${s * 100 | 0}% res \xB7 ${msg}`);
-  };
-  const renderSettled = (reset) => {
-    const vw = canvas.width, vh = canvas.height;
-    setCam(vw, vh);
-    scene.renderAccum(view(), vw, vh, reset);
-    status(`${roi.sv.name} \xB7 ROI crop \xB7 converging n=${scene.accumCount()} \xB7 ${msg}`);
-  };
-  const loop = mountAdaptiveLoop({ renderMoving, renderSettled, count: () => scene.accumCount(), target: 32 });
-  const draw = () => loop.kick();
+  const a3d = mountAdaptive3d({
+    scene: () => scene,
+    view: () => ctx.getCurrentTexture().createView({ format: srgb }),
+    size: () => ({ w: canvas.width, h: canvas.height }),
+    setCamera: (s, w, h) => s.setCamera(camera.position, camera.focalPoint, camera.viewUp, camera.viewAngle, w, h),
+    gpu,
+    onFrame: () => status(`${roi.sv.name} \xB7 ROI crop \xB7 ${msg}`)
+  });
+  const draw = () => a3d.draw();
+  const drawNow = () => a3d.renderSettled(true);
   const resize = () => {
     const dpr = Math.min(2, globalThis.devicePixelRatio || 1);
     const size = Math.min(720, Math.floor(canvas.clientWidth * dpr));
     canvas.width = size;
     canvas.height = size;
-    draw();
+    drawNow();
   };
   globalThis.addEventListener("resize", resize);
   let box0 = roi.snapshot();
@@ -2352,10 +2381,10 @@ async function main() {
       if (p.position) camera.position = [...p.position];
       if (p.focalPoint) camera.focalPoint = [...p.focalPoint];
       if (p.viewUp) camera.viewUp = [...p.viewUp];
-      draw();
+      drawNow();
     },
     extra: () => ({ center: roi.snapshot().center, half: roi.snapshot().half }),
-    render: () => draw()
+    render: () => drawNow()
   });
   globalThis.__roiDbg = {
     snapshot: () => {
@@ -2368,17 +2397,17 @@ async function main() {
       };
     },
     accumCount: () => scene.accumCount(),
-    scale: () => budget.scale(canvas.width, canvas.height),
-    budgetPx: () => budget.budgetPx,
+    scale: () => a3d.budget.scale(canvas.width, canvas.height),
+    budgetPx: () => a3d.budget.budgetPx,
     setBudgetPx: (px) => {
-      budget.budgetPx = px;
+      a3d.budget.budgetPx = px;
     },
     renderMovingN: (n) => {
-      for (let i = 0; i < n; i++) renderMoving();
+      for (let i = 0; i < n; i++) a3d.renderMoving();
     },
     converge: (n) => {
-      renderSettled(true);
-      for (let i = 1; i < n; i++) renderSettled(false);
+      a3d.renderSettled(true);
+      for (let i = 1; i < n; i++) a3d.renderSettled(false);
       return scene.accumCount();
     }
   };

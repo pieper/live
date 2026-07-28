@@ -1653,34 +1653,41 @@ var BudgetController = class {
 // render/demos/accum-loop.ts
 function mountAdaptiveLoop(opts) {
   const target = opts.target ?? 32;
-  const idleGap = opts.idleGapMs ?? 100;
-  let raf = 0;
-  let lastKick = -1e12;
-  let wasMoving = false;
-  const tick = () => {
+  const idleGap = opts.idleGapMs ?? 120;
+  const raf = () => new Promise((r) => requestAnimationFrame(() => r()));
+  const sync = opts.sync ?? (() => Promise.resolve());
+  let running = false, stopped = false, lastKick = -1e12, wasMoving = false;
+  const step = () => {
     if (performance.now() - lastKick < idleGap) {
       opts.renderMoving();
       wasMoving = true;
-      raf = requestAnimationFrame(tick);
-    } else if (wasMoving) {
+      return true;
+    }
+    if (wasMoving) {
       wasMoving = false;
       opts.renderSettled(true);
-      raf = requestAnimationFrame(tick);
-    } else if (opts.count() < target) {
-      opts.renderSettled(false);
-      raf = requestAnimationFrame(tick);
-    } else {
-      raf = 0;
+      return true;
     }
+    if (opts.count() < target) {
+      opts.renderSettled(false);
+      return true;
+    }
+    return false;
+  };
+  const run = async () => {
+    running = true;
+    stopped = false;
+    while (!stopped && step()) await Promise.all([sync(), raf()]);
+    running = false;
   };
   return {
     kick() {
       lastKick = performance.now();
-      if (!raf) raf = requestAnimationFrame(tick);
+      if (!running) run();
     },
+    // run() renders the 1st frame synchronously
     stop() {
-      if (raf) cancelAnimationFrame(raf);
-      raf = 0;
+      stopped = true;
     }
   };
 }
@@ -1712,7 +1719,14 @@ function mountAdaptive3d(opts) {
     sc.renderAccum(opts.view(), vw, vh, reset);
     opts.onFrame?.();
   };
-  const loop = mountAdaptiveLoop({ renderMoving, renderSettled, count: () => opts.scene()?.accumCount() ?? 1e9, target: opts.target ?? 24 });
+  const loop = mountAdaptiveLoop({
+    renderMoving,
+    renderSettled,
+    count: () => opts.scene()?.accumCount() ?? 1e9,
+    target: opts.target ?? 24,
+    sync: () => opts.gpu.device.queue.onSubmittedWorkDone()
+    // GPU-paced: no backlog, input preempts
+  });
   return { draw: () => loop.kick(), budget, renderSettled, renderMoving, loop };
 }
 
