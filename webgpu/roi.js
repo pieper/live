@@ -219,6 +219,15 @@ var SceneRenderer = class _SceneRenderer {
   superresBind;
   superresBuf;
   // (traceW, traceH, viewW, viewH)
+  // The moving/upscale path traces into its OWN low-res target so it never resizes/destroys the
+  // full-size traceTex the accumulation bind groups reference (that sharing caused destroyed-texture
+  // submits + MRT attachment-size mismatches → 3D flicker/blank during interaction).
+  lowTex;
+  lowView;
+  lowW = 0;
+  lowH = 0;
+  accumW = 0;
+  accumH = 0;
   /** Emit a default AABB-distance skip for fields that don't supply their own bound.
    *
    *  OFF because it MEASURED AS A NET LOSS (render/test/profile-boxskip.ts, 448², M-series):
@@ -415,10 +424,20 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
       layout: this.resolvePipeline.getBindGroupLayout(0),
       entries: [{ binding: 0, resource: this.traceView }, { binding: 1, resource: { buffer: this.resolveBgBuf } }]
     });
+  }
+  /** (Re)allocate the low-res trace target + superres bind group when the moving render size changes.
+   *  Separate from traceTex so a moving frame never disturbs the accumulation textures. */
+  ensureLow(width, height) {
+    if (this.lowTex && this.lowW === width && this.lowH === height) return;
+    this.lowTex?.destroy();
+    this.lowTex = this.dev.createTexture({ size: [width, height], format: "rgba32float", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+    this.lowView = this.lowTex.createView();
+    this.lowW = width;
+    this.lowH = height;
     this.superresBind = this.dev.createBindGroup({
       layout: this.superresPipeline.getBindGroupLayout(0),
       entries: [
-        { binding: 0, resource: this.traceView },
+        { binding: 0, resource: this.lowView },
         { binding: 1, resource: this.sampler },
         { binding: 2, resource: { buffer: this.superresBuf } },
         { binding: 3, resource: { buffer: this.resolveBgBuf } }
@@ -430,12 +449,12 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
    *  low-res rays fill the same frustum). Single frame, no accumulation — use while interacting;
    *  switch to renderAccum when the view settles. */
   renderUpscaled(view, renderW, renderH, viewW, viewH) {
-    this.ensureTrace(renderW, renderH);
+    this.ensureLow(renderW, renderH);
     this.flush();
     this.dev.queue.writeBuffer(this.resolveBgBuf, 0, this.mat.subarray(12, 16));
     this.dev.queue.writeBuffer(this.superresBuf, 0, new Float32Array([renderW, renderH, viewW, viewH]));
     const enc = this.dev.createCommandEncoder();
-    const tp = enc.beginRenderPass({ colorAttachments: [{ view: this.traceView, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
+    const tp = enc.beginRenderPass({ colorAttachments: [{ view: this.lowView, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
     tp.setPipeline(this.pipeline);
     tp.setBindGroup(0, this.bind);
     tp.draw(3);
@@ -460,9 +479,13 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
     rp.draw(3);
     rp.end();
   }
-  /** (Re)allocate the ping-pong accumulation targets + their bind groups on a size change. */
+  /** (Re)allocate the ping-pong accumulation targets + their bind groups on a size change. Tracks its
+   *  OWN size and always rebuilds accumBind against the current traceView (which ensureTrace, called
+   *  first in renderAccum, has just refreshed) — so the bind never dangles on a destroyed trace. */
   ensureAccum(width, height) {
-    if (this.accumTex[0] && this.traceW === width && this.traceH === height) return;
+    if (this.accumTex[0] && this.accumW === width && this.accumH === height) return;
+    this.accumW = width;
+    this.accumH = height;
     for (let k = 0; k < 2; k++) {
       this.accumTex[k]?.destroy();
       this.accumTex[k] = this.dev.createTexture({ size: [width, height], format: "rgba32float", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
@@ -2245,6 +2268,8 @@ async function main() {
   }
   status("initializing WebGPU\u2026");
   const gpu = await initDevice();
+  globalThis.__gpuErr = [];
+  gpu.device.addEventListener("uncapturederror", (e) => globalThis.__gpuErr.push(String(e.error?.message ?? e.error)));
   const ctx = canvas.getContext("webgpu");
   const preferred = navigator.gpu.getPreferredCanvasFormat();
   const srgb = preferred + "-srgb";
