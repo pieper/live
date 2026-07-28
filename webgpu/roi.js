@@ -212,6 +212,13 @@ var SceneRenderer = class _SceneRenderer {
   accumView = [void 0, void 0];
   accumPing = 0;
   accumN = 0;
+  // RESOLUTION-SCALED reconstruction (M2b): while interacting, trace at a fraction of the view
+  // (BudgetController) and Catmull-Rom UPSAMPLE the low-res trace to the view — the client-superres
+  // ported from the Python spike. A settled view renders native + accumulates instead.
+  superresPipeline;
+  superresBind;
+  superresBuf;
+  // (traceW, traceH, viewW, viewH)
   /** Emit a default AABB-distance skip for fields that don't supply their own bound.
    *
    *  OFF because it MEASURED AS A NET LOSS (render/test/profile-boxskip.ts, 448², M-series):
@@ -254,6 +261,75 @@ var SceneRenderer = class _SceneRenderer {
       fragment: { module: amod, entryPoint: "fs_accum", targets: [{ format: "rgba32float" }, { format: this.format }] },
       primitive: { topology: "triangle-list", cullMode: "none" }
     });
+    this.superresBuf = this.dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const smod = this.dev.createShaderModule({ code: this.superresWgsl() });
+    this.superresPipeline = this.dev.createRenderPipeline({
+      layout: "auto",
+      vertex: { module: smod, entryPoint: "vs_resolve" },
+      fragment: { module: smod, entryPoint: "fs_superres", targets: [{ format: this.format }] },
+      primitive: { topology: "triangle-list", cullMode: "none" }
+    });
+  }
+  /** RECONSTRUCTOR (upsampling): Catmull-Rom (bicubic, 9 bilinear taps) reconstruction of the
+   *  low-res premultiplied trace, composited over the background — the client-superres from the
+   *  Python spike (435b28d), on WebGPU. Slight edge sharpening from the negative lobes; premultiplied
+   *  so the alpha reconstructs correctly. Used only when the trace is smaller than the view. */
+  superresWgsl() {
+    return (
+      /* wgsl */
+      `
+@group(0) @binding(0) var t_trace : texture_2d<f32>;
+@group(0) @binding(1) var s_lin : sampler;
+@group(0) @binding(2) var<uniform> u_sr : vec4<f32>;   // (traceW, traceH, viewW, viewH)
+@group(0) @binding(3) var<uniform> u_bg : vec4<f32>;
+fn srgb2physical(c : vec3<f32>) -> vec3<f32> {
+  let lo = c / 12.92;
+  let hi = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+  return select(lo, hi, c > vec3<f32>(0.04045));
+}
+// Catmull-Rom via 9 bilinear taps (Sigg/Hadwiger form).
+fn cr(uv : vec2<f32>, texSize : vec2<f32>) -> vec4<f32> {
+  let sp = uv * texSize;
+  let tp1 = floor(sp - 0.5) + 0.5;
+  let f = sp - tp1;
+  let w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+  let w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+  let w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+  let w3 = f * f * (-0.5 + 0.5 * f);
+  let w12 = w1 + w2;
+  let off12 = w2 / w12;
+  let inv = 1.0 / texSize;
+  let p0 = (tp1 - 1.0) * inv;
+  let p3 = (tp1 + 2.0) * inv;
+  let p12 = (tp1 + off12) * inv;
+  var r = vec4<f32>(0.0);
+  r += textureSampleLevel(t_trace, s_lin, vec2<f32>(p0.x,  p0.y),  0.0) * (w0.x  * w0.y);
+  r += textureSampleLevel(t_trace, s_lin, vec2<f32>(p12.x, p0.y),  0.0) * (w12.x * w0.y);
+  r += textureSampleLevel(t_trace, s_lin, vec2<f32>(p3.x,  p0.y),  0.0) * (w3.x  * w0.y);
+  r += textureSampleLevel(t_trace, s_lin, vec2<f32>(p0.x,  p12.y), 0.0) * (w0.x  * w12.y);
+  r += textureSampleLevel(t_trace, s_lin, vec2<f32>(p12.x, p12.y), 0.0) * (w12.x * w12.y);
+  r += textureSampleLevel(t_trace, s_lin, vec2<f32>(p3.x,  p12.y), 0.0) * (w3.x  * w12.y);
+  r += textureSampleLevel(t_trace, s_lin, vec2<f32>(p0.x,  p3.y),  0.0) * (w0.x  * w3.y);
+  r += textureSampleLevel(t_trace, s_lin, vec2<f32>(p12.x, p3.y),  0.0) * (w12.x * w3.y);
+  r += textureSampleLevel(t_trace, s_lin, vec2<f32>(p3.x,  p3.y),  0.0) * (w3.x  * w3.y);
+  return r;
+}
+struct RV { @builtin(position) position : vec4<f32> };
+@vertex
+fn vs_resolve(@builtin(vertex_index) vi : u32) -> RV {
+  let x = select(-1.0, 3.0, vi == 1u);
+  let y = select(-1.0, 3.0, vi == 2u);
+  var o : RV; o.position = vec4<f32>(x, y, 0.0, 1.0); return o;
+}
+@fragment
+fn fs_superres(v : RV) -> @location(0) vec4<f32> {
+  let uv = v.position.xy / u_sr.zw;
+  let s = cr(uv, u_sr.xy);
+  let a = clamp(s.a, 0.0, 1.0);
+  let bg = srgb2physical(u_bg.rgb);
+  return vec4<f32>(mix(bg, s.rgb, a), 1.0);
+}`
+    );
   }
   /** Accumulating RECONSTRUCTOR: fold this frame's traced sample into the running mean (blend =
    *  1/n; blend=1 on reset → mean=this frame) and present it over the background. MRT so one pass
@@ -339,6 +415,37 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
       layout: this.resolvePipeline.getBindGroupLayout(0),
       entries: [{ binding: 0, resource: this.traceView }, { binding: 1, resource: { buffer: this.resolveBgBuf } }]
     });
+    this.superresBind = this.dev.createBindGroup({
+      layout: this.superresPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.traceView },
+        { binding: 1, resource: this.sampler },
+        { binding: 2, resource: { buffer: this.superresBuf } },
+        { binding: 3, resource: { buffer: this.resolveBgBuf } }
+      ]
+    });
+  }
+  /** Adaptive (moving-frame) render: trace at `renderW×renderH` and Catmull-Rom upsample to the
+   *  `viewW×viewH` output. The caller MUST have set the camera size to renderW×renderH (so the
+   *  low-res rays fill the same frustum). Single frame, no accumulation — use while interacting;
+   *  switch to renderAccum when the view settles. */
+  renderUpscaled(view, renderW, renderH, viewW, viewH) {
+    this.ensureTrace(renderW, renderH);
+    this.flush();
+    this.dev.queue.writeBuffer(this.resolveBgBuf, 0, this.mat.subarray(12, 16));
+    this.dev.queue.writeBuffer(this.superresBuf, 0, new Float32Array([renderW, renderH, viewW, viewH]));
+    const enc = this.dev.createCommandEncoder();
+    const tp = enc.beginRenderPass({ colorAttachments: [{ view: this.traceView, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
+    tp.setPipeline(this.pipeline);
+    tp.setBindGroup(0, this.bind);
+    tp.draw(3);
+    tp.end();
+    const sp = enc.beginRenderPass({ colorAttachments: [{ view, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }] });
+    sp.setPipeline(this.superresPipeline);
+    sp.setBindGroup(0, this.superresBind);
+    sp.draw(3);
+    sp.end();
+    this.dev.queue.submit([enc.finish()]);
   }
   /** Encode trace (producer) + resolve (reconstructor) into `enc`, output to `outView`. */
   encodeFrame(enc, outView) {
@@ -2019,26 +2126,67 @@ function attachWidgetControls(canvas, camera, opts) {
 }
 
 // render/demos/accum-loop.ts
-function mountAccumLoop(opts) {
+function mountAdaptiveLoop(opts) {
   const target = opts.target ?? 32;
-  let raf = 0;
-  const tick = () => {
-    raf = 0;
+  const idleGap = opts.idleGapMs ?? 90;
+  let settleRaf = 0;
+  let idleTimer = 0;
+  const stopSettle = () => {
+    if (settleRaf) cancelAnimationFrame(settleRaf);
+    settleRaf = 0;
+  };
+  const settleTick = () => {
+    settleRaf = 0;
     if (opts.count() >= target) return;
-    opts.drawOnce(false);
-    raf = requestAnimationFrame(tick);
+    opts.renderSettled(false);
+    settleRaf = requestAnimationFrame(settleTick);
+  };
+  const startSettle = () => {
+    idleTimer = 0;
+    opts.renderSettled(true);
+    if (!settleRaf) settleRaf = requestAnimationFrame(settleTick);
   };
   return {
     kick() {
-      opts.drawOnce(true);
-      if (!raf) raf = requestAnimationFrame(tick);
+      stopSettle();
+      if (idleTimer) clearTimeout(idleTimer);
+      opts.renderMoving();
+      idleTimer = setTimeout(startSettle, idleGap);
     },
     stop() {
-      if (raf) cancelAnimationFrame(raf);
-      raf = 0;
+      stopSettle();
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = 0;
     }
   };
 }
+
+// render/budget-controller.ts
+var BudgetController = class {
+  budgetPx;
+  targetMs;
+  minPx;
+  maxPx;
+  constructor(opts = {}) {
+    this.targetMs = opts.targetMs ?? 16;
+    this.minPx = opts.minPx ?? 15e4;
+    this.maxPx = opts.maxPx ?? 8e6;
+    this.budgetPx = opts.startPx ?? 12e5;
+  }
+  /** Nudge the budget toward hitting targetMs. Multiplicative, clamped per step (0.8–1.25×) so the
+   *  loop is stable, and bounded to [minPx, maxPx]. Faster-than-target grows it; slower shrinks it. */
+  update(measuredMs) {
+    if (!(measuredMs > 0) || !Number.isFinite(measuredMs)) return;
+    const adj = Math.max(0.8, Math.min(1.25, this.targetMs / measuredMs));
+    this.budgetPx = Math.max(this.minPx, Math.min(this.maxPx, this.budgetPx * adj));
+  }
+  /** Resolution scale for a `w×h` view: sqrt(budget / area), clamped to [0.25, 1]. 1 when the view
+   *  already fits the budget (small window); a fraction for a big/retina window under load. */
+  scale(w, h) {
+    const area = Math.max(1, w * h);
+    return Math.max(0.25, Math.min(1, Math.sqrt(this.budgetPx / area)));
+  }
+};
 
 // render/introspect.ts
 var LOG_MAX = 500;
@@ -2113,14 +2261,31 @@ async function main() {
   scene.setClipBox(roi.lo(), roi.hi());
   const camera = framedCamera(roi.sv.center, roi.sv.radius, 2.8);
   let msg = "drag a handle to crop \xB7 drag empty space to rotate";
-  const drawOnce = (reset) => {
-    const w = canvas.width, h = canvas.height;
-    scene.setCamera(camera.position, camera.focalPoint, camera.viewUp, camera.viewAngle, w, h);
+  const budget = new BudgetController({ targetMs: 16 });
+  const view = () => ctx.getCurrentTexture().createView({ format: srgb });
+  const setCam = (w, h) => scene.setCamera(camera.position, camera.focalPoint, camera.viewUp, camera.viewAngle, w, h);
+  const renderMoving = () => {
+    const vw = canvas.width, vh = canvas.height;
+    const s = budget.scale(vw, vh);
     const t0 = performance.now();
-    scene.renderAccum(ctx.getCurrentTexture().createView({ format: srgb }), w, h, reset);
-    status(`${roi.sv.name} \xB7 ROI crop \xB7 ${(performance.now() - t0).toFixed(0)} ms \xB7 n=${scene.accumCount()} \xB7 ${msg}`);
+    if (s > 0.98) {
+      setCam(vw, vh);
+      scene.renderToView(view(), vw, vh);
+    } else {
+      const rw = Math.max(16, Math.round(vw * s)), rh = Math.max(16, Math.round(vh * s));
+      setCam(rw, rh);
+      scene.renderUpscaled(view(), rw, rh, vw, vh);
+    }
+    gpu.device.queue.onSubmittedWorkDone().then(() => budget.update(performance.now() - t0));
+    status(`${roi.sv.name} \xB7 ROI crop \xB7 ${s * 100 | 0}% res \xB7 ${msg}`);
   };
-  const loop = mountAccumLoop({ drawOnce, count: () => scene.accumCount(), target: 32 });
+  const renderSettled = (reset) => {
+    const vw = canvas.width, vh = canvas.height;
+    setCam(vw, vh);
+    scene.renderAccum(view(), vw, vh, reset);
+    status(`${roi.sv.name} \xB7 ROI crop \xB7 converging n=${scene.accumCount()} \xB7 ${msg}`);
+  };
+  const loop = mountAdaptiveLoop({ renderMoving, renderSettled, count: () => scene.accumCount(), target: 32 });
   const draw = () => loop.kick();
   const resize = () => {
     const dpr = Math.min(2, globalThis.devicePixelRatio || 1);
@@ -2176,8 +2341,17 @@ async function main() {
       };
     },
     accumCount: () => scene.accumCount(),
+    scale: () => budget.scale(canvas.width, canvas.height),
+    budgetPx: () => budget.budgetPx,
+    setBudgetPx: (px) => {
+      budget.budgetPx = px;
+    },
+    renderMovingN: (n) => {
+      for (let i = 0; i < n; i++) renderMoving();
+    },
     converge: (n) => {
-      for (let i = 0; i < n; i++) drawOnce(false);
+      renderSettled(true);
+      for (let i = 1; i < n; i++) renderSettled(false);
       return scene.accumCount();
     }
   };
