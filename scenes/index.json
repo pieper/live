@@ -24,7 +24,7 @@
   "name": "SlicerLive \u2014 SEGRoulette",
   "page": "webgpu/segroulette.html",
   "thumb": "segroulette.png",
-  "desc": "Spin a random segmentation out of 190k+ IDC DICOM SEGs (36 collections): the source CT/MR/PET and the DICOM SEG stream straight from the Imaging Data Commons buckets and are parsed in your browser (dcmjs), then rendered by the TS/WebGPU backbone \u2014 3 MPR planes (grayscale + colored overlay) + a 3D view where the segmentation is the SegmentField iso band-shell (step-derived isosurface), the WebGPU-native replacement for vtk.js surface models. Hit Spin for another case."
+  "desc": "Spin a random segmentation out of 190k+ IDC DICOM SEGs (36 collections): the source CT/MR/PET and the DICOM SEG stream straight from the Imaging Data Commons buckets and are parsed in your browser (dcmjs), then rendered by the TS/WebGPU backbone \u2014 3 MPR planes (grayscale + colored overlay) + a 3D view where the WHOLE segmentation is one unified colorized signed-distance-field surface (GPU jump-flood SDF + settle-refinement): crisp surface-model geometry, per-segment colour + opacity, colour seams pre-blended where labels meet \u2014 any number of segments in a single field. Hit Spin for another case."
  },
  {
   "name": "LiveStory (prototype) \u2014 narrated MR head",
