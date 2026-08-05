@@ -2606,13 +2606,14 @@ fn sample_field_seg${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
 
 // logic/segmentation-logic.ts
 var SegmentationLogic = class {
-  // quiescence before the settle-refine (sdf mode)
+  // quiescence before the settle-refine (sdf mode; capability-tuned)
   constructor(device, seg, opts = {}) {
     this.seg = seg;
     this.renderMode = opts.renderMode ?? "sdf";
     this.sigma = opts.sigmaVoxels ?? 1;
     this.bandMm = opts.bandMm;
     this.opacity = opts.opacity ?? 1;
+    this.refineDelayMs = opts.refineDelayMs ?? 180;
     this.setLabelColor(1, opts.color ?? [0.3, 0.85, 0.55]);
     if (this.renderMode === "sdf") {
       this.sdf = new JfaSdfBaker(device, seg.masterTexture(), seg.dims, seg.ijkToRAS);
@@ -2646,7 +2647,7 @@ var SegmentationLogic = class {
   redrawCbs = [];
   unsubDirty;
   refineTimer;
-  refineDelayMs = 180;
+  refineDelayMs;
   /** Assign a display colour to a label id (0..255). Keeps the current opacity (defaults to 1 =
    *  opaque). Takes effect on the next rebake. */
   setLabelColor(id, rgb) {
@@ -2749,7 +2750,7 @@ var LABEL_COLORS = [
   [0.9, 0.7, 0.5],
   [0.8, 0.8, 0.85]
 ];
-function buildAlgorithmsScene(gpu, format) {
+function buildAlgorithmsScene(gpu, format, opts = {}) {
   const dims = [96, 96, 96];
   const sp = 2;
   const ijkToRAS = [sp, 0, 0, -96, 0, sp, 0, -96, 0, 0, sp, -96, 0, 0, 0, 1];
@@ -2782,7 +2783,7 @@ function buildAlgorithmsScene(gpu, format) {
   let logic;
   let allOpacity = 1;
   const makeLogic = () => {
-    logic = new SegmentationLogic(gpu.device, seg, { renderMode: mode, opacity: 1, sigmaVoxels: 1 });
+    logic = new SegmentationLogic(gpu.device, seg, { renderMode: mode, opacity: 1, sigmaVoxels: 1, refineDelayMs: opts.refineDelayMs });
     for (const [id, rgb] of labelColors) {
       logic.setLabelColor(id, rgb);
       applyLook(id);
@@ -2860,6 +2861,81 @@ function buildAlgorithmsScene(gpu, format) {
   };
 }
 
+// logic/seg-budget.ts
+var SegBudget = class _SegBudget {
+  constructor(tier, refineMsAt64) {
+    this.tier = tier;
+    this.refineMsAt64 = refineMsAt64;
+  }
+  tier;
+  refineMsAt64;
+  /** Measure the device by timing an SDF refine at `probeDim`³ (default 64), then classify. Cheap:
+   *  one warm bake + a few refines behind a single GPU sync. */
+  static async probe(device, probeDim = 64) {
+    const D = probeDim;
+    const dims = [D, D, D];
+    const s = 2;
+    const ijkToRAS = [s, 0, 0, -D, 0, s, 0, -D, 0, 0, s, -D, 0, 0, 0, 1];
+    const seg = new EditableSegmentation(device, dims, { ijkToRAS });
+    const lab = new Uint8Array(D * D * D);
+    const c = D / 2, r = D * 0.35;
+    for (let z = 0; z < D; z++) for (let y = 0; y < D; y++) for (let x = 0; x < D; x++) {
+      const dx = x - c, dy = y - c, dz = z - c;
+      if (dx * dx + dy * dy + dz * dz <= r * r) lab[(z * D + y) * D + x] = 1;
+    }
+    const baker = new JfaSdfBaker(device, seg.masterTexture(), dims, ijkToRAS);
+    const pal = new Float32Array(256 * 4);
+    pal[4] = 1;
+    pal[5] = 1;
+    pal[6] = 1;
+    pal[7] = 1;
+    baker.setPalette(pal);
+    const mode = new Float32Array(256 * 4);
+    baker.setModePalette(mode);
+    let refineMs = 8;
+    try {
+      device.pushErrorScope?.("validation");
+      seg.loadLabelmap(lab);
+      baker.bake();
+      await device.queue.onSubmittedWorkDone();
+      const N = 3, t0 = performance.now();
+      for (let i = 0; i < N; i++) baker.refine();
+      await device.queue.onSubmittedWorkDone();
+      refineMs = (performance.now() - t0) / N;
+      await device.popErrorScope?.();
+    } catch {
+    } finally {
+      baker.destroy();
+      seg.destroy();
+    }
+    const tier = refineMs < 3.5 ? "high" : refineMs < 14 ? "mid" : "low";
+    return new _SegBudget(tier, refineMs);
+  }
+  /** A fixed mid-tier budget without probing (SSR/headless/opt-out). */
+  static fixed(tier = "mid") {
+    return new _SegBudget(tier, tier === "high" ? 2 : tier === "mid" ? 8 : 20);
+  }
+  /** SDF grid cap per axis for large volumes (SEGRoulette / microCT). */
+  sdfMaxDim() {
+    return this.tier === "high" ? 384 : this.tier === "mid" ? 256 : 128;
+  }
+  /** Debounce before the settle-refine fires (ms). Fast → near-immediate (dynamic); slow → patient. */
+  refineDelayMs() {
+    return this.tier === "high" ? 40 : this.tier === "mid" ? 150 : 320;
+  }
+  /** High-end only: refine live during a stroke rather than only on settle. */
+  refineDuringStroke() {
+    return this.tier === "high";
+  }
+  /** Reserve the exact-EDT refinement tier (when built) for capable devices. */
+  useEdt() {
+    return this.tier !== "low";
+  }
+  summary() {
+    return `${this.tier} (${this.refineMsAt64.toFixed(1)} ms/refine@64\xB3 \u2192 sdf\u2264${this.sdfMaxDim()}, refine@${this.refineDelayMs()}ms)`;
+  }
+};
+
 // algorithms/demos/algorithms-browser.ts
 var status = (msg, err = false) => {
   const el = document.getElementById("status-text");
@@ -2882,7 +2958,9 @@ async function main() {
   const preferred = navigator.gpu.getPreferredCanvasFormat();
   const srgb = preferred + "-srgb";
   ctx.configure({ device: gpu.device, format: preferred, viewFormats: [srgb], alphaMode: "opaque" });
-  const a = buildAlgorithmsScene(gpu, srgb);
+  status("probing device capability\u2026");
+  const budget = await SegBudget.probe(gpu.device);
+  const a = buildAlgorithmsScene(gpu, srgb, { refineDelayMs: budget.refineDelayMs() });
   const camera = framedCamera(a.center, a.radius, 2.8);
   const a3d = mountAdaptive3d({
     scene: () => a.scene,
@@ -2954,10 +3032,11 @@ async function main() {
   });
   document.getElementById("reset")?.addEventListener("click", () => location.reload());
   resize();
-  status("surface-mode segmentation \xB7 drag to orbit \xB7 scroll/pinch to zoom \xB7 Poke to edit the shared buffer");
+  status(`surface-mode segmentation \xB7 ${budget.tier}-tier device \xB7 drag to orbit \xB7 scroll/pinch to zoom \xB7 Poke to edit`);
   globalThis.__algoDbg = {
     dist: () => camera.distance,
-    err: () => (globalThis.__gpuErr || []).length
+    err: () => (globalThis.__gpuErr || []).length,
+    tier: () => budget.tier
   };
 }
 main();
