@@ -2089,6 +2089,30 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   textureStore(t_out, c, vec4<f32>(sum, center.a));
 }`
 );
+var FULLBLUR_WGSL = (
+  /* wgsl */
+  `
+struct BU { dims : vec4<u32>, axis_r : vec4<u32>, w : array<vec4<f32>, 4> };
+@group(0) @binding(0) var t_in : texture_3d<f32>;
+@group(0) @binding(1) var t_out : texture_storage_3d<rgba16float, write>;
+@group(0) @binding(2) var<uniform> u : BU;
+fn wt(i : u32) -> f32 { return u.w[i >> 2u][i & 3u]; }
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  if (any(gid >= u.dims.xyz)) { return; }
+  let c = vec3<i32>(gid);
+  let dmax = vec3<i32>(u.dims.xyz) - vec3<i32>(1);
+  var av = vec3<i32>(0);
+  if (u.axis_r.x == 0u) { av = vec3<i32>(1,0,0); } else if (u.axis_r.x == 1u) { av = vec3<i32>(0,1,0); } else { av = vec3<i32>(0,0,1); }
+  var sum = textureLoad(t_in, c, 0) * wt(0u);
+  let R = i32(u.axis_r.y);
+  for (var i = 1; i <= R; i = i + 1) {
+    sum = sum + wt(u32(i)) * (textureLoad(t_in, clamp(c + av * i, vec3<i32>(0), dmax), 0)
+                            + textureLoad(t_in, clamp(c - av * i, vec3<i32>(0), dmax), 0));
+  }
+  textureStore(t_out, c, sum);
+}`
+);
 function gaussHalfKernel2(sigma) {
   const radius = Math.max(1, Math.min(15, Math.ceil(3 * sigma)));
   const raw = new Float32Array(radius + 1);
@@ -2112,7 +2136,8 @@ var JfaSdfBaker = class {
     const mk = (fmt, extra = 0) => dev.createTexture({ size: dims, dimension: "3d", format: fmt, usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING | extra });
     this.seed = [mk("rgba32float"), mk("rgba32float")];
     this.sdfTex = mk("rgba16float", GPUTextureUsage.COPY_DST);
-    this.attrTex = mk("rgba16float");
+    this.attrTex = mk("rgba16float", GPUTextureUsage.COPY_DST);
+    this.attrScratch = mk("rgba16float", GPUTextureUsage.COPY_SRC);
     this.sdfScratch = mk("rgba16float", GPUTextureUsage.COPY_SRC);
     this.uni = dev.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.palBuf = dev.createBuffer({ size: 256 * 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -2123,6 +2148,7 @@ var JfaSdfBaker = class {
     this.finalPipe = mod(FINAL_WGSL);
     this.blurPipe = mod(BLUR_WGSL2);
     this.colBlurPipe = mod(COLBLUR_WGSL);
+    this.fullBlurPipe = mod(FULLBLUR_WGSL);
     this.g = [Math.ceil(dx / 4), Math.ceil(dy / 4), Math.ceil(dz / 4)];
     const maxDim = Math.max(dx, dy, dz);
     const steps = [];
@@ -2138,7 +2164,9 @@ var JfaSdfBaker = class {
   sdfTex;
   // rgba16float: .rgb = per-label colour, .a = signed dist (mm) — sampled by SegmentField
   attrTex;
-  // rgba16float: .r = per-segment opacity — sampled by SegmentField
+  // rgba16float: .r = per-segment opacity, .g = shading mode — sampled by SegmentField
+  attrScratch;
+  // rgba16float attr-blur ping-pong
   sdfScratch;
   // rgba16float blur ping-pong
   uni;
@@ -2153,6 +2181,8 @@ var JfaSdfBaker = class {
   // blurs .a (distance), carries .rgb
   colBlurPipe;
   // blurs .rgb (colour), carries .a
+  fullBlurPipe;
+  // blurs all channels — the attr texture (opacity + mode)
   g;
   steps;
   smoothSigma;
@@ -2258,15 +2288,16 @@ var JfaSdfBaker = class {
     p.dispatchWorkgroups(gx, gy, gz);
     p.end();
     dev.queue.submit([enc.finish()]);
-    if (distSigma > 0) this.blurStage(this.blurPipe, distSigma);
-    if (colorSigma > 0) this.blurStage(this.colBlurPipe, colorSigma);
+    if (distSigma > 0) this.blurStage(this.blurPipe, distSigma, this.sdfTex, this.sdfScratch);
+    if (colorSigma > 0) this.blurStage(this.colBlurPipe, colorSigma, this.sdfTex, this.sdfScratch);
+    if (colorSigma > 0) this.blurStage(this.fullBlurPipe, colorSigma, this.attrTex, this.attrScratch);
   }
-  /** 3 separable Gaussian passes with the given pipeline (which channels it blurs), sdfTex↔scratch,
-   *  ending in scratch → copied back to sdfTex so its identity stays stable for the renderer. */
-  blurStage(pipe, sigma) {
+  /** 3 separable Gaussian passes with the given pipeline (which channels it blurs), tex↔scratch,
+   *  ending in scratch → copied back to `tex` so its identity stays stable for the renderer. */
+  blurStage(pipe, sigma, tex, scratch) {
     const dev = this.dev, [gx, gy, gz] = this.g, [dx, dy, dz] = this.dims;
     const { radius, w } = gaussHalfKernel2(sigma);
-    const passes = [[this.sdfTex, this.sdfScratch, 0], [this.sdfScratch, this.sdfTex, 1], [this.sdfTex, this.sdfScratch, 2]];
+    const passes = [[tex, scratch, 0], [scratch, tex, 1], [tex, scratch, 2]];
     const enc = dev.createCommandEncoder();
     for (const [srcT, dstT, axis] of passes) {
       const ab = new ArrayBuffer(96);
@@ -2290,7 +2321,7 @@ var JfaSdfBaker = class {
       bp.dispatchWorkgroups(gx, gy, gz);
       bp.end();
     }
-    enc.copyTextureToTexture({ texture: this.sdfScratch }, { texture: this.sdfTex }, this.dims);
+    enc.copyTextureToTexture({ texture: scratch }, { texture: tex }, this.dims);
     dev.queue.submit([enc.finish()]);
   }
   destroy() {
@@ -2298,6 +2329,7 @@ var JfaSdfBaker = class {
     this.seed[1].destroy();
     this.sdfTex.destroy();
     this.attrTex.destroy();
+    this.attrScratch.destroy();
     this.sdfScratch.destroy();
     this.uni.destroy();
     this.palBuf.destroy();
@@ -2400,31 +2432,14 @@ fn attr_seg${s}(wp : vec3<f32>) -> vec2<f32> {   // per-segment (.x = opacity, .
   if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { return vec2<f32>(0.0); }
   return textureSampleLevel(t_attr${s}, s_lin, t, 0.0).rg;
 }` : ""}
-fn sample_field_seg${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
-  let op0 = u_material.seg${s}_color.a;
-  if (op0 <= 0.0) { return vec4<f32>(0.0); }
-  let sdf = v_seg${s}(wp);
-  let band = max(u_material.seg${s}_params.x, 1e-3);
-  let step = max(u_material.scene.x, 1e-3);
-${this.attrTex ? `  let at = attr_seg${s}(wp);    // (opacity, shading mode)
-  let seg_op = at.x;
-  if (seg_op <= 0.0) { return vec4<f32>(0.0); }
-  if (at.y > 0.5) {
-    // VOLUME shading: DVR fill of the interior (sdf<0) with translucent emissive colour, so you see
-    // the segment as a solid cloud rather than a surface shell. ~24 mm opacity-unit-distance.
-    if (sdf >= 0.0) { return vec4<f32>(0.0); }
-    let vop = clamp(op0 * seg_op * step / 24.0, 0.0, 1.0);
-    if (vop <= 0.0) { return vec4<f32>(0.0); }
-    let vcol = srgb2physical(clamp(col_seg${s}(wp), vec3<f32>(0.0), vec3<f32>(1.0)));
-    return vec4<f32>(vcol * vop, vop);
-  }` : `  let seg_op = 1.0;`}
-  // SURFACE shading: crisp shell around sdf=0.
+// Shell (surface) contribution at wp: crisp Phong shell around sdf=0. Weighted by (1-mode) so it
+// morphs smoothly into the volume contribution across a blurred surface\u2194volume boundary.
+fn surface_seg${s}(wp : vec3<f32>, rd : vec3<f32>, sdf : f32, band : f32, step : f32, seg_op : f32, op0 : f32) -> vec4<f32> {
   let d_mm = abs(sdf);
-  if (d_mm > band + step) { return vec4<f32>(0.0); }   // outside the shell (+ gradient stencil margin)
+  if (d_mm > band + step) { return vec4<f32>(0.0); }
   let a = 1.0 - clamp(d_mm / band, 0.0, 1.0);
   if (a <= 0.0) { return vec4<f32>(0.0); }
   let op = clamp(a * op0 * seg_op, 0.0, 1.0);
-  // Normal = SDF gradient (central difference); smooth SDF \u2192 smooth normal, no terracing.
   let h = step;
   let g = vec3<f32>(
     v_seg${s}(wp + vec3<f32>(h,0,0)) - v_seg${s}(wp - vec3<f32>(h,0,0)),
@@ -2439,10 +2454,37 @@ ${this.attrTex ? `  let at = attr_seg${s}(wp);    // (opacity, shading mode)
   let ldn = max(dot(-rd, n), 0.0);
   let refl = normalize(2.0 * ldn * n + rd);
   let rdv = max(dot(refl, -rd), 0.0);
-  let col = col_seg${s}(wp);                 // per-label colour from the texture
+  let col = col_seg${s}(wp);
   var lit = col * ka + col * (kd * ldn) + vec3<f32>(ks * pow(rdv, max(sh, 1.0)));
   lit = srgb2physical(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)));
   return vec4<f32>(lit * op, op);
+}
+fn sample_field_seg${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
+  let op0 = u_material.seg${s}_color.a;
+  if (op0 <= 0.0) { return vec4<f32>(0.0); }
+  let sdf = v_seg${s}(wp);
+  let band = max(u_material.seg${s}_params.x, 1e-3);
+  let step = max(u_material.scene.x, 1e-3);
+${this.attrTex ? `  let at = attr_seg${s}(wp);        // (opacity, shading mode)
+  let seg_op = at.x;
+  if (seg_op <= 0.0) { return vec4<f32>(0.0); }
+  let mode = clamp(at.y, 0.0, 1.0);
+  // Surface and volume are BLENDED by the (seam-blurred, fractional) mode, so an opaque-surface
+  // segment and a translucent-volume segment meet with a smooth transition instead of a jagged,
+  // voxel-quantized classification edge.
+  var acc = vec4<f32>(0.0);
+  if (mode > 0.001 && sdf < 0.0) {
+    // VOLUME: translucent DVR fill of the interior (~24 mm opacity-unit-distance).
+    let vop = clamp(op0 * seg_op * step / 24.0, 0.0, 1.0);
+    if (vop > 0.0) {
+      let vcol = srgb2physical(clamp(col_seg${s}(wp), vec3<f32>(0.0), vec3<f32>(1.0)));
+      acc += mode * vec4<f32>(vcol * vop, vop);
+    }
+  }
+  if (mode < 0.999) {
+    acc += (1.0 - mode) * surface_seg${s}(wp, rd, sdf, band, step, seg_op, op0);
+  }
+  return acc;` : `  return surface_seg${s}(wp, rd, sdf, band, step, 1.0, op0);`}
 }`
       );
     }
