@@ -2053,6 +2053,16 @@ fn v_seg${s}(wp : vec3<f32>) -> f32 {   // signed distance (mm)
   if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { return 1e3; }   // far outside \u2192 culled
   return textureSampleLevel(t_seg${s}, s_lin, t, 0.0).a;
 }
+fn vgrad_seg${s}(wp : vec3<f32>) -> f32 {   // signed distance for the NORMAL finite-difference
+  // A gradient tap that steps just outside the (padded) SDF texture must read BACKGROUND, not the
+  // out-of-volume cull sentinel (1e3) \u2014 a huge sentinel would fabricate an enormous fake gradient that
+  // points out through the volume face and unlights the surface (black speckle at the seg/boundary
+  // interface). Clamp to the texture edge: with the padded grid that edge IS background, so the normal
+  // near a cap stays correct. This is the "artificial background boundary sample" for the normal.
+  let t4 = u_material.seg${s}_p2t * vec4<f32>(transform_point_seg${s}(wp), 1.0);
+  let t = clamp(t4.xyz, vec3<f32>(0.0), vec3<f32>(1.0));
+  return textureSampleLevel(t_seg${s}, s_lin, t, 0.0).a;
+}
 fn col_seg${s}(wp : vec3<f32>) -> vec3<f32> {   // per-label colour of the nearest region
   let t4 = u_material.seg${s}_p2t * vec4<f32>(transform_point_seg${s}(wp), 1.0);
   let t = t4.xyz;
@@ -2074,9 +2084,9 @@ fn surface_seg${s}(wp : vec3<f32>, rd : vec3<f32>, sdf : f32, band : f32, step :
   if (T <= 0.0) { return vec4<f32>(0.0); }
   let h = step;
   let g = vec3<f32>(
-    v_seg${s}(wp + vec3<f32>(h,0,0)) - v_seg${s}(wp - vec3<f32>(h,0,0)),
-    v_seg${s}(wp + vec3<f32>(0,h,0)) - v_seg${s}(wp - vec3<f32>(0,h,0)),
-    v_seg${s}(wp + vec3<f32>(0,0,h)) - v_seg${s}(wp - vec3<f32>(0,0,h))) / (2.0 * h);
+    vgrad_seg${s}(wp + vec3<f32>(h,0,0)) - vgrad_seg${s}(wp - vec3<f32>(h,0,0)),
+    vgrad_seg${s}(wp + vec3<f32>(0,h,0)) - vgrad_seg${s}(wp - vec3<f32>(0,h,0)),
+    vgrad_seg${s}(wp + vec3<f32>(0,0,h)) - vgrad_seg${s}(wp - vec3<f32>(0,0,h))) / (2.0 * h);
   let glen = length(g);
   if (glen < 1e-5) { return vec4<f32>(0.0); }
   var n = g / glen;
@@ -2666,6 +2676,87 @@ fn sample_field_fid${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
   }
 };
 
+// algorithms/geom.ts
+function spacingFromIjkToRAS2(ijkToRAS) {
+  const col = (c) => Math.hypot(ijkToRAS[c], ijkToRAS[4 + c], ijkToRAS[8 + c]);
+  return [col(0), col(1), col(2)];
+}
+
+// algorithms/editable-segmentation.ts
+var EditableSegmentation = class {
+  dims;
+  ijkToRAS;
+  device;
+  // effects (algorithms/effects/*) build their own pipelines against this
+  labelTex;
+  // master (r32uint, STORAGE) — the shared buffer effects write
+  dirtyCbs = [];
+  constructor(device, dims, opts) {
+    this.device = device;
+    this.dims = dims;
+    this.ijkToRAS = Array.from(opts.ijkToRAS);
+    this.labelTex = device.createTexture({
+      size: dims,
+      dimension: "3d",
+      format: "r32uint",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC
+    });
+  }
+  /** The master labelmap (r32uint storage). The logic layer reads it (to derive a presence texture);
+   *  editing effects write it on-GPU (A-1+). */
+  masterTexture() {
+    return this.labelTex;
+  }
+  /** Register a callback fired after any edit — the logic layer rebakes + redraws. Returns an
+   *  unsubscribe (so a logic can be swapped/disposed without leaking a stale rebake). */
+  onDirty(cb) {
+    this.dirtyCbs.push(cb);
+    return () => {
+      const i = this.dirtyCbs.indexOf(cb);
+      if (i >= 0) this.dirtyCbs.splice(i, 1);
+    };
+  }
+  /** Signal that the master was edited (effects call this after writing the label texture on-GPU). */
+  markDirty() {
+    for (const cb of this.dirtyCbs) cb();
+  }
+  /** Voxel spacing (mm) from the geometry — for mm↔voxel effect params. */
+  spacingMm() {
+    return spacingFromIjkToRAS2(this.ijkToRAS);
+  }
+  /** Load a full labelmap (ids 0..255) from CPU into the master, then notify. */
+  loadLabelmap(data) {
+    const [dx, dy, dz] = this.dims;
+    const u32 = data instanceof Uint32Array ? data : Uint32Array.from(data);
+    this.device.queue.writeTexture({ texture: this.labelTex }, u32, { bytesPerRow: dx * 4, rowsPerImage: dy }, [dx, dy, dz]);
+    this.markDirty();
+  }
+  /** Read the master labelmap back to CPU (ids per voxel, x-fastest). Handles WebGPU's 256-byte
+   *  bytesPerRow alignment. For tests + zarr serialization (A-7); not on the interactive path. */
+  async readLabelmap() {
+    const [dx, dy, dz] = this.dims;
+    const bpr = Math.ceil(dx * 4 / 256) * 256;
+    const rowU32 = bpr / 4;
+    const buf = this.device.createBuffer({ size: bpr * dy * dz, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const enc = this.device.createCommandEncoder();
+    enc.copyTextureToBuffer({ texture: this.labelTex }, { buffer: buf, bytesPerRow: bpr, rowsPerImage: dy }, [dx, dy, dz]);
+    this.device.queue.submit([enc.finish()]);
+    await buf.mapAsync(GPUMapMode.READ);
+    const padded = new Uint32Array(buf.getMappedRange());
+    const out = new Uint32Array(dx * dy * dz);
+    for (let z = 0; z < dz; z++) for (let y = 0; y < dy; y++) {
+      const src = (z * dy + y) * rowU32, dst = (z * dy + y) * dx;
+      for (let x = 0; x < dx; x++) out[dst + x] = padded[src + x];
+    }
+    buf.unmap();
+    buf.destroy();
+    return out;
+  }
+  destroy() {
+    this.labelTex.destroy();
+  }
+};
+
 // render/bake.ts
 var INIT_WGSL = (
   /* wgsl */
@@ -2723,69 +2814,695 @@ function gaussHalfKernel(sigma) {
   for (let i = 0; i <= radius; i++) w[i] = raw[i] / total;
   return { radius, w };
 }
-function bakeColorizeRGBA(dev, labelmap, dims, palette, sigmaVoxels = 1.5) {
-  const [dx, dy, dz] = dims;
-  const storageUsage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING;
-  const labelTex = dev.createTexture({ size: dims, dimension: "3d", format: "r8uint", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
-  dev.queue.writeTexture({ texture: labelTex }, labelmap, { bytesPerRow: dx, rowsPerImage: dy }, dims);
-  const texA = dev.createTexture({ size: dims, dimension: "3d", format: "rgba16float", usage: storageUsage });
-  const texB = dev.createTexture({ size: dims, dimension: "3d", format: "rgba16float", usage: storageUsage });
-  const palBuf = dev.createBuffer({ size: 256 * 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-  const palData = new Float32Array(256 * 4);
-  palData.set(palette.subarray(0, Math.min(palette.length, 256 * 4)));
-  dev.queue.writeBuffer(palBuf, 0, palData);
-  const dimsBuf = dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-  dev.queue.writeBuffer(dimsBuf, 0, new Uint32Array([dx, dy, dz, 0]));
-  const gx = Math.ceil(dx / 4), gy = Math.ceil(dy / 4), gz = Math.ceil(dz / 4);
-  const initPipe = dev.createComputePipeline({ layout: "auto", compute: { module: dev.createShaderModule({ code: INIT_WGSL }), entryPoint: "main" } });
-  const initBind = dev.createBindGroup({ layout: initPipe.getBindGroupLayout(0), entries: [
-    { binding: 0, resource: labelTex.createView() },
-    { binding: 1, resource: texA.createView() },
-    { binding: 2, resource: { buffer: palBuf } },
-    { binding: 3, resource: { buffer: dimsBuf } }
-  ] });
-  const enc = dev.createCommandEncoder();
-  {
-    const p = enc.beginComputePass();
-    p.setPipeline(initPipe);
-    p.setBindGroup(0, initBind);
-    p.dispatchWorkgroups(gx, gy, gz);
-    p.end();
+var ColorizeBaker = class {
+  /** `label` is either a CPU labelmap (baker allocates + uploads its own r8uint texture, the classic
+   *  path) OR an EXTERNAL r8uint 3D texture the baker only READS (the shared-buffer path used by
+   *  `algorithms/EditableSegmentation` — a compute effect writes the label texture on-GPU and the baker
+   *  re-colorizes from it, no CPU round-trip). An external texture must be `r8uint` with at least
+   *  TEXTURE_BINDING usage; the baker never writes or destroys it. */
+  constructor(dev, label, dims) {
+    this.dev = dev;
+    this.dims = dims;
+    const [dx, dy, dz] = dims;
+    if (label instanceof GPUTexture) {
+      this.labelTex = label;
+      this.ownsLabel = false;
+    } else {
+      this.labelTex = dev.createTexture({ size: dims, dimension: "3d", format: "r8uint", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+      dev.queue.writeTexture({ texture: this.labelTex }, label, { bytesPerRow: dx, rowsPerImage: dy }, dims);
+      this.ownsLabel = true;
+    }
+    this.palBuf = dev.createBuffer({ size: 256 * 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.dimsBuf = dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    dev.queue.writeBuffer(this.dimsBuf, 0, new Uint32Array([dx, dy, dz, 0]));
+    this.initPipe = dev.createComputePipeline({ layout: "auto", compute: { module: dev.createShaderModule({ code: INIT_WGSL }), entryPoint: "main" } });
+    this.blurPipe = dev.createComputePipeline({ layout: "auto", compute: { module: dev.createShaderModule({ code: BLUR_WGSL }), entryPoint: "main" } });
+    this.g = [Math.ceil(dx / 4), Math.ceil(dy / 4), Math.ceil(dz / 4)];
   }
-  if (sigmaVoxels <= 0) {
+  dev;
+  dims;
+  labelTex;
+  ownsLabel;
+  // false when the label texture is owned externally (shared buffer)
+  scratch;
+  // blur ping-pong (lazy; only when sigma > 0)
+  palBuf;
+  dimsBuf;
+  initPipe;
+  blurPipe;
+  g;
+  /** Re-upload an EDITED labelmap (same dims). Follow with bakeInto() to re-colorize into the caller's
+   *  existing output textures — an in-place replace (no re-allocation, so a segmentation edit updates
+   *  smoothly with no flash). */
+  updateLabelmap(labelmap) {
+    if (!this.ownsLabel) throw new Error("ColorizeBaker.updateLabelmap: label texture is external (write it via the owner, e.g. a compute effect), then call bakeInto()");
+    const [dx, dy] = this.dims;
+    this.dev.queue.writeTexture({ texture: this.labelTex }, labelmap, { bytesPerRow: dx, rowsPerImage: dy }, this.dims);
+  }
+  /** Allocate an output texture sized/typed for this baker's labelmap (caller owns it). */
+  output() {
+    return this.dev.createTexture({ size: this.dims, dimension: "3d", format: "rgba16float", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING });
+  }
+  /** (Re)colorize into `out` with `palette` (256*4 f32: rgb + presence*opacity) and Gaussian
+   *  `sigmaVoxels` (0 = crisp, for the 2D slice overlay). In place — reuses everything resident. */
+  bakeInto(out, palette, sigmaVoxels = 1.5) {
+    const dev = this.dev, [gx, gy, gz] = this.g, [dx, dy, dz] = this.dims;
+    const palData = new Float32Array(256 * 4);
+    palData.set(palette.subarray(0, Math.min(palette.length, 256 * 4)));
+    dev.queue.writeBuffer(this.palBuf, 0, palData);
+    const enc = dev.createCommandEncoder();
+    const smooth = sigmaVoxels > 0;
+    if (smooth && !this.scratch) this.scratch = this.output();
+    const initDst = smooth ? this.scratch : out;
+    const initBind = dev.createBindGroup({ layout: this.initPipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: this.labelTex.createView() },
+      { binding: 1, resource: initDst.createView() },
+      { binding: 2, resource: { buffer: this.palBuf } },
+      { binding: 3, resource: { buffer: this.dimsBuf } }
+    ] });
+    {
+      const p = enc.beginComputePass();
+      p.setPipeline(this.initPipe);
+      p.setBindGroup(0, initBind);
+      p.dispatchWorkgroups(gx, gy, gz);
+      p.end();
+    }
+    if (smooth) {
+      const s = this.scratch;
+      const { radius, w } = gaussHalfKernel(sigmaVoxels);
+      const passes = [[s, out, 0], [out, s, 1], [s, out, 2]];
+      for (const [src, dst, axis] of passes) {
+        const ub = dev.createBuffer({ size: 16 + 16 + 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        dev.queue.writeBuffer(ub, 0, new Uint32Array([dx, dy, dz, 0, axis, radius, 0, 0]));
+        dev.queue.writeBuffer(ub, 32, w);
+        const b = dev.createBindGroup({ layout: this.blurPipe.getBindGroupLayout(0), entries: [
+          { binding: 0, resource: src.createView() },
+          { binding: 1, resource: dst.createView() },
+          { binding: 2, resource: { buffer: ub } }
+        ] });
+        const p = enc.beginComputePass();
+        p.setPipeline(this.blurPipe);
+        p.setBindGroup(0, b);
+        p.dispatchWorkgroups(gx, gy, gz);
+        p.end();
+      }
+    }
     dev.queue.submit([enc.finish()]);
-    labelTex.destroy();
-    texB.destroy();
-    return texA;
   }
-  const { radius, w } = gaussHalfKernel(sigmaVoxels);
-  const blurPipe = dev.createComputePipeline({ layout: "auto", compute: { module: dev.createShaderModule({ code: BLUR_WGSL }), entryPoint: "main" } });
-  const passes = [[texA, texB, 0], [texB, texA, 1], [texA, texB, 2]];
-  for (const [src, dst, axis] of passes) {
-    const ub = dev.createBuffer({ size: 16 + 16 + 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    dev.queue.writeBuffer(ub, 0, new Uint32Array([dx, dy, dz, 0, axis, radius, 0, 0]));
-    dev.queue.writeBuffer(ub, 32, w);
-    const b = dev.createBindGroup({ layout: blurPipe.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: src.createView() },
-      { binding: 1, resource: dst.createView() },
-      { binding: 2, resource: { buffer: ub } }
+  destroy() {
+    if (this.ownsLabel) this.labelTex.destroy();
+    this.scratch?.destroy();
+    this.palBuf.destroy();
+    this.dimsBuf.destroy();
+  }
+};
+
+// render/sdf-bake.ts
+var INIT_WGSL2 = (
+  /* wgsl */
+  `
+struct U { ijkToRAS : mat4x4<f32>, dims : vec4<u32>, params : vec4<f32> };
+@group(0) @binding(0) var t_label : texture_3d<u32>;
+@group(0) @binding(1) var t_seed_out : texture_storage_3d<rgba32float, write>;
+@group(0) @binding(2) var<uniform> u : U;
+// PADDED SDF GRID: the seed/SDF textures are LARGER than the labelmap by 'pad' voxels on every side
+// (dims.w). Coord c is a padded-grid coord; the label lives at c-pad, and everything outside the label
+// range is background (0). This gives a real spatial margin of background BEYOND the segmentation, so
+// a segment touching the labelmap edge closes as a genuine capped surface with room for the SDF to go
+// positive \u2014 and gradient/finite-difference samples near that cap stay in-bounds (they read real
+// background) instead of hitting the out-of-volume cull sentinel, which used to poison the normal.
+fn labelAt(c : vec3<i32>) -> u32 {
+  let pad = i32(u.dims.w);
+  let ld = vec3<i32>(u.dims.xyz) - vec3<i32>(2 * pad);   // label dims = padded dims - 2\xB7pad
+  let lc = c - vec3<i32>(pad);
+  if (any(lc < vec3<i32>(0)) || any(lc >= ld)) { return 0u; }
+  return textureLoad(t_label, lc, 0).r;
+}
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  if (any(gid >= u.dims.xyz)) { return; }
+  let c = vec3<i32>(gid);
+  let my = labelAt(c);
+  let meIn = my != 0u;
+  var boundary = false;
+  var region = my;                                  // inside voxel \u2192 own label
+  let offs = array<vec3<i32>, 6>(vec3<i32>(1,0,0), vec3<i32>(-1,0,0), vec3<i32>(0,1,0), vec3<i32>(0,-1,0), vec3<i32>(0,0,1), vec3<i32>(0,0,-1));
+  for (var i = 0; i < 6; i = i + 1) {
+    let nl = labelAt(c + offs[i]);
+    let nIn = nl != 0u;
+    if (nIn != meIn) { boundary = true; if (!meIn) { region = nl; } }  // outside boundary \u2192 adopt inside neighbour's label
+  }
+  var seed = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+  if (boundary) { seed = vec4<f32>((u.ijkToRAS * vec4<f32>(vec3<f32>(gid), 1.0)).xyz, f32(region)); }
+  textureStore(t_seed_out, c, seed);
+}`
+);
+var JFA_WGSL = (
+  /* wgsl */
+  `
+struct U { ijkToRAS : mat4x4<f32>, dims : vec4<u32>, params : vec4<f32> };
+@group(0) @binding(0) var t_seed_in : texture_3d<f32>;
+@group(0) @binding(1) var t_seed_out : texture_storage_3d<rgba32float, write>;
+@group(0) @binding(2) var<uniform> u : U;
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  if (any(gid >= u.dims.xyz)) { return; }
+  let c = vec3<i32>(gid);
+  let p = (u.ijkToRAS * vec4<f32>(vec3<f32>(gid), 1.0)).xyz;
+  let step = i32(u.params.x);
+  let dmax = vec3<i32>(u.dims.xyz) - vec3<i32>(1);
+  var best = textureLoad(t_seed_in, c, 0);
+  var bestD = select(1e30, distance(p, best.xyz), best.w > 0.5);
+  for (var dz = -1; dz <= 1; dz = dz + 1) {
+    for (var dy = -1; dy <= 1; dy = dy + 1) {
+      for (var dx = -1; dx <= 1; dx = dx + 1) {
+        if (dx == 0 && dy == 0 && dz == 0) { continue; }
+        let nc = clamp(c + vec3<i32>(dx, dy, dz) * step, vec3<i32>(0), dmax);
+        let s = textureLoad(t_seed_in, nc, 0);
+        if (s.w > 0.5) {
+          let d = distance(p, s.xyz);
+          if (d < bestD) { bestD = d; best = s; }
+        }
+      }
+    }
+  }
+  textureStore(t_seed_out, c, best);
+}`
+);
+var FINAL_WGSL = (
+  /* wgsl */
+  `
+struct U { ijkToRAS : mat4x4<f32>, dims : vec4<u32>, params : vec4<f32> };
+@group(0) @binding(0) var t_seed_in : texture_3d<f32>;
+@group(0) @binding(1) var t_label : texture_3d<u32>;
+@group(0) @binding(2) var t_out : texture_storage_3d<rgba16float, write>;
+@group(0) @binding(3) var<uniform> u : U;
+@group(0) @binding(4) var<uniform> u_pal : array<vec4<f32>, 256>;
+@group(0) @binding(5) var t_attr : texture_storage_3d<rgba16float, write>;
+@group(0) @binding(6) var<uniform> u_mode : array<vec4<f32>, 256>;   // .x = shading mode (0 surface, 1 volume)
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  if (any(gid >= u.dims.xyz)) { return; }
+  let c = vec3<i32>(gid);
+  let p = (u.ijkToRAS * vec4<f32>(vec3<f32>(gid), 1.0)).xyz;
+  let s = textureLoad(t_seed_in, c, 0);
+  let valid = s.w > 0.5;
+  let dist = select(1e3, distance(p, s.xyz), valid);
+  let pad = i32(u.dims.w);                                       // label is offset by pad; pad region = background (outside)
+  let lc = c - vec3<i32>(pad);
+  let ld = vec3<i32>(u.dims.xyz) - vec3<i32>(2 * pad);
+  let inRange = all(lc >= vec3<i32>(0)) && all(lc < ld);
+  let ins = inRange && textureLoad(t_label, lc, 0).r != 0u;
+  let sdf = select(dist, -dist, ins);
+  let lbl = u32(s.w + 0.5) & 255u;
+  let pal = select(vec4<f32>(0.0), u_pal[lbl], valid);
+  let mode = select(0.0, u_mode[lbl].x, valid);
+  textureStore(t_out, c, vec4<f32>(pal.rgb, sdf));
+  textureStore(t_attr, c, vec4<f32>(pal.a, mode, 0.0, 0.0));   // .r = per-segment opacity, .g = shading mode
+}`
+);
+var BLUR_WGSL2 = (
+  /* wgsl */
+  `
+struct BU { dims : vec4<u32>, axis_r : vec4<u32>, w : array<vec4<f32>, 4> };
+@group(0) @binding(0) var t_in : texture_3d<f32>;
+@group(0) @binding(1) var t_out : texture_storage_3d<rgba16float, write>;
+@group(0) @binding(2) var<uniform> u : BU;
+fn wt(i : u32) -> f32 { return u.w[i >> 2u][i & 3u]; }
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  if (any(gid >= u.dims.xyz)) { return; }
+  let c = vec3<i32>(gid);
+  let dmax = vec3<i32>(u.dims.xyz) - vec3<i32>(1);
+  var av = vec3<i32>(0);
+  if (u.axis_r.x == 0u) { av = vec3<i32>(1,0,0); } else if (u.axis_r.x == 1u) { av = vec3<i32>(0,1,0); } else { av = vec3<i32>(0,0,1); }
+  let center = textureLoad(t_in, c, 0);
+  var sum = center.a * wt(0u);
+  let R = i32(u.axis_r.y);
+  for (var i = 1; i <= R; i = i + 1) {
+    sum = sum + wt(u32(i)) * (textureLoad(t_in, clamp(c + av * i, vec3<i32>(0), dmax), 0).a
+                            + textureLoad(t_in, clamp(c - av * i, vec3<i32>(0), dmax), 0).a);
+  }
+  textureStore(t_out, c, vec4<f32>(center.rgb, sum));
+}`
+);
+var COLBLUR_WGSL = (
+  /* wgsl */
+  `
+struct BU { dims : vec4<u32>, axis_r : vec4<u32>, w : array<vec4<f32>, 4> };
+@group(0) @binding(0) var t_in : texture_3d<f32>;
+@group(0) @binding(1) var t_out : texture_storage_3d<rgba16float, write>;
+@group(0) @binding(2) var<uniform> u : BU;
+fn wt(i : u32) -> f32 { return u.w[i >> 2u][i & 3u]; }
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  if (any(gid >= u.dims.xyz)) { return; }
+  let c = vec3<i32>(gid);
+  let dmax = vec3<i32>(u.dims.xyz) - vec3<i32>(1);
+  var av = vec3<i32>(0);
+  if (u.axis_r.x == 0u) { av = vec3<i32>(1,0,0); } else if (u.axis_r.x == 1u) { av = vec3<i32>(0,1,0); } else { av = vec3<i32>(0,0,1); }
+  let center = textureLoad(t_in, c, 0);
+  var sum = center.rgb * wt(0u);
+  let R = i32(u.axis_r.y);
+  for (var i = 1; i <= R; i = i + 1) {
+    sum = sum + wt(u32(i)) * (textureLoad(t_in, clamp(c + av * i, vec3<i32>(0), dmax), 0).rgb
+                            + textureLoad(t_in, clamp(c - av * i, vec3<i32>(0), dmax), 0).rgb);
+  }
+  textureStore(t_out, c, vec4<f32>(sum, center.a));
+}`
+);
+var FULLBLUR_WGSL = (
+  /* wgsl */
+  `
+struct BU { dims : vec4<u32>, axis_r : vec4<u32>, w : array<vec4<f32>, 4> };
+@group(0) @binding(0) var t_in : texture_3d<f32>;
+@group(0) @binding(1) var t_out : texture_storage_3d<rgba16float, write>;
+@group(0) @binding(2) var<uniform> u : BU;
+fn wt(i : u32) -> f32 { return u.w[i >> 2u][i & 3u]; }
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  if (any(gid >= u.dims.xyz)) { return; }
+  let c = vec3<i32>(gid);
+  let dmax = vec3<i32>(u.dims.xyz) - vec3<i32>(1);
+  var av = vec3<i32>(0);
+  if (u.axis_r.x == 0u) { av = vec3<i32>(1,0,0); } else if (u.axis_r.x == 1u) { av = vec3<i32>(0,1,0); } else { av = vec3<i32>(0,0,1); }
+  var sum = textureLoad(t_in, c, 0) * wt(0u);
+  let R = i32(u.axis_r.y);
+  for (var i = 1; i <= R; i = i + 1) {
+    sum = sum + wt(u32(i)) * (textureLoad(t_in, clamp(c + av * i, vec3<i32>(0), dmax), 0)
+                            + textureLoad(t_in, clamp(c - av * i, vec3<i32>(0), dmax), 0));
+  }
+  textureStore(t_out, c, sum);
+}`
+);
+function gaussHalfKernel2(sigma) {
+  const radius = Math.max(1, Math.min(15, Math.ceil(3 * sigma)));
+  const raw = new Float32Array(radius + 1);
+  let total = 0;
+  for (let i = 0; i <= radius; i++) {
+    raw[i] = Math.exp(-(i * i) / (2 * sigma * sigma));
+    total += (i === 0 ? 1 : 2) * raw[i];
+  }
+  const w = new Float32Array(16);
+  for (let i = 0; i <= radius; i++) w[i] = raw[i] / total;
+  return { radius, w };
+}
+var JfaSdfBaker = class {
+  // original (label) dims, before padding
+  // `pad` voxels of background are added on every side so segments touching the labelmap edge get a
+  // real cap + in-bounds gradient neighbourhood (docs/ALGORITHMS.md border artifact). The SDF textures,
+  // dispatch, seeds, blur and readback all run on the PADDED grid; `dims`/`ijkToRAS` become the padded
+  // grid's, and `sdfDims()`/`sdfIjkToRAS()` expose them to the SegmentField.
+  constructor(dev, labelTex, dims, ijkToRAS, smoothSigmaVoxels = 1, pad = 2) {
+    this.labelTex = labelTex;
+    this.dims = dims;
+    this.ijkToRAS = ijkToRAS;
+    this.dev = dev;
+    this.smoothSigma = smoothSigmaVoxels;
+    this.pad = pad;
+    this.labelDims = [dims[0], dims[1], dims[2]];
+    this.dims = [dims[0] + 2 * pad, dims[1] + 2 * pad, dims[2] + 2 * pad];
+    const m = ijkToRAS.slice();
+    for (let r = 0; r < 3; r++) m[r * 4 + 3] -= pad * (m[r * 4] + m[r * 4 + 1] + m[r * 4 + 2]);
+    this.ijkToRAS = m;
+    const [dx, dy, dz] = this.dims;
+    const mk = (fmt, extra = 0) => dev.createTexture({ size: this.dims, dimension: "3d", format: fmt, usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING | extra });
+    this.seed = [mk("rgba32float"), mk("rgba32float")];
+    this.sdfTex = mk("rgba16float", GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC);
+    this.attrTex = mk("rgba16float", GPUTextureUsage.COPY_DST);
+    this.attrScratch = mk("rgba16float", GPUTextureUsage.COPY_SRC);
+    this.sdfScratch = mk("rgba16float", GPUTextureUsage.COPY_SRC);
+    this.uni = dev.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.palBuf = dev.createBuffer({ size: 256 * 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.modeBuf = dev.createBuffer({ size: 256 * 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const mod = (code) => dev.createComputePipeline({ layout: "auto", compute: { module: dev.createShaderModule({ code }), entryPoint: "main" } });
+    this.initPipe = mod(INIT_WGSL2);
+    this.jfaPipe = mod(JFA_WGSL);
+    this.finalPipe = mod(FINAL_WGSL);
+    this.blurPipe = mod(BLUR_WGSL2);
+    this.colBlurPipe = mod(COLBLUR_WGSL);
+    this.fullBlurPipe = mod(FULLBLUR_WGSL);
+    this.g = [Math.ceil(dx / 4), Math.ceil(dy / 4), Math.ceil(dz / 4)];
+    const maxDim = Math.max(dx, dy, dz);
+    const steps = [];
+    for (let s = 1 << Math.floor(Math.log2(maxDim - 1)); s >= 1; s >>= 1) steps.push(s);
+    this.steps = steps;
+  }
+  labelTex;
+  dims;
+  ijkToRAS;
+  dev;
+  seed;
+  // rgba32float ping-pong (RAS seed xyz + regionLabel)
+  sdfTex;
+  // rgba16float: .rgb = per-label colour, .a = signed dist (mm) — sampled by SegmentField
+  attrTex;
+  // rgba16float: .r = per-segment opacity, .g = shading mode — sampled by SegmentField
+  attrScratch;
+  // rgba16float attr-blur ping-pong
+  sdfScratch;
+  // rgba16float blur ping-pong
+  uni;
+  palBuf;
+  // 256 × vec4 label→colour palette (.a = opacity)
+  modeBuf;
+  // 256 × vec4 label→shading mode (.x = 0 surface / 1 volume)
+  initPipe;
+  jfaPipe;
+  finalPipe;
+  blurPipe;
+  // blurs .a (distance), carries .rgb
+  colBlurPipe;
+  // blurs .rgb (colour), carries .a
+  fullBlurPipe;
+  // blurs all channels — the attr texture (opacity + mode)
+  g;
+  steps;
+  smoothSigma;
+  pad;
+  // background margin (voxels) padded around the labelmap
+  labelDims;
+  /** The resident colorized-SDF texture (rgba16float: .rgb = per-label colour, .a = signed mm).
+   *  Identity stable across bakes → the SceneRenderer bind group stays valid; a live edit updates in
+   *  place. */
+  sdfTexture() {
+    return this.sdfTex;
+  }
+  /** The resident per-segment attribute texture (rgba16float; .r = opacity). Identity stable. */
+  attrTexture() {
+    return this.attrTex;
+  }
+  /** The PADDED grid the SDF/attr textures live on (labelDims + 2·pad), and the ijkToRAS that maps it
+   *  to RAS — hand these to the SegmentField so its patient→texture transform covers the padded extent. */
+  sdfDims() {
+    return this.dims;
+  }
+  sdfIjkToRAS() {
+    return this.ijkToRAS;
+  }
+  /** Background margin (voxels) padded on each side; readDistance() is on the padded grid, so a label
+   *  voxel (x,y,z) is at padded (x+pad, y+pad, z+pad). */
+  padVoxels() {
+    return this.pad;
+  }
+  /** Read back the per-voxel signed distance (sdfTex .a, mm) to CPU. For accuracy comparison/tests. */
+  async readDistance() {
+    const [dx, dy, dz] = this.dims;
+    const bpr = Math.ceil(dx * 8 / 256) * 256;
+    const rowU16 = bpr / 2;
+    const buf = this.dev.createBuffer({ size: bpr * dy * dz, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const enc = this.dev.createCommandEncoder();
+    enc.copyTextureToBuffer({ texture: this.sdfTex }, { buffer: buf, bytesPerRow: bpr, rowsPerImage: dy }, [dx, dy, dz]);
+    this.dev.queue.submit([enc.finish()]);
+    await buf.mapAsync(GPUMapMode.READ);
+    const u16 = new Uint16Array(buf.getMappedRange());
+    const h2f = (h) => {
+      const s = h & 32768 ? -1 : 1, e = (h & 31744) >> 10, f = h & 1023;
+      if (e === 0) return s * Math.pow(2, -14) * (f / 1024);
+      if (e === 31) return f ? NaN : s * Infinity;
+      return s * Math.pow(2, e - 15) * (1 + f / 1024);
+    };
+    const out = new Float32Array(dx * dy * dz);
+    for (let z = 0; z < dz; z++) for (let y = 0; y < dy; y++) for (let x = 0; x < dx; x++) {
+      out[(z * dy + y) * dx + x] = h2f(u16[(z * dy + y) * rowU16 + x * 4 + 3]);
+    }
+    buf.unmap();
+    buf.destroy();
+    return out;
+  }
+  /** Set the label→colour palette (256 × rgba f32: rgb = colour, a = opacity). Call before bake(). */
+  setPalette(palette) {
+    const pal = new Float32Array(256 * 4);
+    pal.set(palette.subarray(0, Math.min(palette.length, 256 * 4)));
+    this.dev.queue.writeBuffer(this.palBuf, 0, pal);
+  }
+  /** Set the per-label shading mode palette (256 × vec4; .x = 0 surface shell / 1 volume DVR fill). */
+  setModePalette(modes) {
+    const m = new Float32Array(256 * 4);
+    m.set(modes.subarray(0, Math.min(modes.length, 256 * 4)));
+    this.dev.queue.writeBuffer(this.modeBuf, 0, m);
+  }
+  writeUni(step) {
+    const ab = new ArrayBuffer(96);
+    const f = new Float32Array(ab), u = new Uint32Array(ab);
+    f.set(transpose4(this.ijkToRAS), 0);
+    u[16] = this.dims[0];
+    u[17] = this.dims[1];
+    u[18] = this.dims[2];
+    u[19] = this.pad;
+    f[20] = step;
+    f[21] = 0;
+    f[22] = 0;
+    f[23] = 0;
+    this.dev.queue.writeBuffer(this.uni, 0, ab);
+  }
+  /** FAST bake for LIVE editing: plain JFA (approximate) + a light distance-only blur (crisp colour
+   *  seams). Cheap, so it keeps up with an in-progress stroke; the seams stay voxel-jagged until the
+   *  edit settles and refine() runs. */
+  bake() {
+    this.sweep([], this.smoothSigma, 0);
+  }
+  /** REFINE for a STATIC labelmap (run once the edit settles): JFA+2 extra passes → a near-exact
+   *  Voronoi/SDF (fixes the small JFA mistakes near close/overlapping segments) and a colour-seam blur
+   *  so neighbouring-label boundaries are smooth, not a voxel staircase. Distance blur stays at the
+   *  same σ (dropping it re-introduces Voronoi facets — crispness comes from the render band, not from
+   *  under-smoothing). Higher quality lives in the resident texture, so camera renders stay cheap. */
+  refine() {
+    this.sweep([2, 1], this.smoothSigma, 1);
+  }
+  /** One full sweep: init → JFA (schedule + extra) → finalize → blur .a → optional blur .rgb. */
+  sweep(extraSteps, distSigma, colorSigma) {
+    const dev = this.dev, [gx, gy, gz] = this.g;
+    this.writeUni(0);
+    let enc = dev.createCommandEncoder();
+    {
+      const b = dev.createBindGroup({ layout: this.initPipe.getBindGroupLayout(0), entries: [
+        { binding: 0, resource: this.labelTex.createView() },
+        { binding: 1, resource: this.seed[0].createView() },
+        { binding: 2, resource: { buffer: this.uni } }
+      ] });
+      const p2 = enc.beginComputePass();
+      p2.setPipeline(this.initPipe);
+      p2.setBindGroup(0, b);
+      p2.dispatchWorkgroups(gx, gy, gz);
+      p2.end();
+    }
+    dev.queue.submit([enc.finish()]);
+    let src = 0;
+    for (const step of [...this.steps, ...extraSteps]) {
+      this.writeUni(step);
+      const dst = src ^ 1;
+      enc = dev.createCommandEncoder();
+      const b = dev.createBindGroup({ layout: this.jfaPipe.getBindGroupLayout(0), entries: [
+        { binding: 0, resource: this.seed[src].createView() },
+        { binding: 1, resource: this.seed[dst].createView() },
+        { binding: 2, resource: { buffer: this.uni } }
+      ] });
+      const p2 = enc.beginComputePass();
+      p2.setPipeline(this.jfaPipe);
+      p2.setBindGroup(0, b);
+      p2.dispatchWorkgroups(gx, gy, gz);
+      p2.end();
+      dev.queue.submit([enc.finish()]);
+      src = dst;
+    }
+    enc = dev.createCommandEncoder();
+    const bf = dev.createBindGroup({ layout: this.finalPipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: this.seed[src].createView() },
+      { binding: 1, resource: this.labelTex.createView() },
+      { binding: 2, resource: this.sdfTex.createView() },
+      { binding: 3, resource: { buffer: this.uni } },
+      { binding: 4, resource: { buffer: this.palBuf } },
+      { binding: 5, resource: this.attrTex.createView() },
+      { binding: 6, resource: { buffer: this.modeBuf } }
     ] });
     const p = enc.beginComputePass();
-    p.setPipeline(blurPipe);
-    p.setBindGroup(0, b);
+    p.setPipeline(this.finalPipe);
+    p.setBindGroup(0, bf);
     p.dispatchWorkgroups(gx, gy, gz);
     p.end();
+    dev.queue.submit([enc.finish()]);
+    if (distSigma > 0) this.blurStage(this.blurPipe, distSigma, this.sdfTex, this.sdfScratch);
+    if (colorSigma > 0) this.blurStage(this.colBlurPipe, colorSigma, this.sdfTex, this.sdfScratch);
+    if (colorSigma > 0) this.blurStage(this.fullBlurPipe, colorSigma, this.attrTex, this.attrScratch);
   }
-  dev.queue.submit([enc.finish()]);
-  labelTex.destroy();
-  texA.destroy();
-  return texB;
-}
-function bakeSegmentPresence(dev, mask, dims, sigmaVoxels = 1.5) {
-  const palette = new Float32Array(256 * 4);
-  palette.set([1, 1, 1, 1], 4);
-  return bakeColorizeRGBA(dev, mask, dims, palette, sigmaVoxels);
-}
+  /** 3 separable Gaussian passes with the given pipeline (which channels it blurs), tex↔scratch,
+   *  ending in scratch → copied back to `tex` so its identity stays stable for the renderer. */
+  blurStage(pipe, sigma, tex, scratch) {
+    const dev = this.dev, [gx, gy, gz] = this.g, [dx, dy, dz] = this.dims;
+    const { radius, w } = gaussHalfKernel2(sigma);
+    const passes = [[tex, scratch, 0], [scratch, tex, 1], [tex, scratch, 2]];
+    const enc = dev.createCommandEncoder();
+    for (const [srcT, dstT, axis] of passes) {
+      const ab = new ArrayBuffer(96);
+      const u32 = new Uint32Array(ab), f32 = new Float32Array(ab);
+      u32[0] = dx;
+      u32[1] = dy;
+      u32[2] = dz;
+      u32[4] = axis;
+      u32[5] = radius;
+      f32.set(w, 8);
+      const ub = dev.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      dev.queue.writeBuffer(ub, 0, ab);
+      const b = dev.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
+        { binding: 0, resource: srcT.createView() },
+        { binding: 1, resource: dstT.createView() },
+        { binding: 2, resource: { buffer: ub } }
+      ] });
+      const bp = enc.beginComputePass();
+      bp.setPipeline(pipe);
+      bp.setBindGroup(0, b);
+      bp.dispatchWorkgroups(gx, gy, gz);
+      bp.end();
+    }
+    enc.copyTextureToTexture({ texture: scratch }, { texture: tex }, this.dims);
+    dev.queue.submit([enc.finish()]);
+  }
+  destroy() {
+    this.seed[0].destroy();
+    this.seed[1].destroy();
+    this.sdfTex.destroy();
+    this.attrTex.destroy();
+    this.attrScratch.destroy();
+    this.sdfScratch.destroy();
+    this.uni.destroy();
+    this.palBuf.destroy();
+    this.modeBuf.destroy();
+  }
+};
+
+// logic/segmentation-logic.ts
+var SegmentationLogic = class {
+  // quiescence before the settle-refine (sdf mode; capability-tuned)
+  constructor(device, seg, opts = {}) {
+    this.seg = seg;
+    this.renderMode = opts.renderMode ?? "sdf";
+    this.sigma = opts.sigmaVoxels ?? 1;
+    this.bandMm = opts.bandMm;
+    this.opacity = opts.opacity ?? 1;
+    this.refineDelayMs = opts.refineDelayMs ?? 180;
+    this.setLabelColor(1, opts.color ?? [0.3, 0.85, 0.55]);
+    if (this.renderMode === "sdf") {
+      this.sdf = new JfaSdfBaker(device, seg.masterTexture(), seg.dims, seg.ijkToRAS);
+    } else {
+      this.baker = new ColorizeBaker(device, seg.masterTexture(), seg.dims);
+      this.presenceTex = this.baker.output();
+    }
+    this.rebake();
+    this.scheduleRefine();
+    this.unsubDirty = seg.onDirty(() => {
+      this.rebake();
+      for (const cb of this.redrawCbs) cb();
+      this.scheduleRefine();
+    });
+  }
+  seg;
+  renderMode;
+  sdf;
+  // sdf path
+  baker;
+  // surface path
+  presenceTex;
+  sigma;
+  bandMm;
+  opacity;
+  palette = new Float32Array(256 * 4);
+  // label id → (r,g,b, opacity); shared by both paths
+  modePalette = new Float32Array(256 * 4);
+  // label id → (.x = shading mode: 0 surface / 1 volume) — sdf only
+  segField;
+  redrawCbs = [];
+  unsubDirty;
+  refineTimer;
+  refineDelayMs;
+  /** Assign a display colour to a label id (0..255). Keeps the current opacity (defaults to 1 =
+   *  opaque). Takes effect on the next rebake. */
+  setLabelColor(id, rgb) {
+    if (id < 1 || id > 255) return;
+    const o = id * 4;
+    this.palette[o] = rgb[0];
+    this.palette[o + 1] = rgb[1];
+    this.palette[o + 2] = rgb[2];
+    if (this.palette[o + 3] === 0) this.palette[o + 3] = 1;
+  }
+  /** Per-segment opacity (0 = hidden, 1 = opaque) — palette alpha. Enables translucent surface-model
+   *  rendering (see through outer segments to inner ones). Rebake/refine to apply. */
+  setLabelOpacity(id, opacity) {
+    if (id < 1 || id > 255) return;
+    this.palette[id * 4 + 3] = Math.max(0, Math.min(1, opacity));
+  }
+  /** Per-segment shading (sdf mode): "surface" = crisp SDF shell (surface model), "volume" = DVR fill
+   *  of the interior (translucent cloud). Rebake/refine to apply. */
+  setLabelShading(id, shading) {
+    if (id < 1 || id > 255) return;
+    this.modePalette[id * 4] = shading === "volume" ? 1 : 0;
+  }
+  /** Re-derive the render texture from the current master + palette (FAST, in place). */
+  rebake() {
+    if (this.sdf) {
+      this.sdf.setPalette(this.palette);
+      this.sdf.setModePalette(this.modePalette);
+      this.sdf.bake();
+    } else this.baker.bakeInto(this.presenceTex, this.palette, this.sigma);
+  }
+  /** Schedule the settle-refine after quiescence (debounced; sdf mode only). */
+  scheduleRefine() {
+    if (!this.sdf) return;
+    if (this.refineTimer !== void 0) clearTimeout(this.refineTimer);
+    this.refineTimer = setTimeout(() => {
+      this.refineTimer = void 0;
+      this.refineNow();
+    }, this.refineDelayMs);
+  }
+  /** Run the settle-refine now (JFA+2 + tighter distance blur + colour-seam blur), then redraw.
+   *  Public so a test — or an app that knows the edit is done — can force the high-quality bake. */
+  refineNow() {
+    if (this.refineTimer !== void 0) {
+      clearTimeout(this.refineTimer);
+      this.refineTimer = void 0;
+    }
+    if (this.sdf) {
+      this.sdf.setPalette(this.palette);
+      this.sdf.setModePalette(this.modePalette);
+      this.sdf.refine();
+      for (const cb of this.redrawCbs) cb();
+    }
+  }
+  /** A SegmentField bound to the shared render texture — hand this to the SceneRenderer once; edits
+   *  update it in place. Colour comes from the texture (per-label); the uniform supplies opacity. */
+  field() {
+    if (!this.segField) {
+      const tex = this.sdf ? this.sdf.sdfTexture() : this.presenceTex;
+      const voxelMm = Math.min(...this.seg.spacingMm());
+      const band = this.bandMm ?? (this.renderMode === "sdf" ? 0.65 * voxelMm : void 0);
+      const fdims = this.sdf ? this.sdf.sdfDims() : this.seg.dims;
+      const fijk = this.sdf ? this.sdf.sdfIjkToRAS() : this.seg.ijkToRAS;
+      this.segField = new SegmentField(tex, fdims, [1, 1, 1], {
+        color: [1, 1, 1],
+        opacity: this.opacity,
+        ijkToRAS: fijk,
+        mode: this.renderMode === "sdf" ? "sdf" : "surface",
+        colorFromTexture: true,
+        bandMm: band,
+        clippable: false,
+        attrTexture: this.sdf ? this.sdf.attrTexture() : void 0
+        // per-segment opacity (sdf)
+      });
+    }
+    return this.segField;
+  }
+  /** Notified after every edit (post-rebake) so the app can redraw. */
+  onRedraw(cb) {
+    this.redrawCbs.push(cb);
+  }
+  destroy() {
+    if (this.refineTimer !== void 0) clearTimeout(this.refineTimer);
+    this.unsubDirty();
+    this.sdf?.destroy();
+    this.baker?.destroy();
+    this.presenceTex?.destroy();
+  }
+};
 
 // render/demos/selftest-scenes.ts
 var SCENES = {
@@ -2846,26 +3563,34 @@ var SEGMENTS = [
 async function buildSegmentation(dev, onBytes) {
   const sv = await loadSceneVolumeField(dev, SCENES.MRHead, onBytes);
   const v = sv.voxels;
-  const counts = [];
-  const segments = [];
-  for (const seg of SEGMENTS) {
-    const mask = new Uint8Array(v.length);
-    let n = 0;
-    for (let i = 0; i < v.length; i++) {
-      if (seg.test(v[i])) {
-        mask[i] = 1;
-        n++;
-      }
+  const lab = new Uint8Array(v.length);
+  const counts = [0, 0];
+  for (let i = 0; i < v.length; i++) {
+    if (SEGMENTS[1].test(v[i])) {
+      lab[i] = 2;
+      counts[1]++;
+    } else if (SEGMENTS[0].test(v[i])) {
+      lab[i] = 1;
+      counts[0]++;
     }
-    counts.push(n);
-    const tex = bakeSegmentPresence(dev, mask, sv.dims, 1.5);
-    segments.push(new SegmentField(tex, sv.dims, [1, 1, 1], {
-      color: seg.color,
-      opacity: 1,
-      ijkToRAS: sv.ijkToRAS
-    }));
   }
-  return { sv, segments, counts };
+  const editable = new EditableSegmentation(dev, sv.dims, { ijkToRAS: sv.ijkToRAS });
+  const logic = new SegmentationLogic(dev, editable, { renderMode: "sdf", opacity: 1 });
+  logic.setLabelColor(1, SEGMENTS[0].color);
+  logic.setLabelColor(2, SEGMENTS[1].color);
+  editable.loadLabelmap(lab);
+  logic.refineNow();
+  return {
+    sv,
+    counts,
+    logic,
+    editable,
+    segments: [logic.field()],
+    destroy() {
+      logic.destroy();
+      editable.destroy();
+    }
+  };
 }
 
 // render/demos/selftest-browser.ts
