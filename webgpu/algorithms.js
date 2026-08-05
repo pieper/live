@@ -289,25 +289,57 @@ function attachCameraControls(canvas, camera, opts = {}) {
     const r = canvas.getBoundingClientRect();
     return { x: e.clientX - r.left, y: e.clientY - r.top };
   };
+  canvas.style.touchAction = "none";
+  const docEl = (canvas.ownerDocument ?? document).documentElement;
+  if (docEl) docEl.style.overscrollBehavior = "none";
+  canvas.addEventListener("touchmove", (e) => e.preventDefault(), { passive: false });
+  const pointers = /* @__PURE__ */ new Map();
+  let pinch = null;
+  const pinchState = () => {
+    const [a, b] = [...pointers.values()];
+    return { dist: Math.hypot(b.x - a.x, b.y - a.y), mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 };
+  };
   canvas.addEventListener("contextmenu", (e) => e.preventDefault());
   canvas.addEventListener("pointerdown", (e) => {
     const { x, y } = local(e);
-    interactor.start(e.button, x, y, canvas.clientHeight, {
-      shift: e.shiftKey,
-      ctrl: e.ctrlKey || e.metaKey,
-      alt: e.altKey
-    });
+    pointers.set(e.pointerId, { x, y });
     canvas.setPointerCapture(e.pointerId);
-    opts.onLog?.("cameraStart", { action: interactor.action, x, y, button: e.button, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey });
+    if (pointers.size === 1) {
+      interactor.start(e.button, x, y, canvas.clientHeight, { shift: e.shiftKey, ctrl: e.ctrlKey || e.metaKey, alt: e.altKey });
+      opts.onLog?.("cameraStart", { action: interactor.action, x, y, button: e.button, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey });
+    } else if (pointers.size === 2) {
+      interactor.end();
+      pinch = pinchState();
+    }
   });
-  canvas.addEventListener("pointerup", (e) => {
-    interactor.end();
-    canvas.releasePointerCapture(e.pointerId);
-  });
+  const endPointer = (e) => {
+    if (!pointers.delete(e.pointerId)) return;
+    canvas.releasePointerCapture?.(e.pointerId);
+    if (pointers.size < 2) pinch = null;
+    if (pointers.size === 1) {
+      const p = [...pointers.values()][0];
+      interactor.start(0, p.x, p.y, canvas.clientHeight, { shift: false, ctrl: false, alt: false });
+    } else if (pointers.size === 0) {
+      interactor.end();
+    }
+  };
+  canvas.addEventListener("pointerup", endPointer);
+  canvas.addEventListener("pointercancel", endPointer);
   canvas.addEventListener("pointermove", (e) => {
-    if (interactor.action === "none") return;
+    if (!pointers.has(e.pointerId)) return;
     const { x, y } = local(e);
-    interactor.move(x, y, canvas.clientWidth, canvas.clientHeight);
+    pointers.set(e.pointerId, { x, y });
+    if (pointers.size >= 2) {
+      const p = pinchState();
+      if (pinch) {
+        if (p.dist > 0 && pinch.dist > 0) camera.dolly(p.dist / pinch.dist);
+        camera.panByDisplayDelta(p.mx - pinch.mx, p.my - pinch.my, canvas.clientWidth, canvas.clientHeight);
+        opts.onChange?.();
+      }
+      pinch = p;
+    } else if (interactor.action !== "none") {
+      interactor.move(x, y, canvas.clientWidth, canvas.clientHeight);
+    }
   });
   canvas.addEventListener("wheel", (e) => {
     e.preventDefault();
@@ -2844,6 +2876,8 @@ async function main() {
   }
   status("initializing WebGPU\u2026");
   const gpu = await initDevice();
+  globalThis.__gpuErr = [];
+  gpu.device.addEventListener("uncapturederror", (e) => globalThis.__gpuErr.push(String(e.error?.message ?? e.error)));
   const ctx = canvas.getContext("webgpu");
   const preferred = navigator.gpu.getPreferredCanvasFormat();
   const srgb = preferred + "-srgb";
@@ -2920,6 +2954,10 @@ async function main() {
   });
   document.getElementById("reset")?.addEventListener("click", () => location.reload());
   resize();
-  status("surface-mode segmentation \xB7 drag to orbit \xB7 scroll to zoom \xB7 Poke to edit the shared buffer");
+  status("surface-mode segmentation \xB7 drag to orbit \xB7 scroll/pinch to zoom \xB7 Poke to edit the shared buffer");
+  globalThis.__algoDbg = {
+    dist: () => camera.distance,
+    err: () => (globalThis.__gpuErr || []).length
+  };
 }
 main();
