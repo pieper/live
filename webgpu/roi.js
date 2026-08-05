@@ -463,6 +463,7 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
     this.flush();
     this.dev.queue.writeBuffer(this.camBuf, 72, new Float32Array([this.focalPx * (viewH / renderH)]));
     this.dev.queue.writeBuffer(this.superresBuf, 0, new Float32Array([renderW, renderH, viewW, viewH]));
+    this.dev.queue.writeBuffer(this.resolveBgBuf, 0, this.mat.subarray(12, 16));
     const enc = this.dev.createCommandEncoder();
     const tp = enc.beginRenderPass({ colorAttachments: [{ view: this.lowView, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
     tp.setPipeline(this.pipeline);
@@ -1089,6 +1090,7 @@ var ImageField = class {
   // volume (3d) + lut (2d)
   volTex;
   lutTex;
+  dev;
   p2t;
   clim;
   shade;
@@ -1113,6 +1115,12 @@ var ImageField = class {
     this.clim = opts.clim;
     this.shade = opts.shade ?? [0.35, 0.75, 0.35, 20];
     this.unit = opts.opacityUnitDistance ?? this.stepMm;
+    this.dev = dev;
+  }
+  /** Replace the 256-entry rgba8 color/opacity LUT in place (no texture/bind-group churn).
+   *  The bind group holds a stable view of lutTex, so the next render uses the new LUT. */
+  setLUT(lut) {
+    this.dev.queue.writeTexture({ texture: this.lutTex }, lut, { bytesPerRow: 256 * 4 }, [256, 1]);
   }
   origP2t;
   // sampling matrix + box at identity, for setWorldTransform
@@ -1250,7 +1258,9 @@ async function inflateDeflate(buf) {
 async function fetchZarrVolume(blobBase, z, onBytes, concurrency = 12) {
   const Ctor = ZDT[z.dtype] ?? Int16Array;
   const [nz, ny, nx] = z.shape, [cz, cy, cx] = z.chunks, [ncz, ncy, ncx] = z.chunkGrid;
-  const base = blobBase + z.dir + "/" + z.dataset + "/";
+  const hashes = z.chunkHashes;
+  const posBase = blobBase + z.dir + "/" + z.dataset + "/";
+  const chunkUrl = (kk, jj, ii) => hashes ? blobBase + hashes[kk + "." + jj + "." + ii] : posBase + kk + "." + jj + "." + ii;
   const out = new Float32Array(nz * ny * nx);
   let lo = Infinity, hi = -Infinity;
   const jobs = [];
@@ -1259,7 +1269,7 @@ async function fetchZarrVolume(blobBase, z, onBytes, concurrency = 12) {
   const worker = async () => {
     while (idx < jobs.length) {
       const [kk, jj, ii] = jobs[idx++];
-      const gz = await (await fetch(base + kk + "." + jj + "." + ii)).arrayBuffer();
+      const gz = await (await fetch(chunkUrl(kk, jj, ii))).arrayBuffer();
       onBytes?.(gz.byteLength);
       const chunk = new Ctor(await inflateDeflate(gz));
       const z0 = kk * cz, y0 = jj * cy, x0 = ii * cx;
@@ -1280,6 +1290,79 @@ async function fetchZarrVolume(blobBase, z, onBytes, concurrency = 12) {
   };
   await Promise.all(Array.from({ length: Math.min(concurrency, jobs.length) }, worker));
   return { data: out, dims: [nx, ny, nz], range: [lo, hi] };
+}
+
+// render/mrson.ts
+var TYPE_TO_CLASS = {
+  image: "vtkMRMLScalarVolumeNode",
+  mesh: "vtkMRMLModelNode",
+  segmentation: "vtkMRMLSegmentationNode",
+  markup: "vtkMRMLMarkupsFiducialNode",
+  transform: "vtkMRMLLinearTransformNode",
+  camera: "vtkMRMLCameraNode",
+  view: "vtkMRMLViewNode",
+  transferFunction: "vtkMRMLVolumePropertyNode",
+  scalarVolumeDisplay: "vtkMRMLScalarVolumeDisplayNode",
+  volumeRenderingDisplay: "vtkMRMLGPURayCastVolumeRenderingDisplayNode",
+  modelDisplay: "vtkMRMLModelDisplayNode",
+  markupDisplay: "vtkMRMLMarkupsDisplayNode"
+};
+function isMrsonScene(raw) {
+  const r = raw;
+  if (!r || typeof r !== "object") return false;
+  if (r.mrson !== void 0) return true;
+  return !!r.nodes && Object.values(r.nodes).some((n) => typeof n?.type === "string");
+}
+var colorRows = (a) => Array.isArray(a) ? a.map((s) => [s.value, s.rgba[0], s.rgba[1], s.rgba[2]]) : [];
+var opacityRows = (a) => Array.isArray(a) ? a.map((s) => [s.value, s.opacity]) : [];
+function adaptMrsonScene(scene) {
+  const nodes = scene.nodes ?? {};
+  const out = {};
+  for (const [id, n] of Object.entries(nodes)) {
+    const cls = n.source?.mrmlClass ?? TYPE_TO_CLASS[n.type] ?? n.type;
+    const refs = { ...n.refs ?? {} };
+    const attrs = {};
+    switch (n.type) {
+      case "image":
+        attrs.zarr = n.zarr;
+        attrs.ijkToRAS = n.ijkToRAS;
+        attrs.dims = n.dims;
+        attrs.comps = n.comps;
+        break;
+      case "transferFunction":
+        attrs.color = colorRows(n.colorStops);
+        attrs.scalarOpacity = opacityRows(n.scalarOpacity);
+        attrs.gradientOpacity = opacityRows(n.gradientOpacity);
+        attrs.shade = n.shade;
+        break;
+      case "scalarVolumeDisplay":
+        attrs.window = n.window;
+        attrs.level = n.level;
+        attrs.color = n.color;
+        attrs.visibility = n.visible ? 1 : 0;
+        break;
+      case "volumeRenderingDisplay":
+        if (n.refs?.transferFunction) refs.volumeProperty = n.refs.transferFunction;
+        break;
+      case "markup": {
+        attrs.controlPoints = n.controlPoints;
+        const dc = (n.refs?.display ?? []).map((d) => nodes[d]?.color).find(Boolean);
+        if (dc) attrs.color = dc.slice(0, 3);
+        break;
+      }
+      case "camera":
+        attrs.position = n.position;
+        attrs.focalPoint = n.focalPoint;
+        attrs.viewUp = n.viewUp;
+        attrs.viewAngle = n.viewAngle;
+        attrs.parallelScale = n.parallelScale;
+        break;
+      default:
+        break;
+    }
+    out[id] = { id, class: cls, name: n.name, refs, attrs, blobs: [] };
+  }
+  return { blobBase: scene.blobBase, nodes: out };
 }
 
 // render/scene-volume.ts
@@ -1338,7 +1421,8 @@ function parseMarkups(nodes) {
 }
 async function loadSceneVolumeField(dev, sceneUrl, onBytes, opts = {}) {
   const raw = await (await fetch(sceneUrl)).json();
-  const wrapper = raw.nodes ? raw : { nodes: raw };
+  const adapted = isMrsonScene(raw) ? adaptMrsonScene(raw) : raw;
+  const wrapper = adapted.nodes ? adapted : { nodes: adapted };
   const nodes = wrapper.nodes;
   const pageBase = globalThis.location?.href ?? "file:///";
   const sceneAbs = new URL(sceneUrl, pageBase).href;
@@ -1923,6 +2007,34 @@ var VtkCamera = class _VtkCamera {
     const motion = add(scale(right, -dxDisplay * mmPerPixel), scale(up, -dyDisplay * mmPerPixel));
     this.translate(motion);
   }
+  /** Project a world (RAS) point to display pixels (y DOWN, origin top-left) for a w×h viewport.
+   *  Vertical-FOV perspective matching SceneRenderer.setCamera (perspectiveZO(fovy, w/h)). `depth`
+   *  is the distance along the view direction (>0 in front of the camera). Used to hit-test
+   *  screen-space markup glyphs. */
+  worldToDisplay(p, w, h) {
+    const { right, up } = this.basis();
+    const dop = this.directionOfProjection;
+    const rel = sub(p, this.position);
+    const depth = dot(rel, dop);
+    const halfH = Math.max(1e-6, depth) * Math.tan(this.viewAngle * Math.PI / 360);
+    const aspect = w / h;
+    const ndcx = dot(rel, right) / (halfH * aspect);
+    const ndcy = dot(rel, up) / halfH;
+    return { x: (ndcx * 0.5 + 0.5) * w, y: (0.5 - ndcy * 0.5) * h, depth };
+  }
+  /** Inverse of worldToDisplay at a FIXED view-depth: the world point under display pixel (x,y)
+   *  lying in the plane perpendicular to the view at `depth`. Dragging a 3D handle in this plane
+   *  keeps its distance from the camera, so it tracks the cursor without depth ambiguity. */
+  displayToWorldAtDepth(x, y, depth, w, h) {
+    const { right, up } = this.basis();
+    const dop = this.directionOfProjection;
+    const halfH = Math.max(1e-6, depth) * Math.tan(this.viewAngle * Math.PI / 360);
+    const aspect = w / h;
+    const ndcx = x / w * 2 - 1;
+    const ndcy = 1 - y / h * 2;
+    const offset = add(scale(right, ndcx * halfH * aspect), scale(up, ndcy * halfH));
+    return add(add(this.position, scale(dop, depth)), offset);
+  }
   /** vtkCamera-comparable snapshot for the harness. */
   state() {
     return {
@@ -2051,25 +2163,57 @@ function attachCameraControls(canvas, camera, opts = {}) {
     const r = canvas.getBoundingClientRect();
     return { x: e.clientX - r.left, y: e.clientY - r.top };
   };
+  canvas.style.touchAction = "none";
+  const docEl = (canvas.ownerDocument ?? document).documentElement;
+  if (docEl) docEl.style.overscrollBehavior = "none";
+  canvas.addEventListener("touchmove", (e) => e.preventDefault(), { passive: false });
+  const pointers = /* @__PURE__ */ new Map();
+  let pinch = null;
+  const pinchState = () => {
+    const [a, b] = [...pointers.values()];
+    return { dist: Math.hypot(b.x - a.x, b.y - a.y), mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 };
+  };
   canvas.addEventListener("contextmenu", (e) => e.preventDefault());
   canvas.addEventListener("pointerdown", (e) => {
     const { x, y } = local(e);
-    interactor.start(e.button, x, y, canvas.clientHeight, {
-      shift: e.shiftKey,
-      ctrl: e.ctrlKey || e.metaKey,
-      alt: e.altKey
-    });
+    pointers.set(e.pointerId, { x, y });
     canvas.setPointerCapture(e.pointerId);
-    opts.onLog?.("cameraStart", { action: interactor.action, x, y, button: e.button, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey });
+    if (pointers.size === 1) {
+      interactor.start(e.button, x, y, canvas.clientHeight, { shift: e.shiftKey, ctrl: e.ctrlKey || e.metaKey, alt: e.altKey });
+      opts.onLog?.("cameraStart", { action: interactor.action, x, y, button: e.button, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey });
+    } else if (pointers.size === 2) {
+      interactor.end();
+      pinch = pinchState();
+    }
   });
-  canvas.addEventListener("pointerup", (e) => {
-    interactor.end();
-    canvas.releasePointerCapture(e.pointerId);
-  });
+  const endPointer = (e) => {
+    if (!pointers.delete(e.pointerId)) return;
+    canvas.releasePointerCapture?.(e.pointerId);
+    if (pointers.size < 2) pinch = null;
+    if (pointers.size === 1) {
+      const p = [...pointers.values()][0];
+      interactor.start(0, p.x, p.y, canvas.clientHeight, { shift: false, ctrl: false, alt: false });
+    } else if (pointers.size === 0) {
+      interactor.end();
+    }
+  };
+  canvas.addEventListener("pointerup", endPointer);
+  canvas.addEventListener("pointercancel", endPointer);
   canvas.addEventListener("pointermove", (e) => {
-    if (interactor.action === "none") return;
+    if (!pointers.has(e.pointerId)) return;
     const { x, y } = local(e);
-    interactor.move(x, y, canvas.clientWidth, canvas.clientHeight);
+    pointers.set(e.pointerId, { x, y });
+    if (pointers.size >= 2) {
+      const p = pinchState();
+      if (pinch) {
+        if (p.dist > 0 && pinch.dist > 0) camera.dolly(p.dist / pinch.dist);
+        camera.panByDisplayDelta(p.mx - pinch.mx, pinch.my - p.my, canvas.clientWidth, canvas.clientHeight);
+        opts.onChange?.();
+      }
+      pinch = p;
+    } else if (interactor.action !== "none") {
+      interactor.move(x, y, canvas.clientWidth, canvas.clientHeight);
+    }
   });
   canvas.addEventListener("wheel", (e) => {
     e.preventDefault();
@@ -2209,15 +2353,15 @@ var BudgetController = class {
   maxPx;
   constructor(opts = {}) {
     this.targetMs = opts.targetMs ?? 16;
-    this.minPx = opts.minPx ?? 15e4;
+    this.minPx = opts.minPx ?? 3e4;
     this.maxPx = opts.maxPx ?? 8e6;
-    this.budgetPx = opts.startPx ?? 12e5;
+    this.budgetPx = opts.startPx ?? 35e4;
   }
   /** Nudge the budget toward hitting targetMs. Multiplicative, clamped per step (0.8–1.25×) so the
    *  loop is stable, and bounded to [minPx, maxPx]. Faster-than-target grows it; slower shrinks it. */
   update(measuredMs) {
     if (!(measuredMs > 0) || !Number.isFinite(measuredMs)) return;
-    const adj = Math.max(0.6, Math.min(1.2, this.targetMs / measuredMs));
+    const adj = Math.max(0.35, Math.min(1.2, this.targetMs / measuredMs));
     this.budgetPx = Math.max(this.minPx, Math.min(this.maxPx, this.budgetPx * adj));
   }
   /** Resolution scale for a `w×h` view: sqrt(budget / area), clamped to [0.25, 1]. 1 when the view
@@ -2232,7 +2376,10 @@ var BudgetController = class {
 function mountAdaptiveLoop(opts) {
   const target = opts.target ?? 32;
   const idleGap = opts.idleGapMs ?? 120;
-  const raf = () => new Promise((r) => requestAnimationFrame(() => r()));
+  const paced = () => Promise.race([
+    new Promise((r) => requestAnimationFrame(() => r())),
+    new Promise((r) => setTimeout(r, 33))
+  ]);
   const sync = opts.sync ?? (() => Promise.resolve());
   let running = false, stopped = false, lastKick = -1e12, wasMoving = false;
   const step = () => {
@@ -2255,7 +2402,7 @@ function mountAdaptiveLoop(opts) {
   const run = async () => {
     running = true;
     stopped = false;
-    while (!stopped && step()) await Promise.all([sync(), raf()]);
+    while (!stopped && step()) await Promise.all([sync(), paced()]);
     running = false;
   };
   return {
@@ -2271,12 +2418,27 @@ function mountAdaptiveLoop(opts) {
 }
 function mountAdaptive3d(opts) {
   const budget = new BudgetController({ targetMs: opts.targetMs ?? 16 });
+  const DBG = typeof location !== "undefined" && new URLSearchParams(location.search).has("perf");
+  let dbgN = 0, dbgMoving = 0, dbgSettled = 0, dbgLast = 0;
+  const dbgTick = (kind, ms, s) => {
+    if (!DBG) return;
+    dbgN++;
+    if (kind === "mov") dbgMoving += ms;
+    else dbgSettled += ms;
+    const now = performance.now();
+    if (now - dbgLast > 500) {
+      console.log(`[perf] mov=${dbgMoving.toFixed(0)}ms/${dbgN}f settled=${dbgSettled.toFixed(0)}ms lastScale=${s.toFixed(2)} last=${ms.toFixed(1)}ms`);
+      dbgLast = now;
+      dbgMoving = dbgSettled = dbgN = 0;
+    }
+  };
+  const movingCap = opts.movingScaleCap ?? 1;
   const renderMoving = () => {
     const sc = opts.scene();
     if (!sc) return;
     const { w: vw, h: vh } = opts.size();
     if (!vw || !vh) return;
-    const s = budget.scale(vw, vh), t0 = performance.now();
+    const s = Math.min(movingCap, budget.scale(vw, vh)), t0 = performance.now();
     if (s > 0.98) {
       opts.setCamera(sc, vw, vh);
       sc.renderToView(opts.view(), vw, vh);
@@ -2285,7 +2447,11 @@ function mountAdaptive3d(opts) {
       opts.setCamera(sc, rw, rh);
       sc.renderUpscaled(opts.view(), rw, rh, vw, vh);
     }
-    opts.gpu.device.queue.onSubmittedWorkDone().then(() => budget.update(performance.now() - t0));
+    opts.gpu.device.queue.onSubmittedWorkDone().then(() => {
+      const ms = performance.now() - t0;
+      budget.update(ms);
+      dbgTick("mov", ms, s);
+    });
     opts.onFrame?.();
   };
   const renderSettled = (reset) => {
@@ -2293,8 +2459,10 @@ function mountAdaptive3d(opts) {
     if (!sc) return;
     const { w: vw, h: vh } = opts.size();
     if (!vw || !vh) return;
+    const t0 = performance.now();
     opts.setCamera(sc, vw, vh);
     sc.renderAccum(opts.view(), vw, vh, reset);
+    if (DBG) opts.gpu.device.queue.onSubmittedWorkDone().then(() => dbgTick("set", performance.now() - t0, 1));
     opts.onFrame?.();
   };
   const loop = mountAdaptiveLoop({
@@ -2302,10 +2470,24 @@ function mountAdaptive3d(opts) {
     renderSettled,
     count: () => opts.scene()?.accumCount() ?? 1e9,
     target: opts.target ?? 24,
+    idleGapMs: opts.idleGapMs,
     sync: () => opts.gpu.device.queue.onSubmittedWorkDone()
     // GPU-paced: no backlog, input preempts
   });
-  return { draw: () => loop.kick(), budget, renderSettled, renderMoving, loop };
+  let kickN = 0, kickLast = 0;
+  const draw = () => {
+    if (DBG) {
+      kickN++;
+      const now = performance.now();
+      if (now - kickLast > 500) {
+        console.log(`[perf] kicks=${kickN} in 500ms`);
+        kickN = 0;
+        kickLast = now;
+      }
+    }
+    loop.kick();
+  };
+  return { draw, budget, renderSettled, renderMoving, loop };
 }
 
 // render/introspect.ts

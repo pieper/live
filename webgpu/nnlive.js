@@ -470,6 +470,7 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
     this.flush();
     this.dev.queue.writeBuffer(this.camBuf, 72, new Float32Array([this.focalPx * (viewH / renderH)]));
     this.dev.queue.writeBuffer(this.superresBuf, 0, new Float32Array([renderW, renderH, viewW, viewH]));
+    this.dev.queue.writeBuffer(this.resolveBgBuf, 0, this.mat.subarray(12, 16));
     const enc = this.dev.createCommandEncoder();
     const tp = enc.beginRenderPass({ colorAttachments: [{ view: this.lowView, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
     tp.setPipeline(this.pipeline);
@@ -1088,13 +1089,14 @@ struct U {
   origin : vec4<f32>,    // RAS of the plane center (for the current scrub offset)
   uvec : vec4<f32>,      // RAS vector spanning the view width  (isotropic mm)
   vvec : vec4<f32>,      // RAS vector spanning the view height (isotropic mm)
-  params : vec4<f32>,    // win, lev, overlayOpacity, outlineMode(0/1)
+  params : vec4<f32>,    // win, lev, fillOpacity, outlineOpacity
   size : vec4<f32>,      // sizeX, sizeY, _, _
 };
 @group(0) @binding(0) var<uniform> u : U;
 @group(0) @binding(1) var s_lin : sampler;
 @group(0) @binding(2) var t_scalar : texture_3d<f32>;
 @group(0) @binding(3) var t_overlay : texture_3d<f32>;
+@group(0) @binding(4) var s_nn : sampler;   // NEAREST \u2014 labelmap overlay is per-voxel crisp (matches Slicer)
 
 struct V { @builtin(position) position : vec4<f32> };
 @vertex
@@ -1110,7 +1112,7 @@ fn srgb2physical(c : vec3<f32>) -> vec3<f32> {
 fn ov_at(ras : vec3<f32>) -> vec4<f32> {   // overlay at a RAS point (0 outside the volume)
   let t = (u.p2t * vec4<f32>(ras, 1.0)).xyz;
   if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { return vec4<f32>(0.0); }
-  return textureSampleLevel(t_overlay, s_lin, t, 0.0);
+  return textureSampleLevel(t_overlay, s_nn, t, 0.0);
 }
 @fragment
 fn fs_main(v : V) -> @location(0) vec4<f32> {
@@ -1123,17 +1125,23 @@ fn fs_main(v : V) -> @location(0) vec4<f32> {
   let win = max(u.params.x, 1e-6);
   let g = clamp((val - (u.params.y - win * 0.5)) / win, 0.0, 1.0);
   var col = vec3<f32>(g);
-  let ov = textureSampleLevel(t_overlay, s_lin, tex, 0.0);
-  var ovA = clamp(ov.a * u.params.z, 0.0, 1.0);
-  if (u.params.w > 0.5) {   // OUTLINE mode: keep the overlay only at segment boundaries (screen-space)
+  let ov = textureSampleLevel(t_overlay, s_nn, tex, 0.0);
+  // Slicer-style 2D segmentation: a semi-transparent per-voxel FILL plus a brighter boundary
+  // OUTLINE, with independent opacities (params.z = fill, params.w = outline). The outline is
+  // screen-space (constant pixel width under zoom), drawn in the segment's own colour along its
+  // inner edge \u2014 at both label\u2194label and label\u2194background boundaries.
+  let fillA = clamp(ov.a * u.params.z, 0.0, 1.0);
+  var outA = 0.0;
+  if (u.params.w > 0.0) {
     let du = u.uvec.xyz / u.size.x * 1.5;   // ~1.5 px right, in RAS
     let dv = u.vvec.xyz / u.size.y * 1.5;   // ~1.5 px up
     let n0 = ov_at(ras + du); let n1 = ov_at(ras - du); let n2 = ov_at(ras + dv); let n3 = ov_at(ras - dv);
     let e = max(max(distance(n0.rgb, ov.rgb) + abs(n0.a - ov.a), distance(n1.rgb, ov.rgb) + abs(n1.a - ov.a)),
                 max(distance(n2.rgb, ov.rgb) + abs(n2.a - ov.a), distance(n3.rgb, ov.rgb) + abs(n3.a - ov.a)));
-    ovA = ovA * clamp((e - 0.03) * 12.0, 0.0, 1.0);   // 0 in the interior, full at a colour/label edge
+    let edge = clamp((e - 0.03) * 12.0, 0.0, 1.0);   // 0 in the interior, 1 at a colour/label edge
+    outA = clamp(ov.a * u.params.w * edge, 0.0, 1.0);
   }
-  col = mix(col, ov.rgb, ovA);
+  col = mix(col, ov.rgb, max(fillA, outA));
   return vec4<f32>(srgb2physical(col), 1.0);
 }
 `
@@ -1148,6 +1156,7 @@ var SliceRenderer = class {
   format;
   pipeline;
   sampler;
+  nnSampler;
   ubuf;
   u = new Float32Array(36);
   // p2t(16) + origin(4) + uvec(4) + vvec(4) + params(4) + size(4)
@@ -1183,6 +1192,7 @@ var SliceRenderer = class {
       primitive: { topology: "triangle-list", cullMode: "none" }
     });
     this.sampler = this.dev.createSampler({ magFilter: "linear", minFilter: "linear", addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge", addressModeW: "clamp-to-edge" });
+    this.nnSampler = this.dev.createSampler({ magFilter: "nearest", minFilter: "nearest", addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge", addressModeW: "clamp-to-edge" });
     this.ubuf = this.dev.createBuffer({ size: this.u.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.setWindowLevel(255, 127);
     this.setOverlayOpacity(0.55);
@@ -1214,7 +1224,8 @@ var SliceRenderer = class {
         { binding: 0, resource: { buffer: this.ubuf } },
         { binding: 1, resource: this.sampler },
         { binding: 2, resource: scalar.createView() },
-        { binding: 3, resource: this.overlay.createView() }
+        { binding: 3, resource: this.overlay.createView() },
+        { binding: 4, resource: this.nnSampler }
       ]
     });
   }
@@ -1228,10 +1239,15 @@ var SliceRenderer = class {
     this.u[28] = win;
     this.u[29] = lev;
   }
+  /** Overlay FILL opacity (per-voxel coloured regions). 0 hides the fill. */
   setOverlayOpacity(o) {
     this.u[30] = o;
   }
-  /** Overlay draw mode: false = FILL (solid coloured regions), true = OUTLINE (segment boundaries only). */
+  /** Overlay OUTLINE opacity (boundary line, composited over the fill). 0 hides the outline. */
+  setOutlineOpacity(o) {
+    this.u[31] = o;
+  }
+  /** Convenience toggle: outline on (opacity 1) / off (0). Composites over the fill. */
   setOverlayOutline(on) {
     this.u[31] = on ? 1 : 0;
   }
@@ -1303,6 +1319,22 @@ var SliceRenderer = class {
   /** Reset pan/zoom for an orientation to the fitted view. */
   resetView(orient) {
     this.viewState[orient] = { panU: 0, panV: 0, zoom: 1 };
+  }
+  /** Mirror Slicer's in-plane navigation for an orientation: drive pan + zoom from the slice
+   *  node's RAS centre and field of view (mm). zoom = extent/FOV on the limiting axis (== 1 when
+   *  Slicer is fitted, per FitSliceToBackground's no-margin fit), so SlicerLive tracks Slicer's
+   *  zoom proportionally; pan is the centre's offset from the volume centre projected onto the
+   *  plane's in-plane axes. The out-of-plane offset is applied separately via setPlane. */
+  setMirrorFrame(orient, centerRAS, fovX, fovY) {
+    const b = BASES[orient];
+    const uExt = this.rasHi[b.uAxis] - this.rasLo[b.uAxis];
+    const vExt = this.rasHi[b.vAxis] - this.rasLo[b.vAxis];
+    const zoom = Math.max(uExt / Math.max(fovX, 1e-6), vExt / Math.max(fovY, 1e-6));
+    const volC = [(this.rasLo[0] + this.rasHi[0]) / 2, (this.rasLo[1] + this.rasHi[1]) / 2, (this.rasLo[2] + this.rasHi[2]) / 2];
+    const d = [centerRAS[0] - volC[0], centerRAS[1] - volC[1], centerRAS[2] - volC[2]];
+    const panU = d[0] * b.uDir[0] + d[1] * b.uDir[1] + d[2] * b.uDir[2];
+    const panV = d[0] * b.vDir[0] + d[1] * b.vDir[1] + d[2] * b.vDir[2];
+    this.viewState[orient] = { panU, panV, zoom: Math.max(1e-3, zoom) };
   }
   /** Map a view (u,v) in [0,1] (y down) to normalized texture coords for the current
    *  plane — for click picking. Returns the tex coord; the caller converts to IJK via
@@ -1411,6 +1443,7 @@ var ImageField = class {
   // volume (3d) + lut (2d)
   volTex;
   lutTex;
+  dev;
   p2t;
   clim;
   shade;
@@ -1435,6 +1468,12 @@ var ImageField = class {
     this.clim = opts.clim;
     this.shade = opts.shade ?? [0.35, 0.75, 0.35, 20];
     this.unit = opts.opacityUnitDistance ?? this.stepMm;
+    this.dev = dev;
+  }
+  /** Replace the 256-entry rgba8 color/opacity LUT in place (no texture/bind-group churn).
+   *  The bind group holds a stable view of lutTex, so the next render uses the new LUT. */
+  setLUT(lut) {
+    this.dev.queue.writeTexture({ texture: this.lutTex }, lut, { bytesPerRow: 256 * 4 }, [256, 1]);
   }
   origP2t;
   // sampling matrix + box at identity, for setWorldTransform
@@ -1962,6 +2001,12 @@ function bakeColorizeRGBA(dev, labelmap, dims, palette, sigmaVoxels = 1.5) {
     p.dispatchWorkgroups(gx, gy, gz);
     p.end();
   }
+  if (sigmaVoxels <= 0) {
+    dev.queue.submit([enc.finish()]);
+    labelTex.destroy();
+    texB.destroy();
+    return texA;
+  }
   const { radius, w } = gaussHalfKernel(sigmaVoxels);
   const blurPipe = dev.createComputePipeline({ layout: "auto", compute: { module: dev.createShaderModule({ code: BLUR_WGSL }), entryPoint: "main" } });
   const passes = [[texA, texB, 0], [texB, texA, 1], [texA, texB, 2]];
@@ -2006,7 +2051,9 @@ async function inflateDeflate(buf) {
 async function fetchZarrVolume(blobBase, z, onBytes, concurrency = 12) {
   const Ctor = ZDT[z.dtype] ?? Int16Array;
   const [nz, ny, nx] = z.shape, [cz, cy, cx] = z.chunks, [ncz, ncy, ncx] = z.chunkGrid;
-  const base = blobBase + z.dir + "/" + z.dataset + "/";
+  const hashes = z.chunkHashes;
+  const posBase = blobBase + z.dir + "/" + z.dataset + "/";
+  const chunkUrl = (kk, jj, ii) => hashes ? blobBase + hashes[kk + "." + jj + "." + ii] : posBase + kk + "." + jj + "." + ii;
   const out = new Float32Array(nz * ny * nx);
   let lo = Infinity, hi = -Infinity;
   const jobs = [];
@@ -2015,7 +2062,7 @@ async function fetchZarrVolume(blobBase, z, onBytes, concurrency = 12) {
   const worker = async () => {
     while (idx < jobs.length) {
       const [kk, jj, ii] = jobs[idx++];
-      const gz = await (await fetch(base + kk + "." + jj + "." + ii)).arrayBuffer();
+      const gz = await (await fetch(chunkUrl(kk, jj, ii))).arrayBuffer();
       onBytes?.(gz.byteLength);
       const chunk = new Ctor(await inflateDeflate(gz));
       const z0 = kk * cz, y0 = jj * cy, x0 = ii * cx;
@@ -2036,6 +2083,79 @@ async function fetchZarrVolume(blobBase, z, onBytes, concurrency = 12) {
   };
   await Promise.all(Array.from({ length: Math.min(concurrency, jobs.length) }, worker));
   return { data: out, dims: [nx, ny, nz], range: [lo, hi] };
+}
+
+// render/mrson.ts
+var TYPE_TO_CLASS = {
+  image: "vtkMRMLScalarVolumeNode",
+  mesh: "vtkMRMLModelNode",
+  segmentation: "vtkMRMLSegmentationNode",
+  markup: "vtkMRMLMarkupsFiducialNode",
+  transform: "vtkMRMLLinearTransformNode",
+  camera: "vtkMRMLCameraNode",
+  view: "vtkMRMLViewNode",
+  transferFunction: "vtkMRMLVolumePropertyNode",
+  scalarVolumeDisplay: "vtkMRMLScalarVolumeDisplayNode",
+  volumeRenderingDisplay: "vtkMRMLGPURayCastVolumeRenderingDisplayNode",
+  modelDisplay: "vtkMRMLModelDisplayNode",
+  markupDisplay: "vtkMRMLMarkupsDisplayNode"
+};
+function isMrsonScene(raw) {
+  const r = raw;
+  if (!r || typeof r !== "object") return false;
+  if (r.mrson !== void 0) return true;
+  return !!r.nodes && Object.values(r.nodes).some((n) => typeof n?.type === "string");
+}
+var colorRows = (a) => Array.isArray(a) ? a.map((s) => [s.value, s.rgba[0], s.rgba[1], s.rgba[2]]) : [];
+var opacityRows = (a) => Array.isArray(a) ? a.map((s) => [s.value, s.opacity]) : [];
+function adaptMrsonScene(scene) {
+  const nodes = scene.nodes ?? {};
+  const out = {};
+  for (const [id, n] of Object.entries(nodes)) {
+    const cls = n.source?.mrmlClass ?? TYPE_TO_CLASS[n.type] ?? n.type;
+    const refs = { ...n.refs ?? {} };
+    const attrs = {};
+    switch (n.type) {
+      case "image":
+        attrs.zarr = n.zarr;
+        attrs.ijkToRAS = n.ijkToRAS;
+        attrs.dims = n.dims;
+        attrs.comps = n.comps;
+        break;
+      case "transferFunction":
+        attrs.color = colorRows(n.colorStops);
+        attrs.scalarOpacity = opacityRows(n.scalarOpacity);
+        attrs.gradientOpacity = opacityRows(n.gradientOpacity);
+        attrs.shade = n.shade;
+        break;
+      case "scalarVolumeDisplay":
+        attrs.window = n.window;
+        attrs.level = n.level;
+        attrs.color = n.color;
+        attrs.visibility = n.visible ? 1 : 0;
+        break;
+      case "volumeRenderingDisplay":
+        if (n.refs?.transferFunction) refs.volumeProperty = n.refs.transferFunction;
+        break;
+      case "markup": {
+        attrs.controlPoints = n.controlPoints;
+        const dc = (n.refs?.display ?? []).map((d) => nodes[d]?.color).find(Boolean);
+        if (dc) attrs.color = dc.slice(0, 3);
+        break;
+      }
+      case "camera":
+        attrs.position = n.position;
+        attrs.focalPoint = n.focalPoint;
+        attrs.viewUp = n.viewUp;
+        attrs.viewAngle = n.viewAngle;
+        attrs.parallelScale = n.parallelScale;
+        break;
+      default:
+        break;
+    }
+    out[id] = { id, class: cls, name: n.name, refs, attrs, blobs: [] };
+  }
+  return { blobBase: scene.blobBase, nodes: out };
 }
 
 // render/scene-volume.ts
@@ -2094,7 +2214,8 @@ function parseMarkups(nodes) {
 }
 async function loadSceneVolumeField(dev, sceneUrl, onBytes, opts = {}) {
   const raw = await (await fetch(sceneUrl)).json();
-  const wrapper = raw.nodes ? raw : { nodes: raw };
+  const adapted = isMrsonScene(raw) ? adaptMrsonScene(raw) : raw;
+  const wrapper = adapted.nodes ? adapted : { nodes: adapted };
   const nodes = wrapper.nodes;
   const pageBase = globalThis.location?.href ?? "file:///";
   const sceneAbs = new URL(sceneUrl, pageBase).href;
@@ -2259,6 +2380,34 @@ var VtkCamera = class _VtkCamera {
     const motion = add(scale(right, -dxDisplay * mmPerPixel), scale(up, -dyDisplay * mmPerPixel));
     this.translate(motion);
   }
+  /** Project a world (RAS) point to display pixels (y DOWN, origin top-left) for a w×h viewport.
+   *  Vertical-FOV perspective matching SceneRenderer.setCamera (perspectiveZO(fovy, w/h)). `depth`
+   *  is the distance along the view direction (>0 in front of the camera). Used to hit-test
+   *  screen-space markup glyphs. */
+  worldToDisplay(p, w, h) {
+    const { right, up } = this.basis();
+    const dop = this.directionOfProjection;
+    const rel = sub(p, this.position);
+    const depth = dot(rel, dop);
+    const halfH = Math.max(1e-6, depth) * Math.tan(this.viewAngle * Math.PI / 360);
+    const aspect = w / h;
+    const ndcx = dot(rel, right) / (halfH * aspect);
+    const ndcy = dot(rel, up) / halfH;
+    return { x: (ndcx * 0.5 + 0.5) * w, y: (0.5 - ndcy * 0.5) * h, depth };
+  }
+  /** Inverse of worldToDisplay at a FIXED view-depth: the world point under display pixel (x,y)
+   *  lying in the plane perpendicular to the view at `depth`. Dragging a 3D handle in this plane
+   *  keeps its distance from the camera, so it tracks the cursor without depth ambiguity. */
+  displayToWorldAtDepth(x, y, depth, w, h) {
+    const { right, up } = this.basis();
+    const dop = this.directionOfProjection;
+    const halfH = Math.max(1e-6, depth) * Math.tan(this.viewAngle * Math.PI / 360);
+    const aspect = w / h;
+    const ndcx = x / w * 2 - 1;
+    const ndcy = 1 - y / h * 2;
+    const offset = add(scale(right, ndcx * halfH * aspect), scale(up, ndcy * halfH));
+    return add(add(this.position, scale(dop, depth)), offset);
+  }
   /** vtkCamera-comparable snapshot for the harness. */
   state() {
     return {
@@ -2387,25 +2536,57 @@ function attachCameraControls(canvas, camera, opts = {}) {
     const r = canvas.getBoundingClientRect();
     return { x: e.clientX - r.left, y: e.clientY - r.top };
   };
+  canvas.style.touchAction = "none";
+  const docEl = (canvas.ownerDocument ?? document).documentElement;
+  if (docEl) docEl.style.overscrollBehavior = "none";
+  canvas.addEventListener("touchmove", (e) => e.preventDefault(), { passive: false });
+  const pointers = /* @__PURE__ */ new Map();
+  let pinch = null;
+  const pinchState = () => {
+    const [a, b] = [...pointers.values()];
+    return { dist: Math.hypot(b.x - a.x, b.y - a.y), mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 };
+  };
   canvas.addEventListener("contextmenu", (e) => e.preventDefault());
   canvas.addEventListener("pointerdown", (e) => {
     const { x, y } = local(e);
-    interactor.start(e.button, x, y, canvas.clientHeight, {
-      shift: e.shiftKey,
-      ctrl: e.ctrlKey || e.metaKey,
-      alt: e.altKey
-    });
+    pointers.set(e.pointerId, { x, y });
     canvas.setPointerCapture(e.pointerId);
-    opts.onLog?.("cameraStart", { action: interactor.action, x, y, button: e.button, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey });
+    if (pointers.size === 1) {
+      interactor.start(e.button, x, y, canvas.clientHeight, { shift: e.shiftKey, ctrl: e.ctrlKey || e.metaKey, alt: e.altKey });
+      opts.onLog?.("cameraStart", { action: interactor.action, x, y, button: e.button, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey });
+    } else if (pointers.size === 2) {
+      interactor.end();
+      pinch = pinchState();
+    }
   });
-  canvas.addEventListener("pointerup", (e) => {
-    interactor.end();
-    canvas.releasePointerCapture(e.pointerId);
-  });
+  const endPointer = (e) => {
+    if (!pointers.delete(e.pointerId)) return;
+    canvas.releasePointerCapture?.(e.pointerId);
+    if (pointers.size < 2) pinch = null;
+    if (pointers.size === 1) {
+      const p = [...pointers.values()][0];
+      interactor.start(0, p.x, p.y, canvas.clientHeight, { shift: false, ctrl: false, alt: false });
+    } else if (pointers.size === 0) {
+      interactor.end();
+    }
+  };
+  canvas.addEventListener("pointerup", endPointer);
+  canvas.addEventListener("pointercancel", endPointer);
   canvas.addEventListener("pointermove", (e) => {
-    if (interactor.action === "none") return;
+    if (!pointers.has(e.pointerId)) return;
     const { x, y } = local(e);
-    interactor.move(x, y, canvas.clientWidth, canvas.clientHeight);
+    pointers.set(e.pointerId, { x, y });
+    if (pointers.size >= 2) {
+      const p = pinchState();
+      if (pinch) {
+        if (p.dist > 0 && pinch.dist > 0) camera.dolly(p.dist / pinch.dist);
+        camera.panByDisplayDelta(p.mx - pinch.mx, pinch.my - p.my, canvas.clientWidth, canvas.clientHeight);
+        opts.onChange?.();
+      }
+      pinch = p;
+    } else if (interactor.action !== "none") {
+      interactor.move(x, y, canvas.clientWidth, canvas.clientHeight);
+    }
   });
   canvas.addEventListener("wheel", (e) => {
     e.preventDefault();
@@ -2431,15 +2612,15 @@ var BudgetController = class {
   maxPx;
   constructor(opts = {}) {
     this.targetMs = opts.targetMs ?? 16;
-    this.minPx = opts.minPx ?? 15e4;
+    this.minPx = opts.minPx ?? 3e4;
     this.maxPx = opts.maxPx ?? 8e6;
-    this.budgetPx = opts.startPx ?? 12e5;
+    this.budgetPx = opts.startPx ?? 35e4;
   }
   /** Nudge the budget toward hitting targetMs. Multiplicative, clamped per step (0.8–1.25×) so the
    *  loop is stable, and bounded to [minPx, maxPx]. Faster-than-target grows it; slower shrinks it. */
   update(measuredMs) {
     if (!(measuredMs > 0) || !Number.isFinite(measuredMs)) return;
-    const adj = Math.max(0.6, Math.min(1.2, this.targetMs / measuredMs));
+    const adj = Math.max(0.35, Math.min(1.2, this.targetMs / measuredMs));
     this.budgetPx = Math.max(this.minPx, Math.min(this.maxPx, this.budgetPx * adj));
   }
   /** Resolution scale for a `w×h` view: sqrt(budget / area), clamped to [0.25, 1]. 1 when the view
@@ -2454,7 +2635,10 @@ var BudgetController = class {
 function mountAdaptiveLoop(opts) {
   const target = opts.target ?? 32;
   const idleGap = opts.idleGapMs ?? 120;
-  const raf = () => new Promise((r) => requestAnimationFrame(() => r()));
+  const paced = () => Promise.race([
+    new Promise((r) => requestAnimationFrame(() => r())),
+    new Promise((r) => setTimeout(r, 33))
+  ]);
   const sync = opts.sync ?? (() => Promise.resolve());
   let running = false, stopped = false, lastKick = -1e12, wasMoving = false;
   const step = () => {
@@ -2477,7 +2661,7 @@ function mountAdaptiveLoop(opts) {
   const run = async () => {
     running = true;
     stopped = false;
-    while (!stopped && step()) await Promise.all([sync(), raf()]);
+    while (!stopped && step()) await Promise.all([sync(), paced()]);
     running = false;
   };
   return {
@@ -2493,12 +2677,27 @@ function mountAdaptiveLoop(opts) {
 }
 function mountAdaptive3d(opts) {
   const budget = new BudgetController({ targetMs: opts.targetMs ?? 16 });
+  const DBG = typeof location !== "undefined" && new URLSearchParams(location.search).has("perf");
+  let dbgN = 0, dbgMoving = 0, dbgSettled = 0, dbgLast = 0;
+  const dbgTick = (kind, ms, s) => {
+    if (!DBG) return;
+    dbgN++;
+    if (kind === "mov") dbgMoving += ms;
+    else dbgSettled += ms;
+    const now = performance.now();
+    if (now - dbgLast > 500) {
+      console.log(`[perf] mov=${dbgMoving.toFixed(0)}ms/${dbgN}f settled=${dbgSettled.toFixed(0)}ms lastScale=${s.toFixed(2)} last=${ms.toFixed(1)}ms`);
+      dbgLast = now;
+      dbgMoving = dbgSettled = dbgN = 0;
+    }
+  };
+  const movingCap = opts.movingScaleCap ?? 1;
   const renderMoving = () => {
     const sc = opts.scene();
     if (!sc) return;
     const { w: vw, h: vh } = opts.size();
     if (!vw || !vh) return;
-    const s = budget.scale(vw, vh), t0 = performance.now();
+    const s = Math.min(movingCap, budget.scale(vw, vh)), t0 = performance.now();
     if (s > 0.98) {
       opts.setCamera(sc, vw, vh);
       sc.renderToView(opts.view(), vw, vh);
@@ -2507,7 +2706,11 @@ function mountAdaptive3d(opts) {
       opts.setCamera(sc, rw, rh);
       sc.renderUpscaled(opts.view(), rw, rh, vw, vh);
     }
-    opts.gpu.device.queue.onSubmittedWorkDone().then(() => budget.update(performance.now() - t0));
+    opts.gpu.device.queue.onSubmittedWorkDone().then(() => {
+      const ms = performance.now() - t0;
+      budget.update(ms);
+      dbgTick("mov", ms, s);
+    });
     opts.onFrame?.();
   };
   const renderSettled = (reset) => {
@@ -2515,8 +2718,10 @@ function mountAdaptive3d(opts) {
     if (!sc) return;
     const { w: vw, h: vh } = opts.size();
     if (!vw || !vh) return;
+    const t0 = performance.now();
     opts.setCamera(sc, vw, vh);
     sc.renderAccum(opts.view(), vw, vh, reset);
+    if (DBG) opts.gpu.device.queue.onSubmittedWorkDone().then(() => dbgTick("set", performance.now() - t0, 1));
     opts.onFrame?.();
   };
   const loop = mountAdaptiveLoop({
@@ -2524,10 +2729,24 @@ function mountAdaptive3d(opts) {
     renderSettled,
     count: () => opts.scene()?.accumCount() ?? 1e9,
     target: opts.target ?? 24,
+    idleGapMs: opts.idleGapMs,
     sync: () => opts.gpu.device.queue.onSubmittedWorkDone()
     // GPU-paced: no backlog, input preempts
   });
-  return { draw: () => loop.kick(), budget, renderSettled, renderMoving, loop };
+  let kickN = 0, kickLast = 0;
+  const draw = () => {
+    if (DBG) {
+      kickN++;
+      const now = performance.now();
+      if (now - kickLast > 500) {
+        console.log(`[perf] kicks=${kickN} in 500ms`);
+        kickN = 0;
+        kickLast = now;
+      }
+    }
+    loop.kick();
+  };
+  return { draw, budget, renderSettled, renderMoving, loop };
 }
 
 // render/faithful-segmenter.ts

@@ -224,6 +224,47 @@ var SceneRenderer = class _SceneRenderer {
   traceView;
   traceW = 0;
   traceH = 0;
+  // TEMPORAL ACCUMULATION (M2a, docs/UNIFIED-RENDERING-PLAN.md §3). When the view is still, each
+  // frame jitters the CAMERA sub-pixel (Halton, via a clip-space translation of invVP — the shader
+  // is untouched, so a non-jittered frame is byte-identical) and the Reconstructor folds it into a
+  // running mean, converging to a supersampled, time-averaged-AA image. Ping-pong accum + running n.
+  baseInvVP = new Float32Array(16);
+  // last setCamera invVP (unjittered)
+  focalPx = 1;
+  // last setCamera focal (view→pixels); used to keep screen-space handles view-sized under low-res trace
+  accumPipeline;
+  // MRT: trace + prev-accum -> new-accum + presented view
+  accumBind = [void 0, void 0];
+  accumUniformBuf;
+  // (bg.rgb, blend)
+  accumTex = [void 0, void 0];
+  accumView = [void 0, void 0];
+  accumPing = 0;
+  accumN = 0;
+  lastAccumCam = new Float32Array(16);
+  // camera (invVP) of the last accumulated frame
+  lastAccumValid = false;
+  // false forces a reset (after a rebuild / first frame)
+  streamPipeline;
+  // trace -> rgba8unorm, for compact sample readback (remote)
+  streamBind;
+  // its OWN bind group (auto-layout differs from this.pipeline's)
+  // RESOLUTION-SCALED reconstruction (M2b): while interacting, trace at a fraction of the view
+  // (BudgetController) and Catmull-Rom UPSAMPLE the low-res trace to the view — the client-superres
+  // ported from the Python spike. A settled view renders native + accumulates instead.
+  superresPipeline;
+  superresBind;
+  superresBuf;
+  // (traceW, traceH, viewW, viewH)
+  // The moving/upscale path traces into its OWN low-res target so it never resizes/destroys the
+  // full-size traceTex the accumulation bind groups reference (that sharing caused destroyed-texture
+  // submits + MRT attachment-size mismatches → 3D flicker/blank during interaction).
+  lowTex;
+  lowView;
+  lowW = 0;
+  lowH = 0;
+  accumW = 0;
+  accumH = 0;
   /** Emit a default AABB-distance skip for fields that don't supply their own bound.
    *
    *  OFF because it MEASURED AS A NET LOSS (render/test/profile-boxskip.ts, 448², M-series):
@@ -258,6 +299,121 @@ var SceneRenderer = class _SceneRenderer {
       fragment: { module: rmod, entryPoint: "fs_resolve", targets: [{ format: this.format }] },
       primitive: { topology: "triangle-list", cullMode: "none" }
     });
+    this.accumUniformBuf = this.dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const amod = this.dev.createShaderModule({ code: this.accumWgsl() });
+    this.accumPipeline = this.dev.createRenderPipeline({
+      layout: "auto",
+      vertex: { module: amod, entryPoint: "vs_resolve" },
+      fragment: { module: amod, entryPoint: "fs_accum", targets: [{ format: "rgba32float" }, { format: this.format }] },
+      primitive: { topology: "triangle-list", cullMode: "none" }
+    });
+    this.superresBuf = this.dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const smod = this.dev.createShaderModule({ code: this.superresWgsl() });
+    this.superresPipeline = this.dev.createRenderPipeline({
+      layout: "auto",
+      vertex: { module: smod, entryPoint: "vs_resolve" },
+      fragment: { module: smod, entryPoint: "fs_superres", targets: [{ format: this.format }] },
+      primitive: { topology: "triangle-list", cullMode: "none" }
+    });
+  }
+  /** RECONSTRUCTOR (upsampling): Catmull-Rom (bicubic, 9 bilinear taps) reconstruction of the
+   *  low-res premultiplied trace, composited over the background — the client-superres from the
+   *  Python spike (435b28d), on WebGPU. Slight edge sharpening from the negative lobes; premultiplied
+   *  so the alpha reconstructs correctly. Used only when the trace is smaller than the view. */
+  superresWgsl() {
+    return (
+      /* wgsl */
+      `
+@group(0) @binding(0) var t_trace : texture_2d<f32>;
+@group(0) @binding(1) var s_lin : sampler;
+@group(0) @binding(2) var<uniform> u_sr : vec4<f32>;   // (traceW, traceH, viewW, viewH)
+@group(0) @binding(3) var<uniform> u_bg : vec4<f32>;
+fn srgb2physical(c : vec3<f32>) -> vec3<f32> {
+  let lo = c / 12.92;
+  let hi = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+  return select(lo, hi, c > vec3<f32>(0.04045));
+}
+// Catmull-Rom via 9 bilinear taps (Sigg/Hadwiger form).
+fn cr(uv : vec2<f32>, texSize : vec2<f32>) -> vec4<f32> {
+  let sp = uv * texSize;
+  let tp1 = floor(sp - 0.5) + 0.5;
+  let f = sp - tp1;
+  let w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+  let w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+  let w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+  let w3 = f * f * (-0.5 + 0.5 * f);
+  let w12 = w1 + w2;
+  let off12 = w2 / w12;
+  let inv = 1.0 / texSize;
+  let p0 = (tp1 - 1.0) * inv;
+  let p3 = (tp1 + 2.0) * inv;
+  let p12 = (tp1 + off12) * inv;
+  var r = vec4<f32>(0.0);
+  r += textureSampleLevel(t_trace, s_lin, vec2<f32>(p0.x,  p0.y),  0.0) * (w0.x  * w0.y);
+  r += textureSampleLevel(t_trace, s_lin, vec2<f32>(p12.x, p0.y),  0.0) * (w12.x * w0.y);
+  r += textureSampleLevel(t_trace, s_lin, vec2<f32>(p3.x,  p0.y),  0.0) * (w3.x  * w0.y);
+  r += textureSampleLevel(t_trace, s_lin, vec2<f32>(p0.x,  p12.y), 0.0) * (w0.x  * w12.y);
+  r += textureSampleLevel(t_trace, s_lin, vec2<f32>(p12.x, p12.y), 0.0) * (w12.x * w12.y);
+  r += textureSampleLevel(t_trace, s_lin, vec2<f32>(p3.x,  p12.y), 0.0) * (w3.x  * w12.y);
+  r += textureSampleLevel(t_trace, s_lin, vec2<f32>(p0.x,  p3.y),  0.0) * (w0.x  * w3.y);
+  r += textureSampleLevel(t_trace, s_lin, vec2<f32>(p12.x, p3.y),  0.0) * (w12.x * w3.y);
+  r += textureSampleLevel(t_trace, s_lin, vec2<f32>(p3.x,  p3.y),  0.0) * (w3.x  * w3.y);
+  return r;
+}
+struct RV { @builtin(position) position : vec4<f32> };
+@vertex
+fn vs_resolve(@builtin(vertex_index) vi : u32) -> RV {
+  let x = select(-1.0, 3.0, vi == 1u);
+  let y = select(-1.0, 3.0, vi == 2u);
+  var o : RV; o.position = vec4<f32>(x, y, 0.0, 1.0); return o;
+}
+@fragment
+fn fs_superres(v : RV) -> @location(0) vec4<f32> {
+  let uv = v.position.xy / u_sr.zw;
+  let s = cr(uv, u_sr.xy);
+  let a = clamp(s.a, 0.0, 1.0);
+  let bg = srgb2physical(u_bg.rgb);
+  return vec4<f32>(mix(bg, s.rgb, a), 1.0);
+}`
+    );
+  }
+  /** Accumulating RECONSTRUCTOR: fold this frame's traced sample into the running mean (blend =
+   *  1/n; blend=1 on reset → mean=this frame) and present it over the background. MRT so one pass
+   *  updates the accumulation texture AND the swap-chain view. Frame N jitters the ray sub-pixel,
+   *  so the mean over N frames is a supersampled, time-averaged-AA image (still camera). */
+  accumWgsl() {
+    return (
+      /* wgsl */
+      `
+@group(0) @binding(0) var t_trace : texture_2d<f32>;
+@group(0) @binding(1) var t_accum : texture_2d<f32>;
+@group(0) @binding(2) var<uniform> u_ra : vec4<f32>;   // (bg.r, bg.g, bg.b, blend)
+fn srgb2physical(c : vec3<f32>) -> vec3<f32> {
+  let lo = c / 12.92;
+  let hi = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+  return select(lo, hi, c > vec3<f32>(0.04045));
+}
+struct RV { @builtin(position) position : vec4<f32> };
+@vertex
+fn vs_resolve(@builtin(vertex_index) vi : u32) -> RV {
+  let x = select(-1.0, 3.0, vi == 1u);
+  let y = select(-1.0, 3.0, vi == 2u);
+  var o : RV; o.position = vec4<f32>(x, y, 0.0, 1.0); return o;
+}
+struct FO { @location(0) accum : vec4<f32>, @location(1) present : vec4<f32> };
+@fragment
+fn fs_accum(v : RV) -> FO {
+  let p = vec2<i32>(v.position.xy);
+  let cur = textureLoad(t_trace, p, 0);
+  let prev = textureLoad(t_accum, p, 0);
+  let acc = mix(prev, cur, u_ra.w);        // blend=1 on reset -> acc = cur
+  let bg = srgb2physical(u_ra.rgb);
+  var o : FO;
+  o.accum = acc;
+  o.present = vec4<f32>(mix(bg, acc.rgb, acc.a), 1.0);
+  return o;
+}`
+    );
   }
   /** RECONSTRUCTOR (M1: identity resolve). Composites the traced premultiplied sample over the
    *  background — the exact `mix(bg, rgb, a)` the fused fs_main used. `textureLoad` at integer
@@ -306,6 +462,48 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
       entries: [{ binding: 0, resource: this.traceView }, { binding: 1, resource: { buffer: this.resolveBgBuf } }]
     });
   }
+  /** (Re)allocate the low-res trace target + superres bind group when the moving render size changes.
+   *  Separate from traceTex so a moving frame never disturbs the accumulation textures. */
+  ensureLow(width, height) {
+    if (this.lowTex && this.lowW === width && this.lowH === height) return;
+    this.lowTex?.destroy();
+    this.lowTex = this.dev.createTexture({ size: [width, height], format: "rgba32float", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+    this.lowView = this.lowTex.createView();
+    this.lowW = width;
+    this.lowH = height;
+    this.superresBind = this.dev.createBindGroup({
+      layout: this.superresPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: this.lowView },
+        { binding: 1, resource: this.sampler },
+        { binding: 2, resource: { buffer: this.superresBuf } },
+        { binding: 3, resource: { buffer: this.resolveBgBuf } }
+      ]
+    });
+  }
+  /** Adaptive (moving-frame) render: trace at `renderW×renderH` and Catmull-Rom upsample to the
+   *  `viewW×viewH` output. The caller MUST have set the camera size to renderW×renderH (so the
+   *  low-res rays fill the same frustum). Single frame, no accumulation — use while interacting;
+   *  switch to renderAccum when the view settles. */
+  renderUpscaled(view, renderW, renderH, viewW, viewH) {
+    this.ensureLow(renderW, renderH);
+    this.flush();
+    this.dev.queue.writeBuffer(this.camBuf, 72, new Float32Array([this.focalPx * (viewH / renderH)]));
+    this.dev.queue.writeBuffer(this.superresBuf, 0, new Float32Array([renderW, renderH, viewW, viewH]));
+    this.dev.queue.writeBuffer(this.resolveBgBuf, 0, this.mat.subarray(12, 16));
+    const enc = this.dev.createCommandEncoder();
+    const tp = enc.beginRenderPass({ colorAttachments: [{ view: this.lowView, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
+    tp.setPipeline(this.pipeline);
+    tp.setBindGroup(0, this.bind);
+    tp.draw(3);
+    tp.end();
+    const sp = enc.beginRenderPass({ colorAttachments: [{ view, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }] });
+    sp.setPipeline(this.superresPipeline);
+    sp.setBindGroup(0, this.superresBind);
+    sp.draw(3);
+    sp.end();
+    this.dev.queue.submit([enc.finish()]);
+  }
   /** Encode trace (producer) + resolve (reconstructor) into `enc`, output to `outView`. */
   encodeFrame(enc, outView) {
     const tp = enc.beginRenderPass({ colorAttachments: [{ view: this.traceView, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
@@ -318,6 +516,85 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
     rp.setBindGroup(0, this.resolveBind);
     rp.draw(3);
     rp.end();
+  }
+  /** (Re)allocate the ping-pong accumulation targets + their bind groups on a size change. Tracks its
+   *  OWN size and always rebuilds accumBind against the current traceView (which ensureTrace, called
+   *  first in renderAccum, has just refreshed) — so the bind never dangles on a destroyed trace. */
+  ensureAccum(width, height) {
+    if (this.accumTex[0] && this.accumW === width && this.accumH === height) return;
+    this.accumW = width;
+    this.accumH = height;
+    for (let k = 0; k < 2; k++) {
+      this.accumTex[k]?.destroy();
+      this.accumTex[k] = this.dev.createTexture({ size: [width, height], format: "rgba32float", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+      this.accumView[k] = this.accumTex[k].createView();
+    }
+    for (let k = 0; k < 2; k++) {
+      this.accumBind[k] = this.dev.createBindGroup({
+        layout: this.accumPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: this.traceView },
+          { binding: 1, resource: this.accumView[k] },
+          { binding: 2, resource: { buffer: this.accumUniformBuf } }
+        ]
+      });
+    }
+    this.accumN = 0;
+    this.accumPing = 0;
+  }
+  /** Reset temporal accumulation — call when the view changes (camera move, scene edit, resize). */
+  resetAccumulation() {
+    this.accumN = 0;
+  }
+  /** Frames accumulated since the last reset (0 before the first accumulated frame). */
+  accumCount() {
+    return this.accumN;
+  }
+  /** Accumulating render: trace this frame (sub-pixel jittered) and fold it into the running mean,
+   *  presenting the mean over the background. `reset` (or a view change) restarts the mean at this
+   *  frame (n=1, no jitter — byte-identical to renderToView). Call repeatedly while the view is
+   *  still to converge to a supersampled, time-averaged-AA image. */
+  renderAccum(view, width, height, reset) {
+    this.ensureTrace(width, height);
+    this.ensureAccum(width, height);
+    let camChanged = !this.lastAccumValid;
+    const cam = this.baseInvVP;
+    for (let i = 0; i < 16 && !camChanged; i++) if (cam[i] !== this.lastAccumCam[i]) camChanged = true;
+    if (camChanged) reset = true;
+    this.lastAccumCam.set(cam);
+    this.lastAccumValid = true;
+    if (reset) this.accumN = 0;
+    this.accumN += 1;
+    const n = this.accumN;
+    if (n > 1) {
+      const jx = _SceneRenderer.halton(n, 2) - 0.5, jy = _SceneRenderer.halton(n, 3) - 0.5;
+      const T = new Float32Array(16);
+      T[0] = T[5] = T[10] = T[15] = 1;
+      T[12] = 2 * jx / width;
+      T[13] = -2 * jy / height;
+      this.dev.queue.writeBuffer(this.camBuf, 0, multiply(this.baseInvVP, T));
+    } else {
+      this.dev.queue.writeBuffer(this.camBuf, 0, this.baseInvVP);
+    }
+    this.flush();
+    this.dev.queue.writeBuffer(this.accumUniformBuf, 0, new Float32Array([this.mat[12], this.mat[13], this.mat[14], 1 / n]));
+    const prev = this.accumPing, next = 1 - this.accumPing;
+    const enc = this.dev.createCommandEncoder();
+    const tp = enc.beginRenderPass({ colorAttachments: [{ view: this.traceView, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
+    tp.setPipeline(this.pipeline);
+    tp.setBindGroup(0, this.bind);
+    tp.draw(3);
+    tp.end();
+    const ap = enc.beginRenderPass({ colorAttachments: [
+      { view: this.accumView[next], loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } },
+      { view, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }
+    ] });
+    ap.setPipeline(this.accumPipeline);
+    ap.setBindGroup(0, this.accumBind[prev]);
+    ap.draw(3);
+    ap.end();
+    this.dev.queue.submit([enc.finish()]);
+    this.accumPing = next;
   }
   /** (Re)build the pipeline for a set of fields. */
   build(fields) {
@@ -348,13 +625,22 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
       fragment: { module, entryPoint: "fs_pick", targets: [{ format: "rgba32float" }] },
       primitive: { topology: "triangle-list", cullMode: "none" }
     });
+    this.streamPipeline = this.dev.createRenderPipeline({
+      layout: "auto",
+      vertex: { module, entryPoint: "vs_main" },
+      fragment: { module, entryPoint: "fs_trace", targets: [{ format: "rgba8unorm" }] },
+      primitive: { topology: "triangle-list", cullMode: "none" }
+    });
     this.bind = this.dev.createBindGroup({ layout: this.pipeline.getBindGroupLayout(0), entries: this.bindGroupEntries() });
+    this.streamBind = this.dev.createBindGroup({ layout: this.streamPipeline.getBindGroupLayout(0), entries: this.bindGroupEntries() });
     if (this.pickPipeline) this.pickBind = this.dev.createBindGroup({ layout: this.pickPipeline.getBindGroupLayout(0), entries: this.bindGroupEntries() });
     this.setBackground(0.07, 0.08, 0.12);
     const step = this.placed.length ? Math.min(...this.placed.map((p) => p.field.sampleStep())) : 1;
     this.setSampleStep(step * 0.7);
     this.recomputeBounds();
     for (const p of this.placed) p.field.fillUniforms(this.mat, p.uoff);
+    this.accumN = 0;
+    this.lastAccumValid = false;
   }
   wgsl() {
     const members = this.placed.map((p) => p.field.structMembers(p.slot)).join("\n");
@@ -494,7 +780,7 @@ fn fs_trace(v : Varyings) -> @location(0) vec4<f32> {
 ${skipInit}
   loop {
     if (t >= t_far || safety >= 5000${hasGhost ? "" : " || integrated.a >= 0.99"}) { break; }
-    let js = fract(sin(dot(v.position.xy + vec2<f32>(f32(safety) * 0.7548, f32(safety) * 0.5698), vec2<f32>(12.9898, 78.233))) * 43758.5453) - 0.5; // per-(pixel,sample) jitter
+    let js = fract(sin(dot(v.position.xy + vec2<f32>(f32(safety) * 0.7548, f32(safety) * 0.5698), vec2<f32>(12.9898, 78.233))) * 43758.5453) - 0.5; // per-(pixel,sample) jitter \u2014 frame-invariant; temporal AA rides on the sub-pixel NDC jitter (frame.xy), which is exact identity at 0
     let wp = ro + rd * (t + js * step);
     var sum = vec4<f32>(0.0);
     var all_defer = true;        // every field guarantees emptiness here -> we may leap
@@ -580,6 +866,16 @@ ${pickDispatch}
   setSampleStep(step) {
     this.mat[8] = step;
   }
+  /** Van der Corput / Halton radical inverse in `base`. */
+  static halton(i, base) {
+    let f = 1, r = 0;
+    while (i > 0) {
+      f /= base;
+      r += f * (i % base);
+      i = Math.floor(i / base);
+    }
+    return r;
+  }
   /** Set up to 8 clip planes (nx,ny,nz,offset), inward-normal, keep-side `dot(wp,n)+offset>=0`.
    *  Written into the uniform tail — a Tier-A update the next flush() uploads; no rebuild. */
   setClipPlanes(planes) {
@@ -642,6 +938,7 @@ ${pickDispatch}
    *  swapped a texture) without recompiling the pipeline. Field set/structure must be unchanged. */
   refreshBindings() {
     this.bind = this.dev.createBindGroup({ layout: this.pipeline.getBindGroupLayout(0), entries: this.bindGroupEntries() });
+    this.streamBind = this.dev.createBindGroup({ layout: this.streamPipeline.getBindGroupLayout(0), entries: this.bindGroupEntries() });
     if (this.pickPipeline) this.pickBind = this.dev.createBindGroup({ layout: this.pickPipeline.getBindGroupLayout(0), entries: this.bindGroupEntries() });
   }
   /** Only fields with texture bindings use the shared sampler. `layout: "auto"` derives the
@@ -665,8 +962,10 @@ ${pickDispatch}
     const view = lookAt(eye, center, up);
     const proj = perspectiveZO(fovyDeg * Math.PI / 180, width / height, 1, 1e5);
     const invVP = invert(multiply(proj, view));
+    this.baseInvVP = invVP;
     const cam = new Float32Array(24);
     cam.set(invVP, 0);
+    this.focalPx = height / 2 / Math.tan(fovyDeg * Math.PI / 360);
     cam[16] = width;
     cam[17] = height;
     cam[18] = height / 2 / Math.tan(fovyDeg * Math.PI / 360);
@@ -759,6 +1058,32 @@ ${pickDispatch}
     const target = this.dev.createTexture({ size: [width, height], format: this.format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
     const enc = this.dev.createCommandEncoder();
     this.encodeFrame(enc, target.createView());
+    const bpr = Math.ceil(width * 4 / 256) * 256;
+    const buf = this.dev.createBuffer({ size: bpr * height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    enc.copyTextureToBuffer({ texture: target }, { buffer: buf, bytesPerRow: bpr, rowsPerImage: height }, [width, height]);
+    this.dev.queue.submit([enc.finish()]);
+    await buf.mapAsync(GPUMapMode.READ);
+    const padded = new Uint8Array(buf.getMappedRange());
+    const out = new Uint8Array(width * height * 4);
+    for (let y = 0; y < height; y++) out.set(padded.subarray(y * bpr, y * bpr + width * 4), y * width * 4);
+    buf.unmap();
+    target.destroy();
+    buf.destroy();
+    return out;
+  }
+  /** REMOTE PRODUCER (M3): trace at width×height and read back the PREMULTIPLIED sample (pre-
+   *  background) as tightly-packed rgba8 — the bytes streamed to the remote client, which runs the
+   *  same reconstruction (upsample + background composite) the local resolve does. The caller sets
+   *  the camera to width×height first (like renderUpscaled). Returns width*height*4 bytes. */
+  async traceSamples(width, height) {
+    this.flush();
+    const target = this.dev.createTexture({ size: [width, height], format: "rgba8unorm", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+    const enc = this.dev.createCommandEncoder();
+    const tp = enc.beginRenderPass({ colorAttachments: [{ view: target.createView(), loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
+    tp.setPipeline(this.streamPipeline);
+    tp.setBindGroup(0, this.streamBind);
+    tp.draw(3);
+    tp.end();
     const bpr = Math.ceil(width * 4 / 256) * 256;
     const buf = this.dev.createBuffer({ size: bpr * height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     enc.copyTextureToBuffer({ texture: target }, { buffer: buf, bytesPerRow: bpr, rowsPerImage: height }, [width, height]);
@@ -889,6 +1214,34 @@ var VtkCamera = class _VtkCamera {
     const motion = add(scale(right, -dxDisplay * mmPerPixel), scale(up, -dyDisplay * mmPerPixel));
     this.translate(motion);
   }
+  /** Project a world (RAS) point to display pixels (y DOWN, origin top-left) for a w×h viewport.
+   *  Vertical-FOV perspective matching SceneRenderer.setCamera (perspectiveZO(fovy, w/h)). `depth`
+   *  is the distance along the view direction (>0 in front of the camera). Used to hit-test
+   *  screen-space markup glyphs. */
+  worldToDisplay(p, w, h) {
+    const { right, up } = this.basis();
+    const dop = this.directionOfProjection;
+    const rel = sub(p, this.position);
+    const depth = dot(rel, dop);
+    const halfH = Math.max(1e-6, depth) * Math.tan(this.viewAngle * Math.PI / 360);
+    const aspect = w / h;
+    const ndcx = dot(rel, right) / (halfH * aspect);
+    const ndcy = dot(rel, up) / halfH;
+    return { x: (ndcx * 0.5 + 0.5) * w, y: (0.5 - ndcy * 0.5) * h, depth };
+  }
+  /** Inverse of worldToDisplay at a FIXED view-depth: the world point under display pixel (x,y)
+   *  lying in the plane perpendicular to the view at `depth`. Dragging a 3D handle in this plane
+   *  keeps its distance from the camera, so it tracks the cursor without depth ambiguity. */
+  displayToWorldAtDepth(x, y, depth, w, h) {
+    const { right, up } = this.basis();
+    const dop = this.directionOfProjection;
+    const halfH = Math.max(1e-6, depth) * Math.tan(this.viewAngle * Math.PI / 360);
+    const aspect = w / h;
+    const ndcx = x / w * 2 - 1;
+    const ndcy = 1 - y / h * 2;
+    const offset = add(scale(right, ndcx * halfH * aspect), scale(up, ndcy * halfH));
+    return add(add(this.position, scale(dop, depth)), offset);
+  }
   /** vtkCamera-comparable snapshot for the harness. */
   state() {
     return {
@@ -1017,25 +1370,57 @@ function attachCameraControls(canvas, camera, opts = {}) {
     const r = canvas.getBoundingClientRect();
     return { x: e.clientX - r.left, y: e.clientY - r.top };
   };
+  canvas.style.touchAction = "none";
+  const docEl = (canvas.ownerDocument ?? document).documentElement;
+  if (docEl) docEl.style.overscrollBehavior = "none";
+  canvas.addEventListener("touchmove", (e) => e.preventDefault(), { passive: false });
+  const pointers = /* @__PURE__ */ new Map();
+  let pinch = null;
+  const pinchState = () => {
+    const [a, b] = [...pointers.values()];
+    return { dist: Math.hypot(b.x - a.x, b.y - a.y), mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 };
+  };
   canvas.addEventListener("contextmenu", (e) => e.preventDefault());
   canvas.addEventListener("pointerdown", (e) => {
     const { x, y } = local(e);
-    interactor.start(e.button, x, y, canvas.clientHeight, {
-      shift: e.shiftKey,
-      ctrl: e.ctrlKey || e.metaKey,
-      alt: e.altKey
-    });
+    pointers.set(e.pointerId, { x, y });
     canvas.setPointerCapture(e.pointerId);
-    opts.onLog?.("cameraStart", { action: interactor.action, x, y, button: e.button, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey });
+    if (pointers.size === 1) {
+      interactor.start(e.button, x, y, canvas.clientHeight, { shift: e.shiftKey, ctrl: e.ctrlKey || e.metaKey, alt: e.altKey });
+      opts.onLog?.("cameraStart", { action: interactor.action, x, y, button: e.button, shift: e.shiftKey, ctrl: e.ctrlKey, alt: e.altKey });
+    } else if (pointers.size === 2) {
+      interactor.end();
+      pinch = pinchState();
+    }
   });
-  canvas.addEventListener("pointerup", (e) => {
-    interactor.end();
-    canvas.releasePointerCapture(e.pointerId);
-  });
+  const endPointer = (e) => {
+    if (!pointers.delete(e.pointerId)) return;
+    canvas.releasePointerCapture?.(e.pointerId);
+    if (pointers.size < 2) pinch = null;
+    if (pointers.size === 1) {
+      const p = [...pointers.values()][0];
+      interactor.start(0, p.x, p.y, canvas.clientHeight, { shift: false, ctrl: false, alt: false });
+    } else if (pointers.size === 0) {
+      interactor.end();
+    }
+  };
+  canvas.addEventListener("pointerup", endPointer);
+  canvas.addEventListener("pointercancel", endPointer);
   canvas.addEventListener("pointermove", (e) => {
-    if (interactor.action === "none") return;
+    if (!pointers.has(e.pointerId)) return;
     const { x, y } = local(e);
-    interactor.move(x, y, canvas.clientWidth, canvas.clientHeight);
+    pointers.set(e.pointerId, { x, y });
+    if (pointers.size >= 2) {
+      const p = pinchState();
+      if (pinch) {
+        if (p.dist > 0 && pinch.dist > 0) camera.dolly(p.dist / pinch.dist);
+        camera.panByDisplayDelta(p.mx - pinch.mx, pinch.my - p.my, canvas.clientWidth, canvas.clientHeight);
+        opts.onChange?.();
+      }
+      pinch = p;
+    } else if (interactor.action !== "none") {
+      interactor.move(x, y, canvas.clientWidth, canvas.clientHeight);
+    }
   });
   canvas.addEventListener("wheel", (e) => {
     e.preventDefault();
@@ -1439,6 +1824,7 @@ var ImageField = class {
   // volume (3d) + lut (2d)
   volTex;
   lutTex;
+  dev;
   p2t;
   clim;
   shade;
@@ -1463,6 +1849,12 @@ var ImageField = class {
     this.clim = opts.clim;
     this.shade = opts.shade ?? [0.35, 0.75, 0.35, 20];
     this.unit = opts.opacityUnitDistance ?? this.stepMm;
+    this.dev = dev;
+  }
+  /** Replace the 256-entry rgba8 color/opacity LUT in place (no texture/bind-group churn).
+   *  The bind group holds a stable view of lutTex, so the next render uses the new LUT. */
+  setLUT(lut) {
+    this.dev.queue.writeTexture({ texture: this.lutTex }, lut, { bytesPerRow: 256 * 4 }, [256, 1]);
   }
   origP2t;
   // sampling matrix + box at identity, for setWorldTransform
@@ -1581,10 +1973,12 @@ fn sample_field_img${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
 };
 var SegmentField = class {
   kind = "seg";
-  bindingCount = 1;
-  // smoothed-presence texture (sampler shared)
+  bindingCount;
+  // 1 (value texture) + 1 when an sdf attr (opacity) texture is bound
   clippable;
   tex;
+  attrTex;
+  // sdf per-voxel attributes (.r = opacity)
   p2t;
   box;
   color;
@@ -1592,6 +1986,8 @@ var SegmentField = class {
   shade;
   bandMm;
   stepMm;
+  mode;
+  colorFromTex;
   constructor(tex, dims, spacing, opts) {
     this.tex = tex;
     const center = opts.center ?? [0, 0, 0];
@@ -1611,6 +2007,10 @@ var SegmentField = class {
     this.bandMm = opts.bandMm ?? voxelMm;
     this.stepMm = opts.sampleStepMm ?? Math.max(0.5 * voxelMm, 0.1);
     this.clippable = opts.clippable ?? true;
+    this.mode = opts.mode ?? "iso";
+    this.colorFromTex = opts.colorFromTexture ?? false;
+    this.attrTex = this.mode === "sdf" ? opts.attrTexture : void 0;
+    this.bindingCount = this.attrTex ? 2 : 1;
   }
   uniformFloats() {
     return 28;
@@ -1638,9 +2038,132 @@ var SegmentField = class {
     ].join("\n");
   }
   declareBindings(s, base) {
-    return `@group(0) @binding(${base}) var t_seg${s} : texture_3d<f32>;`;
+    const value = `@group(0) @binding(${base}) var t_seg${s} : texture_3d<f32>;`;
+    return this.attrTex ? `${value}
+@group(0) @binding(${base + 1}) var t_attr${s} : texture_3d<f32>;` : value;
   }
   samplingWGSL(s) {
+    if (this.mode === "sdf") {
+      return (
+        /* wgsl */
+        `
+fn v_seg${s}(wp : vec3<f32>) -> f32 {   // signed distance (mm)
+  let t4 = u_material.seg${s}_p2t * vec4<f32>(transform_point_seg${s}(wp), 1.0);
+  let t = t4.xyz;
+  if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { return 1e3; }   // far outside \u2192 culled
+  return textureSampleLevel(t_seg${s}, s_lin, t, 0.0).a;
+}
+fn col_seg${s}(wp : vec3<f32>) -> vec3<f32> {   // per-label colour of the nearest region
+  let t4 = u_material.seg${s}_p2t * vec4<f32>(transform_point_seg${s}(wp), 1.0);
+  let t = t4.xyz;
+  if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { return vec3<f32>(0.0); }
+  return textureSampleLevel(t_seg${s}, s_lin, t, 0.0).rgb;
+}${this.attrTex ? `
+fn attr_seg${s}(wp : vec3<f32>) -> vec2<f32> {   // per-segment (.x = opacity, .y = shading mode)
+  let t4 = u_material.seg${s}_p2t * vec4<f32>(transform_point_seg${s}(wp), 1.0);
+  let t = t4.xyz;
+  if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { return vec2<f32>(0.0); }
+  return textureSampleLevel(t_attr${s}, s_lin, t, 0.0).rg;
+}` : ""}
+// Shell (surface) contribution at wp: crisp Phong shell around sdf=0. Weighted by (1-mode) so it
+// morphs smoothly into the volume contribution across a blurred surface\u2194volume boundary.
+fn surface_seg${s}(wp : vec3<f32>, rd : vec3<f32>, sdf : f32, band : f32, step : f32, seg_op : f32, op0 : f32) -> vec4<f32> {
+  let d_mm = abs(sdf);
+  if (d_mm > band + step) { return vec4<f32>(0.0); }
+  let T = clamp(op0 * seg_op, 0.0, 1.0);      // TARGET surface opacity (per-segment \xD7 field)
+  if (T <= 0.0) { return vec4<f32>(0.0); }
+  let h = step;
+  let g = vec3<f32>(
+    v_seg${s}(wp + vec3<f32>(h,0,0)) - v_seg${s}(wp - vec3<f32>(h,0,0)),
+    v_seg${s}(wp + vec3<f32>(0,h,0)) - v_seg${s}(wp - vec3<f32>(0,h,0)),
+    v_seg${s}(wp + vec3<f32>(0,0,h)) - v_seg${s}(wp - vec3<f32>(0,0,h))) / (2.0 * h);
+  let glen = length(g);
+  if (glen < 1e-5) { return vec4<f32>(0.0); }
+  var n = g / glen;
+  if (dot(n, -rd) < 0.0) { n = -n; }
+  // SURFACE opacity (Slicer polydata parity): the shell is a THIN surface of opacity T, not a solid
+  // band. A raymarch crosses it in several samples; giving each \u03B1=T lets the front-to-back OVER
+  // saturate toward opaque (50% looked like ~100%). Instead accumulate OPTICAL DEPTH with a shell
+  // profile \u03C1 = a/band that integrates to 1 across the crossing, scaled by -ln(1-T): \u03A3d\u03C4 = -ln(1-T),
+  // so net opacity = 1-e^(-\u03A3d\u03C4) = T EXACTLY \u2014 independent of band thickness and sample rate, and T\u21921
+  // stays crisply opaque. |dot(rd,n)| converts ray-step to shell-normal distance (\u21920 at grazing =
+  // built-in silhouette AA).
+  let a = max(1.0 - d_mm / band, 0.0);
+  if (a <= 0.0) { return vec4<f32>(0.0); }
+  // Convert ray-step to d_mm-distance with the RAW gradient projection |dot(rd,g)| = |d(d_mm)/ds|
+  // (includes |grad sdf|, which the distance blur pulls below 1) so \u03A3(a/band)\xB7\u0394d_mm = \u222B(a/band)dd = 1
+  // exactly. \u21920 at grazing = built-in silhouette AA.
+  let rate = max(abs(dot(rd, g)), 1e-3);
+  let tau = -log(1.0 - min(T, 0.9999)) * (a / band) * (step * rate);
+  let op = 1.0 - exp(-tau);
+  if (op <= 0.0004) { return vec4<f32>(0.0); }
+  let ka = u_material.seg${s}_shade.x; let kd = u_material.seg${s}_shade.y;
+  let ks = u_material.seg${s}_shade.z; let sh = u_material.seg${s}_shade.w;
+  let ldn = max(dot(-rd, n), 0.0);
+  let refl = normalize(2.0 * ldn * n + rd);
+  let rdv = max(dot(refl, -rd), 0.0);
+  let col = col_seg${s}(wp);
+  var lit = col * ka + col * (kd * ldn) + vec3<f32>(ks * pow(rdv, max(sh, 1.0)));
+  lit = srgb2physical(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)));
+  return vec4<f32>(lit * op, op);
+}
+fn sample_field_seg${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
+  let op0 = u_material.seg${s}_color.a;
+  if (op0 <= 0.0) { return vec4<f32>(0.0); }
+  let sdf = v_seg${s}(wp);
+  let band = max(u_material.seg${s}_params.x, 1e-3);
+  let step = max(u_material.scene.x, 1e-3);
+${this.attrTex ? `  let at = attr_seg${s}(wp);        // (opacity, shading mode)
+  let seg_op = at.x;
+  if (seg_op <= 0.0) { return vec4<f32>(0.0); }
+  let mode = clamp(at.y, 0.0, 1.0);
+  // Surface and volume are BLENDED by the (seam-blurred, fractional) mode, so an opaque-surface
+  // segment and a translucent-volume segment meet with a smooth transition instead of a jagged,
+  // voxel-quantized classification edge.
+  var acc = vec4<f32>(0.0);
+  if (mode > 0.001 && sdf < 0.0) {
+    // VOLUME: translucent DVR fill of the interior (~24 mm opacity-unit-distance).
+    let vop = clamp(op0 * seg_op * step / 24.0, 0.0, 1.0);
+    if (vop > 0.0) {
+      let vcol = srgb2physical(clamp(col_seg${s}(wp), vec3<f32>(0.0), vec3<f32>(1.0)));
+      acc += mode * vec4<f32>(vcol * vop, vop);
+    }
+  }
+  if (mode < 0.999) {
+    acc += (1.0 - mode) * surface_seg${s}(wp, rd, sdf, band, step, seg_op, op0);
+  }
+  return acc;` : `  return surface_seg${s}(wp, rd, sdf, band, step, 1.0, op0);`}
+}`
+      );
+    }
+    const alphaWGSL = this.mode === "surface" ? (
+      /* wgsl */
+      `
+  let step = max(u_material.scene.x, 1e-3);
+  let op = clamp(op0 * glen * step, 0.0, 1.0);
+  if (op <= 0.0) { return vec4<f32>(0.0); }`
+    ) : (
+      /* wgsl */
+      `
+  // Local first-order signed distance to the v=0.5 isosurface (mm), then a
+  // 1-voxel opacity band around it: crisp opaque shell, sub-voxel anti-aliased.
+  let d_mm = abs((v - 0.5) / glen);
+  let band = max(u_material.seg${s}_params.x, 1e-3);
+  let a = 1.0 - clamp(d_mm / band, 0.0, 1.0);
+  if (a <= 0.0) { return vec4<f32>(0.0); }
+  let op = clamp(a * op0, 0.0, 1.0);`
+    );
+    const colWGSL = this.colorFromTex ? (
+      /* wgsl */
+      `
+fn col_seg${s}(wp : vec3<f32>) -> vec3<f32> {
+  let t4 = u_material.seg${s}_p2t * vec4<f32>(transform_point_seg${s}(wp), 1.0);
+  let t = t4.xyz;
+  if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { return vec3<f32>(0.0); }
+  return textureSampleLevel(t_seg${s}, s_lin, t, 0.0).rgb;
+}`
+    ) : "";
+    const colExpr = this.colorFromTex ? `col_seg${s}(wp)` : `u_material.seg${s}_color.rgb`;
     return (
       /* wgsl */
       `
@@ -1649,7 +2172,7 @@ fn v_seg${s}(wp : vec3<f32>) -> f32 {
   let t = t4.xyz;
   if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { return 0.0; }
   return textureSampleLevel(t_seg${s}, s_lin, t, 0.0).a;   // Gaussian-smoothed presence in .a
-}
+}${colWGSL}
 fn sample_field_seg${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
   let op0 = u_material.seg${s}_color.a;
   if (op0 <= 0.0) { return vec4<f32>(0.0); }
@@ -1662,14 +2185,7 @@ fn sample_field_seg${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
     v_seg${s}(wp + vec3<f32>(0,h,0)) - v_seg${s}(wp - vec3<f32>(0,h,0)),
     v_seg${s}(wp + vec3<f32>(0,0,h)) - v_seg${s}(wp - vec3<f32>(0,0,h))) / (2.0 * h);
   let glen = length(g);
-  if (glen < 1e-5) { return vec4<f32>(0.0); }
-  // Local first-order signed distance to the v=0.5 isosurface (mm), then a
-  // 1-voxel opacity band around it: crisp opaque shell, sub-voxel anti-aliased.
-  let d_mm = abs((v - 0.5) / glen);
-  let band = max(u_material.seg${s}_params.x, 1e-3);
-  let a = 1.0 - clamp(d_mm / band, 0.0, 1.0);
-  if (a <= 0.0) { return vec4<f32>(0.0); }
-  let op = clamp(a * op0, 0.0, 1.0);
+  if (glen < 1e-5) { return vec4<f32>(0.0); }${alphaWGSL}
   // Phong from the same gradient, normal flipped to face the camera.
   var n = g / glen;
   if (dot(n, -rd) < 0.0) { n = -n; }
@@ -1678,7 +2194,7 @@ fn sample_field_seg${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
   let ldn = max(dot(-rd, n), 0.0);
   let refl = normalize(2.0 * ldn * n + rd);
   let rdv = max(dot(refl, -rd), 0.0);
-  let col = u_material.seg${s}_color.rgb;
+  let col = ${colExpr};
   var lit = col * ka + col * (kd * ldn) + vec3<f32>(ks * pow(rdv, max(sh, 1.0)));
   lit = srgb2physical(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)));
   return vec4<f32>(lit * op, op);
@@ -1698,7 +2214,9 @@ fn sample_field_seg${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
     out[off + 24] = this.bandMm;
   }
   bindEntries(_s, base) {
-    return [{ binding: base, resource: this.tex.createView() }];
+    const e = [{ binding: base, resource: this.tex.createView() }];
+    if (this.attrTex) e.push({ binding: base + 1, resource: this.attrTex.createView() });
+    return e;
   }
 };
 
@@ -1722,7 +2240,9 @@ async function inflateDeflate(buf) {
 async function fetchZarrVolume(blobBase, z, onBytes, concurrency = 12) {
   const Ctor = ZDT[z.dtype] ?? Int16Array;
   const [nz, ny, nx] = z.shape, [cz, cy, cx] = z.chunks, [ncz, ncy, ncx] = z.chunkGrid;
-  const base = blobBase + z.dir + "/" + z.dataset + "/";
+  const hashes = z.chunkHashes;
+  const posBase = blobBase + z.dir + "/" + z.dataset + "/";
+  const chunkUrl = (kk, jj, ii) => hashes ? blobBase + hashes[kk + "." + jj + "." + ii] : posBase + kk + "." + jj + "." + ii;
   const out = new Float32Array(nz * ny * nx);
   let lo = Infinity, hi = -Infinity;
   const jobs = [];
@@ -1731,7 +2251,7 @@ async function fetchZarrVolume(blobBase, z, onBytes, concurrency = 12) {
   const worker = async () => {
     while (idx < jobs.length) {
       const [kk, jj, ii] = jobs[idx++];
-      const gz = await (await fetch(base + kk + "." + jj + "." + ii)).arrayBuffer();
+      const gz = await (await fetch(chunkUrl(kk, jj, ii))).arrayBuffer();
       onBytes?.(gz.byteLength);
       const chunk = new Ctor(await inflateDeflate(gz));
       const z0 = kk * cz, y0 = jj * cy, x0 = ii * cx;
@@ -1752,6 +2272,79 @@ async function fetchZarrVolume(blobBase, z, onBytes, concurrency = 12) {
   };
   await Promise.all(Array.from({ length: Math.min(concurrency, jobs.length) }, worker));
   return { data: out, dims: [nx, ny, nz], range: [lo, hi] };
+}
+
+// render/mrson.ts
+var TYPE_TO_CLASS = {
+  image: "vtkMRMLScalarVolumeNode",
+  mesh: "vtkMRMLModelNode",
+  segmentation: "vtkMRMLSegmentationNode",
+  markup: "vtkMRMLMarkupsFiducialNode",
+  transform: "vtkMRMLLinearTransformNode",
+  camera: "vtkMRMLCameraNode",
+  view: "vtkMRMLViewNode",
+  transferFunction: "vtkMRMLVolumePropertyNode",
+  scalarVolumeDisplay: "vtkMRMLScalarVolumeDisplayNode",
+  volumeRenderingDisplay: "vtkMRMLGPURayCastVolumeRenderingDisplayNode",
+  modelDisplay: "vtkMRMLModelDisplayNode",
+  markupDisplay: "vtkMRMLMarkupsDisplayNode"
+};
+function isMrsonScene(raw) {
+  const r = raw;
+  if (!r || typeof r !== "object") return false;
+  if (r.mrson !== void 0) return true;
+  return !!r.nodes && Object.values(r.nodes).some((n) => typeof n?.type === "string");
+}
+var colorRows = (a) => Array.isArray(a) ? a.map((s) => [s.value, s.rgba[0], s.rgba[1], s.rgba[2]]) : [];
+var opacityRows = (a) => Array.isArray(a) ? a.map((s) => [s.value, s.opacity]) : [];
+function adaptMrsonScene(scene) {
+  const nodes = scene.nodes ?? {};
+  const out = {};
+  for (const [id, n] of Object.entries(nodes)) {
+    const cls = n.source?.mrmlClass ?? TYPE_TO_CLASS[n.type] ?? n.type;
+    const refs = { ...n.refs ?? {} };
+    const attrs = {};
+    switch (n.type) {
+      case "image":
+        attrs.zarr = n.zarr;
+        attrs.ijkToRAS = n.ijkToRAS;
+        attrs.dims = n.dims;
+        attrs.comps = n.comps;
+        break;
+      case "transferFunction":
+        attrs.color = colorRows(n.colorStops);
+        attrs.scalarOpacity = opacityRows(n.scalarOpacity);
+        attrs.gradientOpacity = opacityRows(n.gradientOpacity);
+        attrs.shade = n.shade;
+        break;
+      case "scalarVolumeDisplay":
+        attrs.window = n.window;
+        attrs.level = n.level;
+        attrs.color = n.color;
+        attrs.visibility = n.visible ? 1 : 0;
+        break;
+      case "volumeRenderingDisplay":
+        if (n.refs?.transferFunction) refs.volumeProperty = n.refs.transferFunction;
+        break;
+      case "markup": {
+        attrs.controlPoints = n.controlPoints;
+        const dc = (n.refs?.display ?? []).map((d) => nodes[d]?.color).find(Boolean);
+        if (dc) attrs.color = dc.slice(0, 3);
+        break;
+      }
+      case "camera":
+        attrs.position = n.position;
+        attrs.focalPoint = n.focalPoint;
+        attrs.viewUp = n.viewUp;
+        attrs.viewAngle = n.viewAngle;
+        attrs.parallelScale = n.parallelScale;
+        break;
+      default:
+        break;
+    }
+    out[id] = { id, class: cls, name: n.name, refs, attrs, blobs: [] };
+  }
+  return { blobBase: scene.blobBase, nodes: out };
 }
 
 // render/scene-volume.ts
@@ -1810,7 +2403,8 @@ function parseMarkups(nodes) {
 }
 async function loadSceneVolumeField(dev, sceneUrl, onBytes, opts = {}) {
   const raw = await (await fetch(sceneUrl)).json();
-  const wrapper = raw.nodes ? raw : { nodes: raw };
+  const adapted = isMrsonScene(raw) ? adaptMrsonScene(raw) : raw;
+  const wrapper = adapted.nodes ? adapted : { nodes: adapted };
   const nodes = wrapper.nodes;
   const pageBase = globalThis.location?.href ?? "file:///";
   const sceneAbs = new URL(sceneUrl, pageBase).href;
@@ -2157,6 +2751,12 @@ function bakeColorizeRGBA(dev, labelmap, dims, palette, sigmaVoxels = 1.5) {
     p.setBindGroup(0, initBind);
     p.dispatchWorkgroups(gx, gy, gz);
     p.end();
+  }
+  if (sigmaVoxels <= 0) {
+    dev.queue.submit([enc.finish()]);
+    labelTex.destroy();
+    texB.destroy();
+    return texA;
   }
   const { radius, w } = gaussHalfKernel(sigmaVoxels);
   const blurPipe = dev.createComputePipeline({ layout: "auto", compute: { module: dev.createShaderModule({ code: BLUR_WGSL }), entryPoint: "main" } });
