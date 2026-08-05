@@ -2020,6 +2020,7 @@ struct U { ijkToRAS : mat4x4<f32>, dims : vec4<u32>, params : vec4<f32> };
 @group(0) @binding(2) var t_out : texture_storage_3d<rgba16float, write>;
 @group(0) @binding(3) var<uniform> u : U;
 @group(0) @binding(4) var<uniform> u_pal : array<vec4<f32>, 256>;
+@group(0) @binding(5) var t_attr : texture_storage_3d<rgba16float, write>;
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (any(gid >= u.dims.xyz)) { return; }
@@ -2031,8 +2032,9 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let ins = textureLoad(t_label, c, 0).r != 0u;
   let sdf = select(dist, -dist, ins);
   let lbl = u32(s.w + 0.5) & 255u;
-  let color = select(vec3<f32>(0.0), u_pal[lbl].rgb, valid);
-  textureStore(t_out, c, vec4<f32>(color, sdf));
+  let pal = select(vec4<f32>(0.0), u_pal[lbl], valid);
+  textureStore(t_out, c, vec4<f32>(pal.rgb, sdf));
+  textureStore(t_attr, c, vec4<f32>(pal.a, 0.0, 0.0, 0.0));   // .r = per-segment opacity
 }`
 );
 var BLUR_WGSL2 = (
@@ -2108,6 +2110,7 @@ var JfaSdfBaker = class {
     const mk = (fmt, extra = 0) => dev.createTexture({ size: dims, dimension: "3d", format: fmt, usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING | extra });
     this.seed = [mk("rgba32float"), mk("rgba32float")];
     this.sdfTex = mk("rgba16float", GPUTextureUsage.COPY_DST);
+    this.attrTex = mk("rgba16float");
     this.sdfScratch = mk("rgba16float", GPUTextureUsage.COPY_SRC);
     this.uni = dev.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.palBuf = dev.createBuffer({ size: 256 * 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -2131,6 +2134,8 @@ var JfaSdfBaker = class {
   // rgba32float ping-pong (RAS seed xyz + regionLabel)
   sdfTex;
   // rgba16float: .rgb = per-label colour, .a = signed dist (mm) — sampled by SegmentField
+  attrTex;
+  // rgba16float: .r = per-segment opacity — sampled by SegmentField
   sdfScratch;
   // rgba16float blur ping-pong
   uni;
@@ -2151,6 +2156,10 @@ var JfaSdfBaker = class {
    *  place. */
   sdfTexture() {
     return this.sdfTex;
+  }
+  /** The resident per-segment attribute texture (rgba16float; .r = opacity). Identity stable. */
+  attrTexture() {
+    return this.attrTex;
   }
   /** Set the label→colour palette (256 × rgba f32; index = label id). Call before bake(). */
   setPalette(palette) {
@@ -2228,7 +2237,8 @@ var JfaSdfBaker = class {
       { binding: 1, resource: this.labelTex.createView() },
       { binding: 2, resource: this.sdfTex.createView() },
       { binding: 3, resource: { buffer: this.uni } },
-      { binding: 4, resource: { buffer: this.palBuf } }
+      { binding: 4, resource: { buffer: this.palBuf } },
+      { binding: 5, resource: this.attrTex.createView() }
     ] });
     const p = enc.beginComputePass();
     p.setPipeline(this.finalPipe);
@@ -2275,6 +2285,7 @@ var JfaSdfBaker = class {
     this.seed[0].destroy();
     this.seed[1].destroy();
     this.sdfTex.destroy();
+    this.attrTex.destroy();
     this.sdfScratch.destroy();
     this.uni.destroy();
     this.palBuf.destroy();
@@ -2284,10 +2295,12 @@ var JfaSdfBaker = class {
 // render/fields.ts
 var SegmentField = class {
   kind = "seg";
-  bindingCount = 1;
-  // smoothed-presence texture (sampler shared)
+  bindingCount;
+  // 1 (value texture) + 1 when an sdf attr (opacity) texture is bound
   clippable;
   tex;
+  attrTex;
+  // sdf per-voxel attributes (.r = opacity)
   p2t;
   box;
   color;
@@ -2318,6 +2331,8 @@ var SegmentField = class {
     this.clippable = opts.clippable ?? true;
     this.mode = opts.mode ?? "iso";
     this.colorFromTex = opts.colorFromTexture ?? false;
+    this.attrTex = this.mode === "sdf" ? opts.attrTexture : void 0;
+    this.bindingCount = this.attrTex ? 2 : 1;
   }
   uniformFloats() {
     return 28;
@@ -2345,7 +2360,9 @@ var SegmentField = class {
     ].join("\n");
   }
   declareBindings(s, base) {
-    return `@group(0) @binding(${base}) var t_seg${s} : texture_3d<f32>;`;
+    const value = `@group(0) @binding(${base}) var t_seg${s} : texture_3d<f32>;`;
+    return this.attrTex ? `${value}
+@group(0) @binding(${base + 1}) var t_attr${s} : texture_3d<f32>;` : value;
   }
   samplingWGSL(s) {
     if (this.mode === "sdf") {
@@ -2363,7 +2380,13 @@ fn col_seg${s}(wp : vec3<f32>) -> vec3<f32> {   // per-label colour of the neare
   let t = t4.xyz;
   if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { return vec3<f32>(0.0); }
   return textureSampleLevel(t_seg${s}, s_lin, t, 0.0).rgb;
-}
+}${this.attrTex ? `
+fn attr_seg${s}(wp : vec3<f32>) -> f32 {   // per-segment opacity of the nearest region
+  let t4 = u_material.seg${s}_p2t * vec4<f32>(transform_point_seg${s}(wp), 1.0);
+  let t = t4.xyz;
+  if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { return 0.0; }
+  return textureSampleLevel(t_attr${s}, s_lin, t, 0.0).r;
+}` : ""}
 fn sample_field_seg${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
   let op0 = u_material.seg${s}_color.a;
   if (op0 <= 0.0) { return vec4<f32>(0.0); }
@@ -2374,7 +2397,9 @@ fn sample_field_seg${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
   if (d_mm > band + step) { return vec4<f32>(0.0); }   // outside the shell (+ gradient stencil margin)
   let a = 1.0 - clamp(d_mm / band, 0.0, 1.0);
   if (a <= 0.0) { return vec4<f32>(0.0); }
-  let op = clamp(a * op0, 0.0, 1.0);
+${this.attrTex ? `  let seg_op = attr_seg${s}(wp);   // per-segment opacity (0 = hidden)
+  if (seg_op <= 0.0) { return vec4<f32>(0.0); }
+  let op = clamp(a * op0 * seg_op, 0.0, 1.0);` : `  let op = clamp(a * op0, 0.0, 1.0);`}
   // Normal = SDF gradient (central difference); smooth SDF \u2192 smooth normal, no terracing.
   let h = step;
   let g = vec3<f32>(
@@ -2475,7 +2500,9 @@ fn sample_field_seg${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
     out[off + 24] = this.bandMm;
   }
   bindEntries(_s, base) {
-    return [{ binding: base, resource: this.tex.createView() }];
+    const e = [{ binding: base, resource: this.tex.createView() }];
+    if (this.attrTex) e.push({ binding: base + 1, resource: this.attrTex.createView() });
+    return e;
   }
 };
 
@@ -2520,14 +2547,21 @@ var SegmentationLogic = class {
   unsubDirty;
   refineTimer;
   refineDelayMs = 180;
-  /** Assign a display colour to a label id (0..255). Takes effect on the next rebake. */
+  /** Assign a display colour to a label id (0..255). Keeps the current opacity (defaults to 1 =
+   *  opaque). Takes effect on the next rebake. */
   setLabelColor(id, rgb) {
     if (id < 1 || id > 255) return;
     const o = id * 4;
     this.palette[o] = rgb[0];
     this.palette[o + 1] = rgb[1];
     this.palette[o + 2] = rgb[2];
-    this.palette[o + 3] = 1;
+    if (this.palette[o + 3] === 0) this.palette[o + 3] = 1;
+  }
+  /** Per-segment opacity (0 = hidden, 1 = opaque) — palette alpha. Enables translucent surface-model
+   *  rendering (see through outer segments to inner ones). Rebake/refine to apply. */
+  setLabelOpacity(id, opacity) {
+    if (id < 1 || id > 255) return;
+    this.palette[id * 4 + 3] = Math.max(0, Math.min(1, opacity));
   }
   /** Re-derive the render texture from the current master + palette (FAST, in place). */
   rebake() {
@@ -2572,7 +2606,9 @@ var SegmentationLogic = class {
         mode: this.renderMode === "sdf" ? "sdf" : "surface",
         colorFromTexture: true,
         bandMm: band,
-        clippable: false
+        clippable: false,
+        attrTexture: this.sdf ? this.sdf.attrTexture() : void 0
+        // per-segment opacity (sdf)
       });
     }
     return this.segField;
@@ -2628,9 +2664,13 @@ function buildAlgorithmsScene(gpu, format) {
   const redrawCbs = [];
   let mode = "sdf";
   let logic;
+  let allOpacity = 1;
   const makeLogic = () => {
     logic = new SegmentationLogic(gpu.device, seg, { renderMode: mode, opacity: 1, sigmaVoxels: 1 });
-    for (const [id, rgb] of labelColors) logic.setLabelColor(id, rgb);
+    for (const [id, rgb] of labelColors) {
+      logic.setLabelColor(id, rgb);
+      logic.setLabelOpacity(id, allOpacity);
+    }
     logic.onRedraw(() => {
       for (const cb of redrawCbs) cb();
     });
@@ -2675,7 +2715,13 @@ function buildAlgorithmsScene(gpu, format) {
     renderMode: () => mode,
     refine() {
       logic.refineNow();
-    }
+    },
+    setAllOpacity(op) {
+      allOpacity = op;
+      for (const [id] of labelColors) logic.setLabelOpacity(id, op);
+      logic.refineNow();
+    },
+    allOpacity: () => allOpacity
   };
 }
 
@@ -2758,6 +2804,17 @@ async function main() {
     syncModeBtn();
     drawNow();
     status(`render path: ${a.renderMode() === "sdf" ? "SDF (crisp, terrace-free)" : "Gaussian (gradient-opacity)"}`);
+  });
+  const opacBtn = document.getElementById("opac");
+  const syncOpacBtn = () => {
+    if (opacBtn) opacBtn.textContent = a.allOpacity() < 1 ? "Surfaces: Translucent" : "Surfaces: Opaque";
+  };
+  syncOpacBtn();
+  opacBtn?.addEventListener("click", () => {
+    a.setAllOpacity(a.allOpacity() < 1 ? 1 : 0.45);
+    syncOpacBtn();
+    drawNow();
+    status(a.allOpacity() < 1 ? "translucent surface models \u2014 see through outer segments to inner ones" : "opaque surfaces");
   });
   document.getElementById("reset")?.addEventListener("click", () => location.reload());
   resize();
