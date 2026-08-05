@@ -1784,6 +1784,16 @@ fn v_seg${s}(wp : vec3<f32>) -> f32 {   // signed distance (mm)
   if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { return 1e3; }   // far outside \u2192 culled
   return textureSampleLevel(t_seg${s}, s_lin, t, 0.0).a;
 }
+fn vgrad_seg${s}(wp : vec3<f32>) -> f32 {   // signed distance for the NORMAL finite-difference
+  // A gradient tap that steps just outside the (padded) SDF texture must read BACKGROUND, not the
+  // out-of-volume cull sentinel (1e3) \u2014 a huge sentinel would fabricate an enormous fake gradient that
+  // points out through the volume face and unlights the surface (black speckle at the seg/boundary
+  // interface). Clamp to the texture edge: with the padded grid that edge IS background, so the normal
+  // near a cap stays correct. This is the "artificial background boundary sample" for the normal.
+  let t4 = u_material.seg${s}_p2t * vec4<f32>(transform_point_seg${s}(wp), 1.0);
+  let t = clamp(t4.xyz, vec3<f32>(0.0), vec3<f32>(1.0));
+  return textureSampleLevel(t_seg${s}, s_lin, t, 0.0).a;
+}
 fn col_seg${s}(wp : vec3<f32>) -> vec3<f32> {   // per-label colour of the nearest region
   let t4 = u_material.seg${s}_p2t * vec4<f32>(transform_point_seg${s}(wp), 1.0);
   let t = t4.xyz;
@@ -1805,9 +1815,9 @@ fn surface_seg${s}(wp : vec3<f32>, rd : vec3<f32>, sdf : f32, band : f32, step :
   if (T <= 0.0) { return vec4<f32>(0.0); }
   let h = step;
   let g = vec3<f32>(
-    v_seg${s}(wp + vec3<f32>(h,0,0)) - v_seg${s}(wp - vec3<f32>(h,0,0)),
-    v_seg${s}(wp + vec3<f32>(0,h,0)) - v_seg${s}(wp - vec3<f32>(0,h,0)),
-    v_seg${s}(wp + vec3<f32>(0,0,h)) - v_seg${s}(wp - vec3<f32>(0,0,h))) / (2.0 * h);
+    vgrad_seg${s}(wp + vec3<f32>(h,0,0)) - vgrad_seg${s}(wp - vec3<f32>(h,0,0)),
+    vgrad_seg${s}(wp + vec3<f32>(0,h,0)) - vgrad_seg${s}(wp - vec3<f32>(0,h,0)),
+    vgrad_seg${s}(wp + vec3<f32>(0,0,h)) - vgrad_seg${s}(wp - vec3<f32>(0,0,h))) / (2.0 * h);
   let glen = length(g);
   if (glen < 1e-5) { return vec4<f32>(0.0); }
   var n = g / glen;
@@ -2669,15 +2679,18 @@ struct U { ijkToRAS : mat4x4<f32>, dims : vec4<u32>, params : vec4<f32> };
 @group(0) @binding(0) var t_label : texture_3d<u32>;
 @group(0) @binding(1) var t_seed_out : texture_storage_3d<rgba32float, write>;
 @group(0) @binding(2) var<uniform> u : U;
-// SYNTHETIC BACKGROUND BORDER: out-of-bounds reads as background (0), NOT clamp-to-edge. A segment
-// touching the volume face then sees a background neighbour across it \u2192 that face is flagged as a
-// boundary and seeded, so its SDF surface closes with a flat cap at the volume edge. With clamp-to-
-// edge the face voxel read its own label back, was never a boundary, got no seed, and left an open/
-// degenerate SDF at the border \u2192 black speckles where the ray enters the volume.
+// PADDED SDF GRID: the seed/SDF textures are LARGER than the labelmap by 'pad' voxels on every side
+// (dims.w). Coord c is a padded-grid coord; the label lives at c-pad, and everything outside the label
+// range is background (0). This gives a real spatial margin of background BEYOND the segmentation, so
+// a segment touching the labelmap edge closes as a genuine capped surface with room for the SDF to go
+// positive \u2014 and gradient/finite-difference samples near that cap stay in-bounds (they read real
+// background) instead of hitting the out-of-volume cull sentinel, which used to poison the normal.
 fn labelAt(c : vec3<i32>) -> u32 {
-  let d = vec3<i32>(u.dims.xyz);
-  if (any(c < vec3<i32>(0)) || any(c >= d)) { return 0u; }
-  return textureLoad(t_label, c, 0).r;
+  let pad = i32(u.dims.w);
+  let ld = vec3<i32>(u.dims.xyz) - vec3<i32>(2 * pad);   // label dims = padded dims - 2\xB7pad
+  let lc = c - vec3<i32>(pad);
+  if (any(lc < vec3<i32>(0)) || any(lc >= ld)) { return 0u; }
+  return textureLoad(t_label, lc, 0).r;
 }
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
@@ -2749,7 +2762,11 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let s = textureLoad(t_seed_in, c, 0);
   let valid = s.w > 0.5;
   let dist = select(1e3, distance(p, s.xyz), valid);
-  let ins = textureLoad(t_label, c, 0).r != 0u;
+  let pad = i32(u.dims.w);                                       // label is offset by pad; pad region = background (outside)
+  let lc = c - vec3<i32>(pad);
+  let ld = vec3<i32>(u.dims.xyz) - vec3<i32>(2 * pad);
+  let inRange = all(lc >= vec3<i32>(0)) && all(lc < ld);
+  let ins = inRange && textureLoad(t_label, lc, 0).r != 0u;
   let sdf = select(dist, -dist, ins);
   let lbl = u32(s.w + 0.5) & 255u;
   let pal = select(vec4<f32>(0.0), u_pal[lbl], valid);
@@ -2845,14 +2862,25 @@ function gaussHalfKernel2(sigma) {
   return { radius, w };
 }
 var JfaSdfBaker = class {
-  constructor(dev, labelTex, dims, ijkToRAS, smoothSigmaVoxels = 1) {
+  // original (label) dims, before padding
+  // `pad` voxels of background are added on every side so segments touching the labelmap edge get a
+  // real cap + in-bounds gradient neighbourhood (docs/ALGORITHMS.md border artifact). The SDF textures,
+  // dispatch, seeds, blur and readback all run on the PADDED grid; `dims`/`ijkToRAS` become the padded
+  // grid's, and `sdfDims()`/`sdfIjkToRAS()` expose them to the SegmentField.
+  constructor(dev, labelTex, dims, ijkToRAS, smoothSigmaVoxels = 1, pad = 2) {
     this.labelTex = labelTex;
     this.dims = dims;
     this.ijkToRAS = ijkToRAS;
     this.dev = dev;
     this.smoothSigma = smoothSigmaVoxels;
-    const [dx, dy, dz] = dims;
-    const mk = (fmt, extra = 0) => dev.createTexture({ size: dims, dimension: "3d", format: fmt, usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING | extra });
+    this.pad = pad;
+    this.labelDims = [dims[0], dims[1], dims[2]];
+    this.dims = [dims[0] + 2 * pad, dims[1] + 2 * pad, dims[2] + 2 * pad];
+    const m = ijkToRAS.slice();
+    for (let r = 0; r < 3; r++) m[r * 4 + 3] -= pad * (m[r * 4] + m[r * 4 + 1] + m[r * 4 + 2]);
+    this.ijkToRAS = m;
+    const [dx, dy, dz] = this.dims;
+    const mk = (fmt, extra = 0) => dev.createTexture({ size: this.dims, dimension: "3d", format: fmt, usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING | extra });
     this.seed = [mk("rgba32float"), mk("rgba32float")];
     this.sdfTex = mk("rgba16float", GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC);
     this.attrTex = mk("rgba16float", GPUTextureUsage.COPY_DST);
@@ -2905,6 +2933,9 @@ var JfaSdfBaker = class {
   g;
   steps;
   smoothSigma;
+  pad;
+  // background margin (voxels) padded around the labelmap
+  labelDims;
   /** The resident colorized-SDF texture (rgba16float: .rgb = per-label colour, .a = signed mm).
    *  Identity stable across bakes → the SceneRenderer bind group stays valid; a live edit updates in
    *  place. */
@@ -2914,6 +2945,19 @@ var JfaSdfBaker = class {
   /** The resident per-segment attribute texture (rgba16float; .r = opacity). Identity stable. */
   attrTexture() {
     return this.attrTex;
+  }
+  /** The PADDED grid the SDF/attr textures live on (labelDims + 2·pad), and the ijkToRAS that maps it
+   *  to RAS — hand these to the SegmentField so its patient→texture transform covers the padded extent. */
+  sdfDims() {
+    return this.dims;
+  }
+  sdfIjkToRAS() {
+    return this.ijkToRAS;
+  }
+  /** Background margin (voxels) padded on each side; readDistance() is on the padded grid, so a label
+   *  voxel (x,y,z) is at padded (x+pad, y+pad, z+pad). */
+  padVoxels() {
+    return this.pad;
   }
   /** Read back the per-voxel signed distance (sdfTex .a, mm) to CPU. For accuracy comparison/tests. */
   async readDistance() {
@@ -2959,7 +3003,7 @@ var JfaSdfBaker = class {
     u[16] = this.dims[0];
     u[17] = this.dims[1];
     u[18] = this.dims[2];
-    u[19] = 0;
+    u[19] = this.pad;
     f[20] = step;
     f[21] = 0;
     f[22] = 0;
@@ -3185,10 +3229,12 @@ var SegmentationLogic = class {
       const tex = this.sdf ? this.sdf.sdfTexture() : this.presenceTex;
       const voxelMm = Math.min(...this.seg.spacingMm());
       const band = this.bandMm ?? (this.renderMode === "sdf" ? 0.65 * voxelMm : void 0);
-      this.segField = new SegmentField(tex, this.seg.dims, [1, 1, 1], {
+      const fdims = this.sdf ? this.sdf.sdfDims() : this.seg.dims;
+      const fijk = this.sdf ? this.sdf.sdfIjkToRAS() : this.seg.ijkToRAS;
+      this.segField = new SegmentField(tex, fdims, [1, 1, 1], {
         color: [1, 1, 1],
         opacity: this.opacity,
-        ijkToRAS: this.seg.ijkToRAS,
+        ijkToRAS: fijk,
         mode: this.renderMode === "sdf" ? "sdf" : "surface",
         colorFromTexture: true,
         bandMm: band,
