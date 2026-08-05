@@ -15,6 +15,14 @@
   "legacy": null
  },
  {
+  "name": "TotalSegmentator \u2014 75 structures (WebGPU)",
+  "page": "webgpu/segroulette.html?s=64a4c235-7fbb-412f-9c2a-5b0892211d70",
+  "thumb": "totalsegmentator.png",
+  "desc": "A whole-body TotalSegmentator run (v1.5.6) on a National Lung Screening Trial chest CT, straight from the Imaging Data Commons \u2014 75 structures rendered as ONE unified colorized signed-distance-field surface: every rib and vertebra its own crisp colored mesh, plus lungs, heart, liver and vessels, composited inside the CT volume render. The WebGPU successor to the legacy vtk.js TotalSegmentator viewer: a single field for all 75 segments (no per-surface slowdown), JFA-SDF + settle-refinement for surface-model geometry with pre-blended colour seams.",
+  "wip": true,
+  "legacy": null
+ },
+ {
   "name": "WebGPU real scene \u2014 MRHead (MPR + 3D VR)",
   "page": "webgpu/real.html",
   "thumb": "real-mrhead.png",
