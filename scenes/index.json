@@ -7,6 +7,14 @@
   "wip": true
  },
  {
+  "name": "SlicerLive \u2014 Live Segmentation Algorithms",
+  "page": "webgpu/algorithms.html",
+  "thumb": "algorithms.png",
+  "desc": "A WebGPU-native segment editor experiment: paint brush strokes and drop spheres, each a new coloured label, rendered as one crisp surface-model-style mesh. The pipeline is a GPU jump-flood signed-distance field (labelmap \u2192 colorized SDF) with a settle-refinement (near-exact Voronoi + pre-blended colour seams) \u2014 so a static segmentation renders smooth and cheap while orbiting, and neighbouring labels meet with a clean colour boundary. Paint is driven entirely by the mrson SegEdit op stream (no editing UI), interpolating pointer samples into continuous strokes in real time. Toggle SDF vs Gaussian render paths.",
+  "wip": true,
+  "legacy": null
+ },
+ {
   "name": "WebGPU real scene \u2014 MRHead (MPR + 3D VR)",
   "page": "webgpu/real.html",
   "thumb": "real-mrhead.png",
