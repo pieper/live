@@ -2167,7 +2167,7 @@ var JfaSdfBaker = class {
     const [dx, dy, dz] = dims;
     const mk = (fmt, extra = 0) => dev.createTexture({ size: dims, dimension: "3d", format: fmt, usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING | extra });
     this.seed = [mk("rgba32float"), mk("rgba32float")];
-    this.sdfTex = mk("rgba16float", GPUTextureUsage.COPY_DST);
+    this.sdfTex = mk("rgba16float", GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC);
     this.attrTex = mk("rgba16float", GPUTextureUsage.COPY_DST);
     this.attrScratch = mk("rgba16float", GPUTextureUsage.COPY_SRC);
     this.sdfScratch = mk("rgba16float", GPUTextureUsage.COPY_SRC);
@@ -2227,6 +2227,31 @@ var JfaSdfBaker = class {
   /** The resident per-segment attribute texture (rgba16float; .r = opacity). Identity stable. */
   attrTexture() {
     return this.attrTex;
+  }
+  /** Read back the per-voxel signed distance (sdfTex .a, mm) to CPU. For accuracy comparison/tests. */
+  async readDistance() {
+    const [dx, dy, dz] = this.dims;
+    const bpr = Math.ceil(dx * 8 / 256) * 256;
+    const rowU16 = bpr / 2;
+    const buf = this.dev.createBuffer({ size: bpr * dy * dz, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const enc = this.dev.createCommandEncoder();
+    enc.copyTextureToBuffer({ texture: this.sdfTex }, { buffer: buf, bytesPerRow: bpr, rowsPerImage: dy }, [dx, dy, dz]);
+    this.dev.queue.submit([enc.finish()]);
+    await buf.mapAsync(GPUMapMode.READ);
+    const u16 = new Uint16Array(buf.getMappedRange());
+    const h2f = (h) => {
+      const s = h & 32768 ? -1 : 1, e = (h & 31744) >> 10, f = h & 1023;
+      if (e === 0) return s * Math.pow(2, -14) * (f / 1024);
+      if (e === 31) return f ? NaN : s * Infinity;
+      return s * Math.pow(2, e - 15) * (1 + f / 1024);
+    };
+    const out = new Float32Array(dx * dy * dz);
+    for (let z = 0; z < dz; z++) for (let y = 0; y < dy; y++) for (let x = 0; x < dx; x++) {
+      out[(z * dy + y) * dx + x] = h2f(u16[(z * dy + y) * rowU16 + x * 4 + 3]);
+    }
+    buf.unmap();
+    buf.destroy();
+    return out;
   }
   /** Set the label→colour palette (256 × rgba f32: rgb = colour, a = opacity). Call before bake(). */
   setPalette(palette) {
@@ -2469,9 +2494,8 @@ fn attr_seg${s}(wp : vec3<f32>) -> vec2<f32> {   // per-segment (.x = opacity, .
 fn surface_seg${s}(wp : vec3<f32>, rd : vec3<f32>, sdf : f32, band : f32, step : f32, seg_op : f32, op0 : f32) -> vec4<f32> {
   let d_mm = abs(sdf);
   if (d_mm > band + step) { return vec4<f32>(0.0); }
-  let a = 1.0 - clamp(d_mm / band, 0.0, 1.0);
-  if (a <= 0.0) { return vec4<f32>(0.0); }
-  let op = clamp(a * op0 * seg_op, 0.0, 1.0);
+  let T = clamp(op0 * seg_op, 0.0, 1.0);      // TARGET surface opacity (per-segment \xD7 field)
+  if (T <= 0.0) { return vec4<f32>(0.0); }
   let h = step;
   let g = vec3<f32>(
     v_seg${s}(wp + vec3<f32>(h,0,0)) - v_seg${s}(wp - vec3<f32>(h,0,0)),
@@ -2481,6 +2505,22 @@ fn surface_seg${s}(wp : vec3<f32>, rd : vec3<f32>, sdf : f32, band : f32, step :
   if (glen < 1e-5) { return vec4<f32>(0.0); }
   var n = g / glen;
   if (dot(n, -rd) < 0.0) { n = -n; }
+  // SURFACE opacity (Slicer polydata parity): the shell is a THIN surface of opacity T, not a solid
+  // band. A raymarch crosses it in several samples; giving each \u03B1=T lets the front-to-back OVER
+  // saturate toward opaque (50% looked like ~100%). Instead accumulate OPTICAL DEPTH with a shell
+  // profile \u03C1 = a/band that integrates to 1 across the crossing, scaled by -ln(1-T): \u03A3d\u03C4 = -ln(1-T),
+  // so net opacity = 1-e^(-\u03A3d\u03C4) = T EXACTLY \u2014 independent of band thickness and sample rate, and T\u21921
+  // stays crisply opaque. |dot(rd,n)| converts ray-step to shell-normal distance (\u21920 at grazing =
+  // built-in silhouette AA).
+  let a = max(1.0 - d_mm / band, 0.0);
+  if (a <= 0.0) { return vec4<f32>(0.0); }
+  // Convert ray-step to d_mm-distance with the RAW gradient projection |dot(rd,g)| = |d(d_mm)/ds|
+  // (includes |grad sdf|, which the distance blur pulls below 1) so \u03A3(a/band)\xB7\u0394d_mm = \u222B(a/band)dd = 1
+  // exactly. \u21920 at grazing = built-in silhouette AA.
+  let rate = max(abs(dot(rd, g)), 1e-3);
+  let tau = -log(1.0 - min(T, 0.9999)) * (a / band) * (step * rate);
+  let op = 1.0 - exp(-tau);
+  if (op <= 0.0004) { return vec4<f32>(0.0); }
   let ka = u_material.seg${s}_shade.x; let kd = u_material.seg${s}_shade.y;
   let ks = u_material.seg${s}_shade.z; let sh = u_material.seg${s}_shade.w;
   let ldn = max(dot(-rd, n), 0.0);

@@ -1801,9 +1801,8 @@ fn attr_seg${s}(wp : vec3<f32>) -> vec2<f32> {   // per-segment (.x = opacity, .
 fn surface_seg${s}(wp : vec3<f32>, rd : vec3<f32>, sdf : f32, band : f32, step : f32, seg_op : f32, op0 : f32) -> vec4<f32> {
   let d_mm = abs(sdf);
   if (d_mm > band + step) { return vec4<f32>(0.0); }
-  let a = 1.0 - clamp(d_mm / band, 0.0, 1.0);
-  if (a <= 0.0) { return vec4<f32>(0.0); }
-  let op = clamp(a * op0 * seg_op, 0.0, 1.0);
+  let T = clamp(op0 * seg_op, 0.0, 1.0);      // TARGET surface opacity (per-segment \xD7 field)
+  if (T <= 0.0) { return vec4<f32>(0.0); }
   let h = step;
   let g = vec3<f32>(
     v_seg${s}(wp + vec3<f32>(h,0,0)) - v_seg${s}(wp - vec3<f32>(h,0,0)),
@@ -1813,6 +1812,22 @@ fn surface_seg${s}(wp : vec3<f32>, rd : vec3<f32>, sdf : f32, band : f32, step :
   if (glen < 1e-5) { return vec4<f32>(0.0); }
   var n = g / glen;
   if (dot(n, -rd) < 0.0) { n = -n; }
+  // SURFACE opacity (Slicer polydata parity): the shell is a THIN surface of opacity T, not a solid
+  // band. A raymarch crosses it in several samples; giving each \u03B1=T lets the front-to-back OVER
+  // saturate toward opaque (50% looked like ~100%). Instead accumulate OPTICAL DEPTH with a shell
+  // profile \u03C1 = a/band that integrates to 1 across the crossing, scaled by -ln(1-T): \u03A3d\u03C4 = -ln(1-T),
+  // so net opacity = 1-e^(-\u03A3d\u03C4) = T EXACTLY \u2014 independent of band thickness and sample rate, and T\u21921
+  // stays crisply opaque. |dot(rd,n)| converts ray-step to shell-normal distance (\u21920 at grazing =
+  // built-in silhouette AA).
+  let a = max(1.0 - d_mm / band, 0.0);
+  if (a <= 0.0) { return vec4<f32>(0.0); }
+  // Convert ray-step to d_mm-distance with the RAW gradient projection |dot(rd,g)| = |d(d_mm)/ds|
+  // (includes |grad sdf|, which the distance blur pulls below 1) so \u03A3(a/band)\xB7\u0394d_mm = \u222B(a/band)dd = 1
+  // exactly. \u21920 at grazing = built-in silhouette AA.
+  let rate = max(abs(dot(rd, g)), 1e-3);
+  let tau = -log(1.0 - min(T, 0.9999)) * (a / band) * (step * rate);
+  let op = 1.0 - exp(-tau);
+  if (op <= 0.0004) { return vec4<f32>(0.0); }
   let ka = u_material.seg${s}_shade.x; let kd = u_material.seg${s}_shade.y;
   let ks = u_material.seg${s}_shade.z; let sh = u_material.seg${s}_shade.w;
   let ldn = max(dot(-rd, n), 0.0);
@@ -2833,7 +2848,7 @@ var JfaSdfBaker = class {
     const [dx, dy, dz] = dims;
     const mk = (fmt, extra = 0) => dev.createTexture({ size: dims, dimension: "3d", format: fmt, usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING | extra });
     this.seed = [mk("rgba32float"), mk("rgba32float")];
-    this.sdfTex = mk("rgba16float", GPUTextureUsage.COPY_DST);
+    this.sdfTex = mk("rgba16float", GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC);
     this.attrTex = mk("rgba16float", GPUTextureUsage.COPY_DST);
     this.attrScratch = mk("rgba16float", GPUTextureUsage.COPY_SRC);
     this.sdfScratch = mk("rgba16float", GPUTextureUsage.COPY_SRC);
@@ -2893,6 +2908,31 @@ var JfaSdfBaker = class {
   /** The resident per-segment attribute texture (rgba16float; .r = opacity). Identity stable. */
   attrTexture() {
     return this.attrTex;
+  }
+  /** Read back the per-voxel signed distance (sdfTex .a, mm) to CPU. For accuracy comparison/tests. */
+  async readDistance() {
+    const [dx, dy, dz] = this.dims;
+    const bpr = Math.ceil(dx * 8 / 256) * 256;
+    const rowU16 = bpr / 2;
+    const buf = this.dev.createBuffer({ size: bpr * dy * dz, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const enc = this.dev.createCommandEncoder();
+    enc.copyTextureToBuffer({ texture: this.sdfTex }, { buffer: buf, bytesPerRow: bpr, rowsPerImage: dy }, [dx, dy, dz]);
+    this.dev.queue.submit([enc.finish()]);
+    await buf.mapAsync(GPUMapMode.READ);
+    const u16 = new Uint16Array(buf.getMappedRange());
+    const h2f = (h) => {
+      const s = h & 32768 ? -1 : 1, e = (h & 31744) >> 10, f = h & 1023;
+      if (e === 0) return s * Math.pow(2, -14) * (f / 1024);
+      if (e === 31) return f ? NaN : s * Infinity;
+      return s * Math.pow(2, e - 15) * (1 + f / 1024);
+    };
+    const out = new Float32Array(dx * dy * dz);
+    for (let z = 0; z < dz; z++) for (let y = 0; y < dy; y++) for (let x = 0; x < dx; x++) {
+      out[(z * dy + y) * dx + x] = h2f(u16[(z * dy + y) * rowU16 + x * 4 + 3]);
+    }
+    buf.unmap();
+    buf.destroy();
+    return out;
   }
   /** Set the label→colour palette (256 × rgba f32: rgb = colour, a = opacity). Call before bake(). */
   setPalette(palette) {
@@ -3253,10 +3293,11 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
       segments.push({ num, name: seg.names[num] ?? `Segment ${num}`, color: [r, g, b], voxels: n });
     }
   }
-  const hidden = /* @__PURE__ */ new Set();
+  const segOpacity = /* @__PURE__ */ new Map();
+  const opacityOf = (num) => segOpacity.get(num) ?? 1;
   const visPalette = () => {
     const p = palette.slice();
-    for (const n of hidden) if (n < 256) p[n * 4 + 3] = 0;
+    for (const s of segments) if (s.num < 256) p[s.num * 4 + 3] = opacityOf(s.num);
     return p;
   };
   let colorTex = seg ? bakeColorizeRGBA(dev, seg.lab, dims, visPalette(), 1.5) : void 0;
@@ -3269,7 +3310,7 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
     segLogic = new SegmentationLogic(dev, editable, { renderMode: "sdf", opacity: 1, refineDelayMs: opts.refineDelayMs });
     for (const s of segments) {
       segLogic.setLabelColor(s.num, s.color);
-      segLogic.setLabelOpacity(s.num, hidden.has(s.num) ? 0 : 1);
+      segLogic.setLabelOpacity(s.num, opacityOf(s.num));
     }
     editable.loadLabelmap(cap.lab);
     segLogic.refineNow();
@@ -3301,7 +3342,6 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
     const old = colorTex;
     colorTex = nt;
     slice.setTextures(volumeField.volumeTexture(), colorTex);
-    colorizedField?.setTexture(colorTex, false);
     old?.destroy();
   };
   const slice = new SliceRenderer(gpu, format);
@@ -3331,14 +3371,19 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
       showSeg = ss;
       rebuild();
     },
-    setSegmentVisible(num, visible) {
-      if (visible) hidden.delete(num);
-      else hidden.add(num);
+    setSegmentOpacity(num, opacity) {
+      const o = Math.max(0, Math.min(1, opacity));
+      if (o >= 1) segOpacity.delete(num);
+      else segOpacity.set(num, o);
       rebakeColorized();
-      segLogic?.setLabelOpacity(num, visible ? 1 : 0);
+      segLogic?.setLabelOpacity(num, o);
       segLogic?.refineNow();
     },
-    isSegmentVisible: (num) => !hidden.has(num),
+    segmentOpacity: (num) => opacityOf(num),
+    setSegmentVisible(num, visible) {
+      this.setSegmentOpacity(num, visible ? 1 : 0);
+    },
+    isSegmentVisible: (num) => opacityOf(num) > 0,
     setRoiEnabled(on) {
       roiEnabled = on;
       rebuild();
@@ -4421,6 +4466,12 @@ function installChrome(opts) {
     sw.innerHTML = `<span style="position:absolute;top:2px;left:${on ? 17 : 2}px;width:15px;height:15px;border-radius:50%;background:#fff;transition:left 120ms;box-shadow:0 1px 3px rgba(0,0,0,.4)"></span>`;
   };
   const afterPaint = (fn) => requestAnimationFrame(() => requestAnimationFrame(fn));
+  const paintTri = (box, level, color) => {
+    const pct = Math.round(level * 100);
+    const c = `rgb(${Math.round(color[0] * 255)},${Math.round(color[1] * 255)},${Math.round(color[2] * 255)})`;
+    box.style.opacity = level === 0 ? "0.75" : "1";
+    box.innerHTML = `<span style="position:absolute;left:0;top:0;bottom:0;width:${pct}%;background:${c};opacity:.9"></span><span style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font:700 10px -apple-system,system-ui,sans-serif;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,.75)">${pct}%</span>`;
+  };
   const rows = [];
   if (controls.length) {
     const head = document.createElement("div");
@@ -4476,21 +4527,22 @@ function installChrome(opts) {
       lab.style.cssText = "font:500 12.5px -apple-system,system-ui,sans-serif;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
       left.appendChild(swatch);
       left.appendChild(lab);
-      const sw = document.createElement("span");
-      sw.style.cssText = "width:34px;height:19px;border-radius:999px;position:relative;transition:background 120ms;flex:0 0 auto;";
+      const box = document.createElement("span");
+      box.title = "Opacity: click to cycle 100% \u2192 50% \u2192 off";
+      box.style.cssText = "width:40px;height:18px;border-radius:6px;position:relative;overflow:hidden;flex:0 0 auto;background:rgba(255,255,255,.14);box-shadow:inset 0 0 0 1px rgba(255,255,255,.18);";
       row.appendChild(left);
-      row.appendChild(sw);
+      row.appendChild(box);
       row.onclick = () => {
         if (S.enabled && !S.enabled()) return;
-        const next = !S.get(s.num);
-        paintSw(sw, next);
+        const next = { 1: 0.5, 0.5: 0, 0: 1 }[S.get(s.num)] ?? 1;
+        paintTri(box, next, s.color);
         afterPaint(() => {
-          S.set(s.num, next);
+          S.cycle(s.num);
           refresh();
         });
       };
       wrap.appendChild(row);
-      segRows.push({ num: s.num, sw });
+      segRows.push({ num: s.num, box, color: s.color });
     }
     segHost.appendChild(wrap);
     paintSegments();
@@ -4500,7 +4552,7 @@ function installChrome(opts) {
     if (!S) return;
     const dis = S.enabled ? !S.enabled() : false;
     segHost.style.opacity = dis ? "0.4" : "1";
-    for (const { num, sw } of segRows) paintSw(sw, S.get(num));
+    for (const { num, box, color } of segRows) paintTri(box, S.get(num), color);
   }
   if (opts.about !== false) {
     const about = document.createElement("div");
@@ -4968,9 +5020,10 @@ async function main() {
     anchor: cv.threeD.parentElement ?? void 0,
     segments: {
       list: () => (rs?.segments ?? []).map((s) => ({ num: s.num, name: s.name, color: s.color })),
-      get: (num) => rs?.isSegmentVisible(num) ?? true,
-      set: (num, on) => {
-        rs?.setSegmentVisible(num, on);
+      get: (num) => rs?.segmentOpacity(num) ?? 1,
+      cycle: (num) => {
+        const next = { 1: 0.5, 0.5: 0, 0: 1 }[rs?.segmentOpacity(num) ?? 1] ?? 1;
+        rs?.setSegmentOpacity(num, next);
         redrawSlices();
         draw3d();
         xhair?.redraw();
@@ -5132,6 +5185,12 @@ async function main() {
     segVis: (num) => rs?.isSegmentVisible(num) ?? null,
     setSegVis: (num, on) => {
       rs?.setSegmentVisible(num, on);
+      for (const p of planes) drawSlice(p);
+      draw3d();
+    },
+    segOpacity: (num) => rs?.segmentOpacity(num) ?? null,
+    setSegOpacity: (num, o) => {
+      rs?.setSegmentOpacity(num, o);
       for (const p of planes) drawSlice(p);
       draw3d();
     },
