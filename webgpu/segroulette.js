@@ -1745,6 +1745,11 @@ var SegmentField = class {
     this.attrTex = this.mode === "sdf" ? opts.attrTexture : void 0;
     this.bindingCount = this.attrTex ? 2 : 1;
   }
+  /** Field-level opacity (multiplies every segment's per-label opacity in the shader). Live global
+   *  segmentation opacity — the caller does scene.syncUniforms() + redraw to apply. */
+  setOpacity(o) {
+    this.opacity = Math.max(0, Math.min(1, o));
+  }
   uniformFloats() {
     return 28;
   }
@@ -3360,6 +3365,12 @@ var SegmentationLogic = class {
     }
     return this.segField;
   }
+  /** Live GLOBAL segmentation opacity (0..1) — the field-level multiplier over every segment's own
+   *  opacity. Caller does scene.syncUniforms() + redraw. */
+  setGlobalOpacity(o) {
+    this.opacity = o;
+    this.segField?.setOpacity(o);
+  }
   /** Notified after every edit (post-rebake) so the app can redraw. */
   onRedraw(cb) {
     this.redrawCbs.push(cb);
@@ -3404,7 +3415,13 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
   const dims = ct.dims;
   const data = ct.vol instanceof Float32Array ? ct.vol : Float32Array.from(ct.vol);
   const clim = [ct.lev - ct.win / 2, ct.lev + ct.win / 2];
-  const volumeField = new ImageField(dev, data, dims, [1, 1, 1], modalityLUT(ct.modality), {
+  const baseVolLut = modalityLUT(ct.modality);
+  const scaledVolLut = (o) => {
+    const l = baseVolLut.slice();
+    for (let i = 0; i < 256; i++) l[i * 4 + 3] = Math.round(l[i * 4 + 3] * o);
+    return l;
+  };
+  const volumeField = new ImageField(dev, data, dims, [1, 1, 1], baseVolLut, {
     clim,
     ijkToRAS: ct.ijkToRAS,
     shade: [0.25, 0.7, 0.45, 20]
@@ -3456,6 +3473,7 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
   const scene = new SceneRenderer(gpu, format);
   const [rasLo, rasHi] = volumeField.aabb();
   const roi = createRoiWidget(rasLo, rasHi, { coverage: 0.35 });
+  let volumeOpacity = 1, segLayerOpacity = 1;
   let showVolume = true, showSeg = hasSeg;
   let roiEnabled = false, roiVisible = false;
   const currentSegFields = () => segLogic ? [segLogic.field()] : [];
@@ -3503,10 +3521,26 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
     hasSeg,
     roi,
     setLayers(sv, ss) {
-      showVolume = sv;
-      showSeg = ss;
-      rebuild();
+      this.setVolumeOpacity(sv ? 1 : 0);
+      this.setSegOpacity(ss ? 1 : 0);
     },
+    setVolumeOpacity(o) {
+      volumeOpacity = Math.max(0, Math.min(1, o));
+      const was = showVolume;
+      showVolume = volumeOpacity > 1e-3;
+      volumeField.setLUT(scaledVolLut(volumeOpacity));
+      if (was !== showVolume) rebuild();
+    },
+    volumeOpacity: () => volumeOpacity,
+    setSegOpacity(o) {
+      segLayerOpacity = Math.max(0, Math.min(1, o));
+      const was = showSeg;
+      showSeg = hasSeg && segLayerOpacity > 1e-3;
+      segLogic?.setGlobalOpacity(segLayerOpacity);
+      if (was !== showSeg) rebuild();
+      else scene.syncUniforms();
+    },
+    segOpacity: () => segLayerOpacity,
     setSegmentOpacity(num, opacity) {
       const o = Math.max(0, Math.min(1, opacity));
       if (o >= 1) segOpacity.delete(num);
@@ -4612,9 +4646,56 @@ function installChrome(opts) {
   const paintTri = (box, level, color) => {
     const pct = Math.round(level * 100);
     const c = `rgb(${Math.round(color[0] * 255)},${Math.round(color[1] * 255)},${Math.round(color[2] * 255)})`;
-    box.style.opacity = level === 0 ? "0.75" : "1";
+    box.style.opacity = level < 0.02 ? "0.75" : "1";
     box.innerHTML = `<span style="position:absolute;left:0;top:0;bottom:0;width:${pct}%;background:${c};opacity:.9"></span><span style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font:700 10px -apple-system,system-ui,sans-serif;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,.75)">${pct}%</span>`;
   };
+  const triNext = (v) => v > 0.66 ? 0.5 : v > 0.04 ? 0 : 1;
+  const attachOpacity = (box, get, set, color, onChange) => {
+    box.style.cursor = "ew-resize";
+    box.title = "Click: 100% \u2192 50% \u2192 off \xB7 Drag sideways for a live opacity slider";
+    const paint = () => paintTri(box, get(), color);
+    paint();
+    let startX = 0, startV = 0, dragged = false, id = -1;
+    box.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      startX = e.clientX;
+      startV = get();
+      dragged = false;
+      id = e.pointerId;
+      try {
+        box.setPointerCapture(id);
+      } catch {
+      }
+    });
+    box.addEventListener("pointermove", (e) => {
+      if (id < 0) return;
+      const dx = e.clientX - startX;
+      if (Math.abs(dx) > 3) dragged = true;
+      if (dragged) {
+        set(Math.max(0, Math.min(1, startV + dx / 130)));
+        paint();
+        onChange();
+      }
+    });
+    const end = () => {
+      if (id < 0) return;
+      if (!dragged) {
+        set(triNext(get()));
+        paint();
+        onChange();
+      }
+      try {
+        box.releasePointerCapture(id);
+      } catch {
+      }
+      id = -1;
+    };
+    box.addEventListener("pointerup", end);
+    box.addEventListener("pointercancel", end);
+    return paint;
+  };
+  const OPBOX_CSS = "width:44px;height:18px;border-radius:6px;position:relative;overflow:hidden;flex:0 0 auto;background:rgba(255,255,255,.14);box-shadow:inset 0 0 0 1px rgba(255,255,255,.18);touch-action:none;";
   const rows = [];
   if (controls.length) {
     const head = document.createElement("div");
@@ -4623,25 +4704,34 @@ function installChrome(opts) {
     pop.appendChild(head);
     for (const c of controls) {
       const row = document.createElement("div");
-      row.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:14px;padding:5px 0;cursor:pointer;";
+      row.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:14px;padding:5px 0;";
       const lab = document.createElement("span");
       lab.textContent = c.label;
-      const sw = document.createElement("span");
-      sw.style.cssText = "width:34px;height:19px;border-radius:999px;position:relative;transition:background 120ms;flex:0 0 auto;";
       row.appendChild(lab);
-      row.appendChild(sw);
-      row.onclick = () => {
-        if (c.disabled?.()) return;
-        const next = !c.get();
-        paintSw(sw, next);
-        afterPaint(() => {
-          c.set(next);
-          opts.onChange?.();
-          refresh();
-        });
-      };
+      if (c.getOpacity && c.setOpacity) {
+        const box = document.createElement("span");
+        box.style.cssText = OPBOX_CSS;
+        row.appendChild(box);
+        const paint = attachOpacity(box, c.getOpacity, (o) => c.setOpacity(o), c.color ?? [0.62, 0.9, 1], () => opts.onChange?.());
+        rows.push({ c, row, repaint: paint });
+      } else {
+        row.style.cursor = "pointer";
+        const sw = document.createElement("span");
+        sw.style.cssText = "width:34px;height:19px;border-radius:999px;position:relative;transition:background 120ms;flex:0 0 auto;";
+        row.appendChild(sw);
+        row.onclick = () => {
+          if (c.disabled?.()) return;
+          const next = !c.get();
+          paintSw(sw, next);
+          afterPaint(() => {
+            c.set(next);
+            opts.onChange?.();
+            refresh();
+          });
+        };
+        rows.push({ c, row, sw });
+      }
       pop.appendChild(row);
-      rows.push({ c, row, sw });
     }
   } else if (opts.about === false && !opts.segments) {
     pop.textContent = "SlicerLive \u2014 WebGPU renderer";
@@ -4660,7 +4750,7 @@ function installChrome(opts) {
     wrap.style.cssText = "margin-top:6px;border-top:1px solid rgba(255,255,255,.12);padding-top:6px;" + (list.length > 6 ? "max-height:210px;overflow-y:auto;" : "");
     for (const s of list) {
       const row = document.createElement("div");
-      row.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:12px;padding:4px 2px;cursor:pointer;";
+      row.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:12px;padding:4px 2px;";
       const left = document.createElement("span");
       left.style.cssText = "display:flex;align-items:center;gap:8px;min-width:0;";
       const swatch = document.createElement("span");
@@ -4671,21 +4761,14 @@ function installChrome(opts) {
       left.appendChild(swatch);
       left.appendChild(lab);
       const box = document.createElement("span");
-      box.title = "Opacity: click to cycle 100% \u2192 50% \u2192 off";
-      box.style.cssText = "width:40px;height:18px;border-radius:6px;position:relative;overflow:hidden;flex:0 0 auto;background:rgba(255,255,255,.14);box-shadow:inset 0 0 0 1px rgba(255,255,255,.18);";
+      box.style.cssText = OPBOX_CSS;
       row.appendChild(left);
       row.appendChild(box);
-      row.onclick = () => {
-        if (S.enabled && !S.enabled()) return;
-        const next = { 1: 0.5, 0.5: 0, 0: 1 }[S.get(s.num)] ?? 1;
-        paintTri(box, next, s.color);
-        afterPaint(() => {
-          S.cycle(s.num);
-          refresh();
-        });
-      };
+      const paint = attachOpacity(box, () => S.get(s.num), (o) => {
+        if (!(S.enabled && !S.enabled())) S.set(s.num, o);
+      }, s.color, () => opts.onChange?.());
       wrap.appendChild(row);
-      segRows.push({ num: s.num, box, color: s.color });
+      segRows.push({ num: s.num, box, color: s.color, paint });
     }
     segHost.appendChild(wrap);
     paintSegments();
@@ -4695,7 +4778,7 @@ function installChrome(opts) {
     if (!S) return;
     const dis = S.enabled ? !S.enabled() : false;
     segHost.style.opacity = dis ? "0.4" : "1";
-    for (const { num, box, color } of segRows) paintTri(box, S.get(num), color);
+    for (const r of segRows) r.paint();
   }
   if (opts.about !== false) {
     const about = document.createElement("div");
@@ -4716,9 +4799,14 @@ function installChrome(opts) {
     pop.appendChild(about);
   }
   function refresh() {
-    for (const { c, row, sw } of rows) {
-      const on = c.get(), dis = c.disabled?.() ?? false;
+    for (const { c, row, sw, repaint } of rows) {
+      const dis = c.disabled?.() ?? false;
       row.style.opacity = dis ? "0.4" : "1";
+      if (repaint) {
+        repaint();
+        continue;
+      }
+      const on = c.get();
       row.style.cursor = dis ? "default" : "pointer";
       sw.style.background = on ? "linear-gradient(180deg,#9fe9ff,#54c6f0)" : "rgba(255,255,255,.18)";
       sw.innerHTML = `<span style="position:absolute;top:2px;left:${on ? 17 : 2}px;width:15px;height:15px;border-radius:50%;background:#fff;transition:left 120ms;box-shadow:0 1px 3px rgba(0,0,0,.4)"></span>`;
@@ -5111,14 +5199,8 @@ async function main() {
   globalThis.addEventListener("resize", resize);
   const grid = attachViewGrid(document.getElementById("grid"), names, resize);
   attachDoubleClick(cv.threeD, () => grid.toggleMax("threeD"));
-  const layers = { volume: true, seg: true };
   let sliceOutline = false;
   let roiEnabled = false, roiVisible = false, roiFirstEnable = true;
-  const applyLayers = () => {
-    rs?.setLayers(layers.volume, layers.seg);
-    draw3d();
-    xhair?.redraw();
-  };
   const redrawSlices = () => {
     for (const p of planes) drawSlice(p);
     xhair?.redraw();
@@ -5130,14 +5212,18 @@ async function main() {
     xhair?.redraw();
   };
   const controls = [
-    { label: "Volume render", get: () => layers.volume, set: (on) => {
-      layers.volume = on;
-      applyLayers();
-    } },
-    { label: "Segmentation", get: () => layers.seg, set: (on) => {
-      layers.seg = on;
-      applyLayers();
-    }, disabled: () => !rs?.hasSeg },
+    // Volume render + Segmentation are unified opacity controls (click = tri-state, drag = live slider),
+    // so a semi-transparent VR can be composited with the segmentation.
+    { label: "Volume render", getOpacity: () => rs?.volumeOpacity() ?? 1, setOpacity: (o) => {
+      rs?.setVolumeOpacity(o);
+      draw3d();
+      xhair?.redraw();
+    }, color: [0.75, 0.78, 0.85] },
+    { label: "Segmentation", getOpacity: () => rs?.segOpacity() ?? 1, setOpacity: (o) => {
+      rs?.setSegOpacity(o);
+      draw3d();
+      xhair?.redraw();
+    }, disabled: () => !rs?.hasSeg, color: [0.62, 0.9, 1] },
     { label: "Slice outline", get: () => sliceOutline, set: (on) => {
       sliceOutline = on;
       rs?.slice.setOverlayOutline(on);
@@ -5150,7 +5236,7 @@ async function main() {
         roiFirstEnable = false;
       }
       applyRoi();
-    }, disabled: () => !layers.volume },
+    }, disabled: () => (rs?.volumeOpacity() ?? 0) <= 0 },
     { label: "Show ROI box", get: () => roiVisible, set: (on) => {
       roiVisible = on;
       rs?.setRoiVisible(on);
@@ -5164,14 +5250,13 @@ async function main() {
     segments: {
       list: () => (rs?.segments ?? []).map((s) => ({ num: s.num, name: s.name, color: s.color })),
       get: (num) => rs?.segmentOpacity(num) ?? 1,
-      cycle: (num) => {
-        const next = { 1: 0.5, 0.5: 0, 0: 1 }[rs?.segmentOpacity(num) ?? 1] ?? 1;
-        rs?.setSegmentOpacity(num, next);
+      set: (num, o) => {
+        rs?.setSegmentOpacity(num, o);
         redrawSlices();
         draw3d();
         xhair?.redraw();
       },
-      enabled: () => !!rs?.hasSeg && (layers.seg || layers.volume)
+      enabled: () => !!rs?.hasSeg && ((rs?.segOpacity() ?? 0) > 0 || (rs?.volumeOpacity() ?? 0) > 0)
     }
   });
   const mosaic = createMosaic(document.querySelector("main"));
@@ -5222,8 +5307,6 @@ async function main() {
       camera.focalPoint = framed.focalPoint;
       camera.viewUp = framed.viewUp;
       camera.viewAngle = framed.viewAngle;
-      layers.volume = true;
-      layers.seg = rs.hasSeg;
       rs.slice.setOverlayOutline(sliceOutline);
       rs.setRoiEnabled(roiEnabled);
       rs.setRoiVisible(roiVisible);
