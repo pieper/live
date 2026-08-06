@@ -2622,6 +2622,27 @@ function createRoiWidget(lo, hi, opts = {}) {
 }
 
 // algorithms/geom.ts
+function labelmapHasInternalBoundary(lab, dims) {
+  const [nx, ny, nz] = dims;
+  const at = (x, y, z) => lab[(z * ny + y) * nx + x];
+  for (let z = 0; z < nz; z++) for (let y = 0; y < ny; y++) for (let x = 0; x < nx; x++) {
+    const v = at(x, y, z);
+    if (v === 0) continue;
+    if (x + 1 < nx) {
+      const n = at(x + 1, y, z);
+      if (n !== 0 && n !== v) return true;
+    }
+    if (y + 1 < ny) {
+      const n = at(x, y + 1, z);
+      if (n !== 0 && n !== v) return true;
+    }
+    if (z + 1 < nz) {
+      const n = at(x, y, z + 1);
+      if (n !== 0 && n !== v) return true;
+    }
+  }
+  return false;
+}
 function spacingFromIjkToRAS2(ijkToRAS) {
   const col = (c) => Math.hypot(ijkToRAS[c], ijkToRAS[4 + c], ijkToRAS[8 + c]);
   return [col(0), col(1), col(2)];
@@ -3411,7 +3432,8 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
   if (seg && segments.length > 0) {
     const cap = cappedLabelmap(seg.lab, dims, ct.ijkToRAS, opts.sdfMaxDim ?? SDF_MAX_DIM);
     editable = new EditableSegmentation(dev, cap.dims, { ijkToRAS: cap.ijkToRAS });
-    segLogic = new SegmentationLogic(dev, editable, { renderMode: "sdf", opacity: 1, refineDelayMs: opts.refineDelayMs });
+    const boundaryMode = labelmapHasInternalBoundary(cap.lab, cap.dims) ? "all" : "outer";
+    segLogic = new SegmentationLogic(dev, editable, { renderMode: "sdf", opacity: 1, boundaryMode, refineDelayMs: opts.refineDelayMs });
     for (const s of segments) {
       segLogic.setLabelColor(s.num, s.color);
       segLogic.setLabelOpacity(s.num, opacityOf(s.num));

@@ -1,107 +1,114 @@
 [
- {
-  "name": "nnLive \u2014 interactive segmentation (4-up)",
-  "page": "webgpu/nnlive.html",
-  "thumb": "nnlive.png",
-  "desc": "The payoff: a real CT in the SlicerLive 4-up where each click runs nnLive's FAITHFUL 192\u00b3 interactive segmentation (distilled nnInteractive: trunk encode + perclick decode, EDT-ball prompts, prev-mask feedback, auto-zoom) \u2192 mask \u2192 ColorizeVolume, live as a colored 3D volume + MPR overlay with a pushpin per click. Shift-click = background point. Coordinates correct end-to-end (RAS reslice + view\u2192RAS\u2192voxel). 188 MB weights stream from the public bucket.",
-  "wip": true
- },
- {
-  "name": "SlicerLive \u2014 Live Segmentation Algorithms",
-  "page": "webgpu/algorithms.html",
-  "thumb": "algorithms.png",
-  "desc": "A WebGPU-native segment editor experiment: paint brush strokes and drop spheres, each a new coloured label, rendered as one crisp surface-model-style mesh. The pipeline is a GPU jump-flood signed-distance field (labelmap \u2192 colorized SDF) with a settle-refinement (near-exact Voronoi + pre-blended colour seams) \u2014 so a static segmentation renders smooth and cheap while orbiting, and neighbouring labels meet with a clean colour boundary. Paint is driven entirely by the mrson SegEdit op stream (no editing UI), interpolating pointer samples into continuous strokes in real time. Toggle SDF vs Gaussian render paths.",
-  "wip": true,
-  "legacy": null
- },
- {
-  "name": "TotalSegmentator \u2014 75 structures (WebGPU)",
-  "page": "webgpu/segroulette.html?s=64a4c235-7fbb-412f-9c2a-5b0892211d70",
-  "thumb": "totalsegmentator.png",
-  "desc": "A whole-body TotalSegmentator run (v1.5.6) on a National Lung Screening Trial chest CT, straight from the Imaging Data Commons \u2014 75 structures rendered as ONE unified colorized signed-distance-field surface: every rib and vertebra its own crisp colored mesh, plus lungs, heart, liver and vessels, composited inside the CT volume render. The WebGPU successor to the legacy vtk.js TotalSegmentator viewer: a single field for all 75 segments (no per-surface slowdown), JFA-SDF + settle-refinement for surface-model geometry with pre-blended colour seams.",
-  "wip": true,
-  "legacy": null
- },
- {
-  "name": "WebGPU real scene \u2014 MRHead (MPR + 3D VR)",
-  "page": "webgpu/real.html",
-  "thumb": "real-mrhead.png",
-  "desc": "A REAL SlicerLive scene, live: the chunked OME-Zarr volume is streamed from the Jetstream2 bucket and gunzipped in your browser, then rendered by the TS/WebGPU backbone \u2014 3 orthogonal MPR planes + a 3D volume render using the scene's own transfer function and true rotated IJK\u2192RAS geometry. The direct replacement for the legacy vtk.js MRHead. Scroll a slice to scrub; drag 3D to orbit."
- },
- {
-  "name": "SlicerLive \u2014 SEGRoulette",
-  "page": "webgpu/segroulette.html",
-  "thumb": "segroulette.png",
-  "desc": "Spin a random segmentation out of 190k+ IDC DICOM SEGs (36 collections): the source CT/MR/PET and the DICOM SEG stream straight from the Imaging Data Commons buckets and are parsed in your browser (dcmjs), then rendered by the TS/WebGPU backbone \u2014 3 MPR planes (grayscale + colored overlay) + a 3D view where the WHOLE segmentation is one unified colorized signed-distance-field surface (GPU jump-flood SDF + settle-refinement): crisp surface-model geometry, per-segment colour + opacity, colour seams pre-blended where labels meet \u2014 any number of segments in a single field. Hit Spin for another case."
- },
- {
-  "name": "LiveStory (prototype) \u2014 narrated MR head",
-  "page": "webgpu/story.html?scene=../legacy/scenes/MRHead.json",
-  "thumb": "livestory.png",
-  "desc": "PROTOTYPE / placeholder. LiveStory (inspired by MinervaStory) turns a 3D Slicer scene into a narrated walkthrough \u2014 camera + slice views with captions and Wikipedia-style links on the left, the live SlicerLive WebGPU 4-up on the right; click a page to jump the view. Authored in Slicer via the LiveStory module and previewed straight from Slicer's own web server."
- },
- {
-  "name": "WebGPU: Landmark Deform (TPS)",
-  "page": "webgpu/deform.html",
-  "thumb": "deform.png",
-  "desc": "A port of the slicer-wgpu Landmark Deform selftest \u2014 a NONLINEAR thin-plate-spline transform applied during the ray march. DRAG a magenta target landmark to re-solve the spline and deform the volume live (GPU-local, no pipeline rebuild); the volume follows the pull. Cyan = source landmarks, magenta = draggable targets."
- },
- {
-  "name": "WebGPU: ROI Crop",
-  "page": "webgpu/roi.html",
-  "thumb": "roi.png",
-  "desc": "CTACardio cropped by an interactive ROI box. The box wireframe ray-marches in the SAME pass as the volume and drives the clip planes, so dragging a face/corner/centre handle re-crops the volume and moves the widget together \u2014 GPU-local, one uniform update, no pipeline rebuild. Grab-or-bubble: handles grab, empty space rotates the camera."
- },
- {
-  "name": "Selftest: Single Volume (CTACardio)",
-  "page": "webgpu/selftest-single.html",
-  "thumb": "selftest-single.png",
-  "desc": "SlicerWGPU Single Volume selftest, on the data it actually loads \u2014 CTACardio (512\u00d7512\u00d7321) streamed from the Jetstream2 bucket and ray-marched with the volume's own transfer function carried over from Slicer. Slicer-faithful camera bindings."
- },
- {
-  "name": "Selftest: Volume + Fiducials (CTACardio)",
-  "page": "webgpu/selftest-fiducials.html",
-  "thumb": "selftest-fiducials.png",
-  "desc": "SlicerWGPU Volume + Fiducials selftest \u2014 CTACardio with four markup lists of 25 control points, drawn as procedural SDF spheres composited inside the same ray-march so glyphs occlude and are occluded by anatomy."
- },
- {
-  "name": "Selftest: Multi-Volume (CTACardio + Panoramix)",
-  "page": "webgpu/selftest-multi.html",
-  "thumb": "selftest-multi.png",
-  "desc": "SlicerWGPU Multi-Volume selftest \u2014 CTACardio and CTAAbdomenPanoramix, each with its own transfer function, composited in one ray-march with Panoramix offset +200 mm along R exactly as the selftest places it."
- },
- {
-  "name": "Selftest: Segmentation (MRHead)",
-  "page": "webgpu/selftest-seg.html",
-  "thumb": "selftest-seg.png",
-  "desc": "SlicerWGPU Segmentation selftest \u2014 two segments thresholded straight out of MRHead intensities (Brain 40<v<120, High v>120), baked through ColorizeVolume and ray-marched: the native replacement for surface models."
- },
- {
-  "name": "TotalSegmentator-CT",
-  "page": "legacy/viewer.html?scene=scenes/TotalSegmentator-CT.json",
-  "thumb": "TotalSegmentator-CT.png",
-  "legacy": true,
-  "desc": "NLST chest CT with 73 TotalSegmentator organ & bone segmentations (IDC) \u2014 3D surfaces + colored MPR overlays"
- },
- {
-  "name": "IDC: TotalSegmentator",
-  "page": "legacy/viewer.html?ct=74eb30a8-27ff-442e-8a38-22b57c52cadd&seg=ff9a3d4f-c4e6-4403-9cd5-d7bc517dc488",
-  "thumb": "IDC-TotalSegmentator.png",
-  "legacy": true,
-  "desc": "Streamed LIVE from the NCI IDC AWS bucket + parsed in your browser with dcmjs \u2014 NLST chest CT + 73 TotalSegmentator organ/bone segments. No server, no pre-processing (~150 MB, give it a moment)."
- },
- {
-  "name": "MRHead",
-  "page": "legacy/viewer.html?scene=scenes/MRHead.json",
-  "thumb": "MRHead.png",
-  "legacy": true,
-  "desc": "MR head \u2014 volume rendering + 4-up (axial / sagittal / coronal)"
- },
- {
-  "name": "SEGRoulette (vtk.js)",
-  "page": "legacy/viewer.html?segroulette",
-  "thumb": "segroulette-legacy.png",
-  "legacy": true,
-  "desc": "The original vtk.js SEGRoulette \u2014 spin a random IDC DICOM SEG + its source series, loaded client-side and rendered with surface models + MPR overlays. Superseded by the WebGPU SlicerLive SEGRoulette above."
- }
+  {
+    "name": "nnLive — interactive segmentation (4-up)",
+    "page": "webgpu/nnlive.html",
+    "thumb": "nnlive.png",
+    "desc": "The payoff: a real CT in the SlicerLive 4-up where each click runs nnLive's FAITHFUL 192³ interactive segmentation (distilled nnInteractive: trunk encode + perclick decode, EDT-ball prompts, prev-mask feedback, auto-zoom) → mask → ColorizeVolume, live as a colored 3D volume + MPR overlay with a pushpin per click. Shift-click = background point. Coordinates correct end-to-end (RAS reslice + view→RAS→voxel). 188 MB weights stream from the public bucket.",
+    "wip": true
+  },
+  {
+    "name": "SlicerLive — Live Segmentation Algorithms",
+    "page": "webgpu/algorithms.html",
+    "thumb": "algorithms.png",
+    "desc": "A WebGPU-native segment editor experiment: paint brush strokes and drop spheres, each a new coloured label, rendered as one crisp surface-model-style mesh. The pipeline is a GPU jump-flood signed-distance field (labelmap → colorized SDF) with a settle-refinement (near-exact Voronoi + pre-blended colour seams) — so a static segmentation renders smooth and cheap while orbiting, and neighbouring labels meet with a clean colour boundary. Paint is driven entirely by the mrson SegEdit op stream (no editing UI), interpolating pointer samples into continuous strokes in real time. Toggle SDF vs Gaussian render paths.",
+    "wip": true,
+    "legacy": null
+  },
+  {
+    "name": "SlicerLive — Islands within islands (multi-material)",
+    "page": "webgpu/islands.html",
+    "thumb": "islands.png",
+    "desc": "A stress test for EMBEDDED / nested segmentations — tumors inside a liver, a necrotic core inside a tumor, touching cyst clusters, vessels threading an organ. Rendered through a single multi-material INTERFACE field: an unsigned distance to ANY label change, so every internal label↔label boundary surfaces (not just the outer segment↔background one) with its own colour and per-segment opacity — one field for arbitrarily nested layers, no per-segment SDF blow-up. Regenerate for new random scenarios; drop the Opacity slider to see the islands nested inside.",
+    "wip": true
+  },
+  {
+    "name": "TotalSegmentator — 75 structures (WebGPU)",
+    "page": "webgpu/segroulette.html?s=64a4c235-7fbb-412f-9c2a-5b0892211d70",
+    "thumb": "totalsegmentator.png",
+    "desc": "A whole-body TotalSegmentator run (v1.5.6) on a National Lung Screening Trial chest CT, straight from the Imaging Data Commons — 75 structures rendered as ONE unified colorized signed-distance-field surface: every rib and vertebra its own crisp colored mesh, plus lungs, heart, liver and vessels, composited inside the CT volume render. The WebGPU successor to the legacy vtk.js TotalSegmentator viewer: a single field for all 75 segments (no per-surface slowdown), JFA-SDF + settle-refinement for surface-model geometry with pre-blended colour seams.",
+    "wip": true,
+    "legacy": null
+  },
+  {
+    "name": "WebGPU real scene — MRHead (MPR + 3D VR)",
+    "page": "webgpu/real.html",
+    "thumb": "real-mrhead.png",
+    "desc": "A REAL SlicerLive scene, live: the chunked OME-Zarr volume is streamed from the Jetstream2 bucket and gunzipped in your browser, then rendered by the TS/WebGPU backbone — 3 orthogonal MPR planes + a 3D volume render using the scene's own transfer function and true rotated IJK→RAS geometry. The direct replacement for the legacy vtk.js MRHead. Scroll a slice to scrub; drag 3D to orbit."
+  },
+  {
+    "name": "SlicerLive — SEGRoulette",
+    "page": "webgpu/segroulette.html",
+    "thumb": "segroulette.png",
+    "desc": "Spin a random segmentation out of 190k+ IDC DICOM SEGs (36 collections): the source CT/MR/PET and the DICOM SEG stream straight from the Imaging Data Commons buckets and are parsed in your browser (dcmjs), then rendered by the TS/WebGPU backbone — 3 MPR planes (grayscale + colored overlay) + a 3D view where the WHOLE segmentation is one unified colorized signed-distance-field surface (GPU jump-flood SDF + settle-refinement): crisp surface-model geometry, per-segment colour + opacity, colour seams pre-blended where labels meet — any number of segments in a single field. Hit Spin for another case."
+  },
+  {
+    "name": "LiveStory (prototype) — narrated MR head",
+    "page": "webgpu/story.html?scene=../legacy/scenes/MRHead.json",
+    "thumb": "livestory.png",
+    "desc": "PROTOTYPE / placeholder. LiveStory (inspired by MinervaStory) turns a 3D Slicer scene into a narrated walkthrough — camera + slice views with captions and Wikipedia-style links on the left, the live SlicerLive WebGPU 4-up on the right; click a page to jump the view. Authored in Slicer via the LiveStory module and previewed straight from Slicer's own web server."
+  },
+  {
+    "name": "WebGPU: Landmark Deform (TPS)",
+    "page": "webgpu/deform.html",
+    "thumb": "deform.png",
+    "desc": "A port of the slicer-wgpu Landmark Deform selftest — a NONLINEAR thin-plate-spline transform applied during the ray march. DRAG a magenta target landmark to re-solve the spline and deform the volume live (GPU-local, no pipeline rebuild); the volume follows the pull. Cyan = source landmarks, magenta = draggable targets."
+  },
+  {
+    "name": "WebGPU: ROI Crop",
+    "page": "webgpu/roi.html",
+    "thumb": "roi.png",
+    "desc": "CTACardio cropped by an interactive ROI box. The box wireframe ray-marches in the SAME pass as the volume and drives the clip planes, so dragging a face/corner/centre handle re-crops the volume and moves the widget together — GPU-local, one uniform update, no pipeline rebuild. Grab-or-bubble: handles grab, empty space rotates the camera."
+  },
+  {
+    "name": "Selftest: Single Volume (CTACardio)",
+    "page": "webgpu/selftest-single.html",
+    "thumb": "selftest-single.png",
+    "desc": "SlicerWGPU Single Volume selftest, on the data it actually loads — CTACardio (512×512×321) streamed from the Jetstream2 bucket and ray-marched with the volume's own transfer function carried over from Slicer. Slicer-faithful camera bindings."
+  },
+  {
+    "name": "Selftest: Volume + Fiducials (CTACardio)",
+    "page": "webgpu/selftest-fiducials.html",
+    "thumb": "selftest-fiducials.png",
+    "desc": "SlicerWGPU Volume + Fiducials selftest — CTACardio with four markup lists of 25 control points, drawn as procedural SDF spheres composited inside the same ray-march so glyphs occlude and are occluded by anatomy."
+  },
+  {
+    "name": "Selftest: Multi-Volume (CTACardio + Panoramix)",
+    "page": "webgpu/selftest-multi.html",
+    "thumb": "selftest-multi.png",
+    "desc": "SlicerWGPU Multi-Volume selftest — CTACardio and CTAAbdomenPanoramix, each with its own transfer function, composited in one ray-march with Panoramix offset +200 mm along R exactly as the selftest places it."
+  },
+  {
+    "name": "Selftest: Segmentation (MRHead)",
+    "page": "webgpu/selftest-seg.html",
+    "thumb": "selftest-seg.png",
+    "desc": "SlicerWGPU Segmentation selftest — two segments thresholded straight out of MRHead intensities (Brain 40<v<120, High v>120), baked through ColorizeVolume and ray-marched: the native replacement for surface models."
+  },
+  {
+    "name": "TotalSegmentator-CT",
+    "page": "legacy/viewer.html?scene=scenes/TotalSegmentator-CT.json",
+    "thumb": "TotalSegmentator-CT.png",
+    "legacy": true,
+    "desc": "NLST chest CT with 73 TotalSegmentator organ & bone segmentations (IDC) — 3D surfaces + colored MPR overlays"
+  },
+  {
+    "name": "IDC: TotalSegmentator",
+    "page": "legacy/viewer.html?ct=74eb30a8-27ff-442e-8a38-22b57c52cadd&seg=ff9a3d4f-c4e6-4403-9cd5-d7bc517dc488",
+    "thumb": "IDC-TotalSegmentator.png",
+    "legacy": true,
+    "desc": "Streamed LIVE from the NCI IDC AWS bucket + parsed in your browser with dcmjs — NLST chest CT + 73 TotalSegmentator organ/bone segments. No server, no pre-processing (~150 MB, give it a moment)."
+  },
+  {
+    "name": "MRHead",
+    "page": "legacy/viewer.html?scene=scenes/MRHead.json",
+    "thumb": "MRHead.png",
+    "legacy": true,
+    "desc": "MR head — volume rendering + 4-up (axial / sagittal / coronal)"
+  },
+  {
+    "name": "SEGRoulette (vtk.js)",
+    "page": "legacy/viewer.html?segroulette",
+    "thumb": "segroulette-legacy.png",
+    "legacy": true,
+    "desc": "The original vtk.js SEGRoulette — spin a random IDC DICOM SEG + its source series, loaded client-side and rendered with surface models + MPR overlays. Superseded by the WebGPU SlicerLive SEGRoulette above."
+  }
 ]
