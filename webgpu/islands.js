@@ -1550,11 +1550,6 @@ ${pickDispatch}
 };
 
 // algorithms/geom.ts
-function transpose42(m) {
-  const o = new Float32Array(16);
-  for (let r = 0; r < 4; r++) for (let c = 0; c < 4; c++) o[c * 4 + r] = m[r * 4 + c];
-  return o;
-}
 function spacingFromIjkToRAS2(ijkToRAS) {
   const col = (c) => Math.hypot(ijkToRAS[c], ijkToRAS[4 + c], ijkToRAS[8 + c]);
   return [col(0), col(1), col(2)];
@@ -1632,191 +1627,6 @@ var EditableSegmentation = class {
   }
   destroy() {
     this.labelTex.destroy();
-  }
-};
-
-// algorithms/effects/paint.ts
-var PAINT_WGSL = (
-  /* wgsl */
-  `
-struct U {
-  ijkToRAS : mat4x4<f32>,   // column-major (transpose of the row-major host matrix)
-  dims     : vec4<u32>,
-  params   : vec4<f32>,     // x=radiusMm, y=id, z=mode(0 add/1 remove), w=pointCount
-};
-@group(0) @binding(0) var t_label : texture_storage_3d<r32uint, write>;
-@group(0) @binding(1) var<uniform> u : U;
-@group(0) @binding(2) var<storage, read> pts : array<vec4<f32>>;   // xyz = RAS sample points
-
-fn seg_dist(p : vec3<f32>, a : vec3<f32>, b : vec3<f32>) -> f32 {
-  let ab = b - a;
-  let denom = max(dot(ab, ab), 1e-8);
-  let t = clamp(dot(p - a, ab) / denom, 0.0, 1.0);
-  return length(p - (a + t * ab));
-}
-
-@compute @workgroup_size(4, 4, 4)
-fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  if (any(gid >= u.dims.xyz)) { return; }
-  let p = (u.ijkToRAS * vec4<f32>(vec3<f32>(gid), 1.0)).xyz;
-  let n = u32(u.params.w);
-  if (n == 0u) { return; }
-  var dmin = 1e30;
-  if (n == 1u) {
-    dmin = length(p - pts[0].xyz);
-  } else {
-    for (var i = 0u; i < n - 1u; i = i + 1u) {
-      dmin = min(dmin, seg_dist(p, pts[i].xyz, pts[i + 1u].xyz));
-    }
-  }
-  if (dmin <= u.params.x) {
-    let id = select(u32(u.params.y), 0u, u.params.z > 0.5);   // remove \u2192 0
-    textureStore(t_label, vec3<i32>(gid), vec4<u32>(id, 0u, 0u, 0u));
-  }
-}`
-);
-var PaintEffect = class {
-  constructor(seg) {
-    this.seg = seg;
-    const dev = seg.device;
-    this.dev = dev;
-    this.pipe = dev.createComputePipeline({ layout: "auto", compute: { module: dev.createShaderModule({ code: PAINT_WGSL }), entryPoint: "main" } });
-    this.uni = dev.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-  }
-  seg;
-  dev;
-  pipe;
-  uni;
-  ptsBuf;
-  ptsCap = 0;
-  /** Rasterize a stroke (RAS polyline + spherical brush) into the master, interpolating between
-   *  samples, then mark the segmentation dirty (one redraw). A single point = a sphere dab. */
-  stampStroke(points, opts) {
-    if (points.length === 0) return;
-    const dev = this.dev, dims = this.seg.dims;
-    const need = points.length * 4 * 4;
-    if (!this.ptsBuf || this.ptsCap < points.length) {
-      this.ptsBuf?.destroy();
-      this.ptsCap = Math.max(points.length, 64);
-      this.ptsBuf = dev.createBuffer({ size: this.ptsCap * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-    }
-    const pd = new Float32Array(points.length * 4);
-    for (let i = 0; i < points.length; i++) {
-      pd[i * 4] = points[i][0];
-      pd[i * 4 + 1] = points[i][1];
-      pd[i * 4 + 2] = points[i][2];
-    }
-    dev.queue.writeBuffer(this.ptsBuf, 0, pd, 0, points.length * 4);
-    const ab = new ArrayBuffer(96);
-    const f = new Float32Array(ab), uu = new Uint32Array(ab);
-    f.set(transpose42(this.seg.ijkToRAS), 0);
-    uu[16] = dims[0];
-    uu[17] = dims[1];
-    uu[18] = dims[2];
-    uu[19] = 0;
-    f[20] = opts.radiusMm;
-    f[21] = opts.id ?? 1;
-    f[22] = opts.mode === "remove" ? 1 : 0;
-    f[23] = points.length;
-    dev.queue.writeBuffer(this.uni, 0, ab);
-    const bind = dev.createBindGroup({ layout: this.pipe.getBindGroupLayout(0), entries: [
-      { binding: 0, resource: this.seg.masterTexture().createView() },
-      { binding: 1, resource: { buffer: this.uni } },
-      { binding: 2, resource: { buffer: this.ptsBuf, size: need } }
-    ] });
-    const [gx, gy, gz] = [Math.ceil(dims[0] / 4), Math.ceil(dims[1] / 4), Math.ceil(dims[2] / 4)];
-    const enc = dev.createCommandEncoder();
-    const p = enc.beginComputePass();
-    p.setPipeline(this.pipe);
-    p.setBindGroup(0, bind);
-    p.dispatchWorkgroups(gx, gy, gz);
-    p.end();
-    dev.queue.submit([enc.finish()]);
-    this.seg.markDirty();
-  }
-  /** Incremental segment: weld a capsule from `prev` to `next` (one pointer move). */
-  extend(prev, next, opts) {
-    this.stampStroke([prev, next], opts);
-  }
-  destroy() {
-    this.uni.destroy();
-    this.ptsBuf?.destroy();
-  }
-};
-
-// algorithms/seg-edit-driver.ts
-var SegEditDriver = class _SegEditDriver {
-  constructor(seg, opts = {}) {
-    this.seg = seg;
-    this.opts = opts;
-    this.paint = new PaintEffect(seg);
-  }
-  seg;
-  opts;
-  paint;
-  labels = /* @__PURE__ */ new Map();
-  // Slicer segment id → r32uint master label
-  nextLabel = 1;
-  active;
-  /** Normalize any of the three carriers → the bare SegEdit payload (or null). */
-  static unwrap(op) {
-    const o = op;
-    if (o && typeof o === "object") {
-      if (o.edit && typeof o.edit === "object") return o.edit;
-      if (o.cmd === "segEdit" && o.args && typeof o.args === "object") return o.args;
-      if (typeof o.kind === "string") return o;
-    }
-    return null;
-  }
-  labelFor(segmentId) {
-    if (!segmentId) return 1;
-    if (this.opts.labelForSegment) return this.opts.labelForSegment(segmentId);
-    let id = this.labels.get(segmentId);
-    if (id === void 0) {
-      id = this.nextLabel++;
-      this.labels.set(segmentId, id);
-    }
-    return id;
-  }
-  radiusFor(e) {
-    return (e.brush?.diameterMm ?? this.opts.defaultDiameterMm ?? 6) / 2;
-  }
-  modeFor(e) {
-    if (e.mode === "remove" || (e.effect ?? "").toLowerCase().startsWith("erase")) return "remove";
-    return "add";
-  }
-  strokeOpts(e) {
-    return { radiusMm: this.radiusFor(e), id: this.labelFor(e.segmentId), mode: this.modeFor(e) };
-  }
-  /** Apply one COMMITTED edit (all its points at once) — the replay path. */
-  applyEdit(op) {
-    const e = _SegEditDriver.unwrap(op);
-    if (!e) return;
-    if (e.kind !== "stroke") {
-      this.opts.onUnhandled?.(e.kind);
-      return;
-    }
-    const s = e;
-    if (!s.points?.length) return;
-    this.paint.stampStroke(s.points, this.strokeOpts(s));
-  }
-  // ── Incremental live path: begin / addPoint / end, as pointer samples arrive (real-time apply,
-  //    no wait for mouse-up). A stroke is a pointer-drag stream, exactly like a camera drag. ──
-  /** Start an incremental stroke; `meta` carries the same fields a full edit would (minus points). */
-  beginStroke(meta = {}) {
-    this.active = { opts: this.strokeOpts({ kind: "stroke", points: [], ...meta }), last: void 0 };
-  }
-  /** Add one sampled point — welds a capsule from the previous sample (first point = a dab). */
-  addPoint(p) {
-    if (!this.active) return;
-    this.paint.stampStroke(this.active.last ? [this.active.last, p] : [p], this.active.opts);
-    this.active.last = p;
-  }
-  endStroke() {
-    this.active = void 0;
-  }
-  destroy() {
-    this.paint.destroy();
   }
 };
 
@@ -2879,128 +2689,186 @@ var SegmentationLogic = class {
   }
 };
 
-// algorithms/demos/algorithms-scene.ts
-var LABEL_COLORS = [
+// algorithms/demos/islands-scene.ts
+var PALETTE = [
+  [0.85, 0.45, 0.35],
   [0.3, 0.85, 0.55],
   [0.35, 0.65, 0.95],
-  [0.95, 0.6, 0.3],
-  [0.9, 0.35, 0.45],
-  [0.7, 0.45, 0.95],
+  [0.95, 0.8, 0.35],
+  [0.9, 0.35, 0.55],
+  [0.55, 0.45, 0.95],
   [0.35, 0.85, 0.9],
-  [0.95, 0.85, 0.35],
-  [0.95, 0.5, 0.8],
-  [0.55, 0.8, 0.35],
-  [0.5, 0.55, 0.9],
-  [0.9, 0.7, 0.5],
-  [0.8, 0.8, 0.85]
+  [0.95, 0.6, 0.3],
+  [0.6, 0.8, 0.4],
+  [0.9, 0.55, 0.85],
+  [0.5, 0.6, 0.9],
+  [0.8, 0.82, 0.86]
 ];
-function buildAlgorithmsScene(gpu, format, opts = {}) {
-  const dims = [96, 96, 96];
-  const sp = 2;
-  const ijkToRAS = [sp, 0, 0, -96, 0, sp, 0, -96, 0, 0, sp, -96, 0, 0, 0, 1];
-  const seg = new EditableSegmentation(gpu.device, dims, { ijkToRAS });
-  const paint = new PaintEffect(seg);
-  const keyToId = /* @__PURE__ */ new Map();
-  const labelColors = [];
-  const labelLook = /* @__PURE__ */ new Map();
-  let nextId = 1;
-  const applyLook = (id) => {
-    const lk = labelLook.get(id);
-    logic.setLabelOpacity(id, lk.op);
-    logic.setLabelShading(id, lk.shading);
-  };
-  const allocId = (key) => {
-    let id = keyToId.get(key);
-    if (id !== void 0) return id;
-    id = nextId++;
-    const rgb = LABEL_COLORS[(id - 1) % LABEL_COLORS.length];
-    keyToId.set(key, id);
-    labelColors.push([id, rgb]);
-    labelLook.set(id, { op: 1, shading: "surface" });
-    logic.setLabelColor(id, rgb);
-    applyLook(id);
-    return id;
-  };
-  const scene = new SceneRenderer(gpu, format);
-  const redrawCbs = [];
-  let mode = "sdf";
-  let logic;
-  let allOpacity = 1;
-  const makeLogic = () => {
-    logic = new SegmentationLogic(gpu.device, seg, { renderMode: mode, opacity: 1, sigmaVoxels: 1, refineDelayMs: opts.refineDelayMs });
-    for (const [id, rgb] of labelColors) {
-      logic.setLabelColor(id, rgb);
-      applyLook(id);
-    }
-    logic.onRedraw(() => {
-      for (const cb of redrawCbs) cb();
-    });
-    scene.build([logic.field()]);
-    scene.setBackground(0.05, 0.06, 0.09);
-  };
-  makeLogic();
-  const driver = new SegEditDriver(seg, { labelForSegment: (segId) => allocId(segId) });
-  allocId("seed");
+function buildIslandsScene(gpu, format, opts = {}) {
+  const N = opts.dim ?? 112;
+  const dims = [N, N, N];
+  const sp = 1.6;
+  const ijkToRAS = [sp, 0, 0, -sp * N / 2, 0, sp, 0, -sp * N / 2, 0, 0, sp, -sp * N / 2, 0, 0, 0, 1];
   const [nx, ny, nz] = dims;
   const lab = new Uint8Array(nx * ny * nz);
-  const c = [48, 48, 48], rv = 15;
-  for (let z = 0; z < nz; z++) for (let y = 0; y < ny; y++) for (let x = 0; x < nx; x++) {
-    const dx = x - c[0], dy = y - c[1], dz = z - c[2];
-    if (dx * dx + dy * dy + dz * dz <= rv * rv) lab[(z * ny + y) * nx + x] = 1;
-  }
+  const put = (test, id) => {
+    for (let z = 0; z < nz; z++) for (let y = 0; y < ny; y++) for (let x = 0; x < nx; x++) {
+      if (test(x, y, z)) lab[(z * ny + y) * nx + x] = id;
+    }
+  };
+  const ball = (c, r, id) => put((x, y, z) => (x - c[0]) ** 2 + (y - c[1]) ** 2 + (z - c[2]) ** 2 <= r * r, id);
+  const ellipsoid = (c, rr, id) => put((x, y, z) => ((x - c[0]) / rr[0]) ** 2 + ((y - c[1]) / rr[1]) ** 2 + ((z - c[2]) / rr[2]) ** 2 <= 1, id);
+  const tube = (a, b, r, id) => {
+    const ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    const L2 = ab[0] ** 2 + ab[1] ** 2 + ab[2] ** 2 || 1;
+    put((x, y, z) => {
+      let t = ((x - a[0]) * ab[0] + (y - a[1]) * ab[1] + (z - a[2]) * ab[2]) / L2;
+      t = Math.max(0, Math.min(1, t));
+      const px = a[0] + t * ab[0], py = a[1] + t * ab[1], pz = a[2] + t * ab[2];
+      return (x - px) ** 2 + (y - py) ** 2 + (z - pz) ** 2 <= r * r;
+    }, id);
+  };
+  const R = (a, b) => a + Math.random() * (b - a);
+  const jitter = (c, d) => [c[0] + R(-d, d), c[1] + R(-d, d), c[2] + R(-d, d)];
+  let next = 1;
+  const color = (id) => PALETTE[(id - 1) % PALETTE.length];
+  const scenarioOrganWithTumors = () => {
+    const out = [];
+    const c = [R(0.3, 0.7) * nx, R(0.35, 0.65) * ny, R(0.35, 0.65) * nz];
+    const rr = [R(0.16, 0.24) * nx, R(0.14, 0.22) * ny, R(0.16, 0.24) * nz];
+    const organ = next++;
+    ellipsoid(c, rr, organ);
+    out.push({ id: organ, color: color(organ), op: 0.3, shading: "surface" });
+    const nT = 2 + Math.floor(R(0, 3));
+    for (let i = 0; i < nT; i++) {
+      const tc = jitter(c, Math.min(...rr) * 0.7);
+      const tr = R(0.05, 0.1) * nx;
+      const tumor = next++;
+      ball(tc, tr, tumor);
+      out.push({ id: tumor, color: color(tumor), op: 0.7, shading: "surface" });
+      if (Math.random() < 0.6) {
+        const core = next++;
+        ball(tc, tr * R(0.4, 0.6), core);
+        out.push({ id: core, color: color(core), op: 1, shading: "surface" });
+      }
+    }
+    return out;
+  };
+  const scenarioNested = () => {
+    const out = [];
+    const c = [R(0.35, 0.65) * nx, R(0.35, 0.65) * ny, R(0.35, 0.65) * nz];
+    let r = R(0.18, 0.26) * nx;
+    const layers = 3 + Math.floor(R(0, 2));
+    for (let i = 0; i < layers; i++) {
+      const id = next++;
+      ball(c, r, id);
+      out.push({ id, color: color(id), op: i === 0 ? 0.3 : i === layers - 1 ? 1 : 0.6, shading: "surface" });
+      r *= R(0.55, 0.72);
+    }
+    return out;
+  };
+  const scenarioCluster = () => {
+    const out = [];
+    const c = [R(0.35, 0.65) * nx, R(0.35, 0.65) * ny, R(0.35, 0.65) * nz];
+    const nB = 3 + Math.floor(R(0, 3));
+    for (let i = 0; i < nB; i++) {
+      const id = next++;
+      ball(jitter(c, 0.1 * nx), R(0.07, 0.11) * nx, id);
+      out.push({ id, color: color(id), op: R(0.5, 1), shading: "surface" });
+    }
+    return out;
+  };
+  const scenarioVesselOrgan = () => {
+    const out = [];
+    const c = [R(0.35, 0.65) * nx, R(0.4, 0.6) * ny, R(0.4, 0.6) * nz];
+    const rr = [R(0.18, 0.26) * nx, R(0.14, 0.2) * ny, R(0.16, 0.22) * nz];
+    const organ = next++;
+    ellipsoid(c, rr, organ);
+    out.push({ id: organ, color: color(organ), op: 0.28, shading: "surface" });
+    const vessel = next++;
+    const nSeg = 3;
+    let p = jitter(c, Math.min(...rr));
+    for (let i = 0; i < nSeg; i++) {
+      const q = jitter(c, Math.min(...rr) * 0.9);
+      tube(p, q, R(0.02, 0.035) * nx, vessel);
+      p = q;
+    }
+    out.push({ id: vessel, color: color(vessel), op: 1, shading: "surface" });
+    return out;
+  };
+  const SCENARIOS = [scenarioOrganWithTumors, scenarioNested, scenarioCluster, scenarioVesselOrgan];
+  let looks = [];
+  const generate = () => {
+    lab.fill(0);
+    next = 1;
+    looks = [];
+    const nS = 2 + Math.floor(R(0, 2));
+    for (let i = 0; i < nS; i++) looks.push(...SCENARIOS[Math.floor(Math.random() * SCENARIOS.length)]());
+  };
+  generate();
+  const seg = new EditableSegmentation(gpu.device, dims, { ijkToRAS });
+  const logic = new SegmentationLogic(gpu.device, seg, { renderMode: "sdf", boundaryMode: "all", opacity: 1, refineDelayMs: opts.refineDelayMs });
+  const applyLooks = () => {
+    for (const lk of looks) {
+      logic.setLabelColor(lk.id, lk.color);
+      logic.setLabelOpacity(lk.id, lk.op);
+      logic.setLabelShading(lk.id, lk.shading);
+    }
+  };
+  applyLooks();
   seg.loadLabelmap(lab);
+  logic.refineNow();
+  const scene = new SceneRenderer(gpu, format);
+  const redrawCbs = [];
+  logic.onRedraw(() => {
+    for (const cb of redrawCbs) cb();
+  });
+  scene.build([logic.field()]);
+  scene.setBackground(0.05, 0.06, 0.09);
   const center = [0, 0, 0];
-  const radius = Math.hypot(96, 96, 96);
-  let pokeN = 0;
+  const radius = sp * N * 0.5 * Math.SQRT2;
   return {
     scene,
     seg,
-    paint,
-    driver,
+    logic,
     center,
     radius,
     dims,
-    poke(centerRAS, radiusMm) {
-      paint.stampStroke([centerRAS], { radiusMm, id: allocId(`poke_${pokeN++}`), mode: "add" });
-    },
+    labels: () => looks,
     onRedraw(cb) {
       redrawCbs.push(cb);
     },
-    setRenderMode(m) {
-      if (m === mode) return;
-      logic.destroy();
-      mode = m;
-      makeLogic();
+    regenerate() {
+      generate();
+      applyLooks();
+      seg.loadLabelmap(lab);
+      logic.refineNow();
       for (const cb of redrawCbs) cb();
     },
-    renderMode: () => mode,
     refine() {
       logic.refineNow();
     },
-    setAllOpacity(op) {
-      allOpacity = op;
-      for (const [id] of labelColors) {
-        labelLook.get(id).op = op;
-        applyLook(id);
-      }
-      logic.refineNow();
-    },
-    allOpacity: () => allOpacity,
     randomizeLook() {
-      for (const [id] of labelColors) {
-        const lk = { op: 0.3 + Math.random() * 0.7, shading: Math.random() < 0.5 ? "surface" : "volume" };
-        labelLook.set(id, lk);
-        applyLook(id);
+      for (const lk of looks) {
+        lk.op = 0.3 + Math.random() * 0.7;
+        lk.shading = Math.random() < 0.5 ? "surface" : "volume";
       }
+      applyLooks();
       logic.refineNow();
     },
     resetLook() {
-      allOpacity = 1;
-      for (const [id] of labelColors) {
-        labelLook.set(id, { op: 1, shading: "surface" });
-        applyLook(id);
-      }
+      for (const lk of looks) lk.shading = "surface";
+      applyLooks();
       logic.refineNow();
+    },
+    setAllOpacity(op) {
+      for (const lk of looks) lk.op = op;
+      applyLooks();
+      logic.refineNow();
+    },
+    destroy() {
+      logic.destroy();
+      seg.destroy();
     }
   };
 }
@@ -3080,7 +2948,7 @@ var SegBudget = class _SegBudget {
   }
 };
 
-// algorithms/demos/algorithms-browser.ts
+// algorithms/demos/islands-browser.ts
 var status = (msg, err = false) => {
   const el = document.getElementById("status-text");
   if (el) {
@@ -3104,10 +2972,11 @@ async function main() {
   ctx.configure({ device: gpu.device, format: preferred, viewFormats: [srgb], alphaMode: "opaque" });
   status("probing device capability\u2026");
   const budget = await SegBudget.probe(gpu.device);
-  const a = buildAlgorithmsScene(gpu, srgb, { refineDelayMs: budget.refineDelayMs() });
-  const camera = framedCamera(a.center, a.radius, 2.8);
+  const dim = budget.tier === "high" ? 144 : budget.tier === "mid" ? 112 : 88;
+  const rs = buildIslandsScene(gpu, srgb, { refineDelayMs: budget.refineDelayMs(), dim });
+  const camera = framedCamera(rs.center, rs.radius, 2.6);
   const a3d = mountAdaptive3d({
-    scene: () => a.scene,
+    scene: () => rs.scene,
     view: () => ctx.getCurrentTexture().createView({ format: srgb }),
     size: () => ({ w: canvas.width, h: canvas.height }),
     setCamera: (s, w, h) => s.setCamera(camera.position, camera.focalPoint, camera.viewUp, camera.viewAngle, w, h),
@@ -3117,70 +2986,48 @@ async function main() {
   });
   const draw = () => a3d.draw();
   const drawNow = () => a3d.renderSettled(true);
-  a.onRedraw(() => drawNow());
+  rs.onRedraw(() => drawNow());
   const resize = () => {
     const dpr = Math.min(2, globalThis.devicePixelRatio || 1);
-    const size = Math.min(760, Math.floor(canvas.clientWidth * dpr));
+    const size = Math.min(820, Math.floor(canvas.clientWidth * dpr));
     canvas.width = size;
     canvas.height = size;
     drawNow();
   };
   globalThis.addEventListener("resize", resize);
   attachCameraControls(canvas, camera, { onChange: draw });
-  let n = 0;
-  const poke = () => {
-    const R = 70;
-    const c = [(Math.random() * 2 - 1) * R, (Math.random() * 2 - 1) * R, (Math.random() * 2 - 1) * R];
-    a.poke(c, 16 + Math.random() * 12);
-    status(`poked ${++n} sphere${n === 1 ? "" : "s"} through the shared buffer \xB7 surface re-rendered in place`);
-  };
-  document.getElementById("poke")?.addEventListener("click", poke);
-  let painting = false, strokeN = 0;
-  const paintStroke = async () => {
-    if (painting) return;
-    painting = true;
-    const R = 55, N = 26;
-    const cx = (Math.random() * 2 - 1) * 30, cy = (Math.random() * 2 - 1) * 30, cz = (Math.random() * 2 - 1) * 30;
-    a.driver.beginStroke({ segmentId: `stroke_${++strokeN}`, effect: "Paint", brush: { shape: "sphere", diameterMm: 14 } });
-    for (let i = 0; i < N; i++) {
-      const t = i / (N - 1) * Math.PI * 1.5;
-      a.driver.addPoint([cx + R * Math.cos(t), cy + R * Math.sin(t) * 0.6, cz + i / N * 40 - 20]);
-      status(`painting stroke from the SegEdit stream\u2026 sample ${i + 1}/${N}`);
-      await new Promise((r) => requestAnimationFrame(() => r(null)));
-    }
-    a.driver.endStroke();
-    status(`painted a stroke via SegEditDriver (${N} samples, interpolated) \xB7 orbit to inspect`);
-    painting = false;
-  };
-  document.getElementById("paint")?.addEventListener("click", paintStroke);
-  const modeBtn = document.getElementById("mode");
-  const syncModeBtn = () => {
-    if (modeBtn) modeBtn.textContent = a.renderMode() === "sdf" ? "Render: SDF" : "Render: Gaussian";
-  };
-  syncModeBtn();
-  modeBtn?.addEventListener("click", () => {
-    a.setRenderMode(a.renderMode() === "sdf" ? "surface" : "sdf");
-    syncModeBtn();
+  const summary = () => `${rs.labels().length} labels \xB7 ${dim}\xB3 \xB7 multi-material interface field`;
+  document.getElementById("regen")?.addEventListener("click", () => {
+    rs.regenerate();
     drawNow();
-    status(`render path: ${a.renderMode() === "sdf" ? "SDF (crisp, terrace-free)" : "Gaussian (gradient-opacity)"}`);
+    status(`new scene \u2014 ${summary()} \xB7 drag to orbit`);
   });
   document.getElementById("rand")?.addEventListener("click", () => {
-    a.randomizeLook();
+    rs.randomizeLook();
     drawNow();
     status("randomized per-segment opacity + surface/volume shading");
   });
-  document.getElementById("opaque")?.addEventListener("click", () => {
-    a.resetLook();
+  document.getElementById("reset")?.addEventListener("click", () => {
+    rs.resetLook();
     drawNow();
-    status("all segments opaque surfaces");
+    status("reset per-segment look (depth-based: outer translucent, inner opaque)");
   });
-  document.getElementById("reset")?.addEventListener("click", () => location.reload());
+  const op = document.getElementById("opacity");
+  op?.addEventListener("input", () => {
+    rs.setAllOpacity(parseInt(op.value, 10) / 100);
+    drawNow();
+  });
   resize();
-  status(`surface-mode segmentation \xB7 ${budget.tier}-tier device \xB7 drag to orbit \xB7 scroll/pinch to zoom \xB7 Poke to edit`);
-  globalThis.__algoDbg = {
+  status(`${summary()} \xB7 ${budget.tier}-tier \xB7 drag to orbit \xB7 scroll/pinch to zoom \xB7 Regenerate for a new case`);
+  globalThis.__islandsDbg = {
+    labels: () => rs.labels().length,
     dist: () => camera.distance,
     err: () => (globalThis.__gpuErr || []).length,
-    tier: () => budget.tier
+    tier: () => budget.tier,
+    regenerate: () => {
+      rs.regenerate();
+      drawNow();
+    }
   };
 }
 main();

@@ -1988,6 +1988,7 @@ var SegmentField = class {
   stepMm;
   mode;
   colorFromTex;
+  interfaceMode;
   constructor(tex, dims, spacing, opts) {
     this.tex = tex;
     const center = opts.center ?? [0, 0, 0];
@@ -2009,6 +2010,7 @@ var SegmentField = class {
     this.clippable = opts.clippable ?? true;
     this.mode = opts.mode ?? "iso";
     this.colorFromTex = opts.colorFromTexture ?? false;
+    this.interfaceMode = this.mode === "sdf" && (opts.interfaceMode ?? false);
     this.attrTex = this.mode === "sdf" ? opts.attrTexture : void 0;
     this.bindingCount = this.attrTex ? 2 : 1;
   }
@@ -2074,6 +2076,28 @@ fn attr_seg${s}(wp : vec3<f32>) -> vec2<f32> {   // per-segment (.x = opacity, .
   let t = t4.xyz;
   if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { return vec2<f32>(0.0); }
   return textureSampleLevel(t_attr${s}, s_lin, t, 0.0).rg;
+}` : ""}${this.interfaceMode ? `
+fn bdist_seg${s}(wp : vec3<f32>) -> f32 {   // SMOOTH (seam-blurred) interface distance from attr.b \u2014 for the normal only
+  let t4 = u_material.seg${s}_p2t * vec4<f32>(transform_point_seg${s}(wp), 1.0);
+  let t = clamp(t4.xyz, vec3<f32>(0.0), vec3<f32>(1.0));
+  return textureSampleLevel(t_attr${s}, s_lin, t, 0.0).b;
+}
+fn pres_seg${s}(wp : vec3<f32>) -> f32 {   // CRISP in-segment presence (attr.a), linear-sampled for ~1-voxel AA
+  let t4 = u_material.seg${s}_p2t * vec4<f32>(transform_point_seg${s}(wp), 1.0);
+  let t = t4.xyz;
+  if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { return 0.0; }
+  return textureSampleLevel(t_attr${s}, s_lin, t, 0.0).a;
+}
+fn g1_seg${s}(c : f32, wp : vec3<f32>, dir : vec3<f32>, h : f32) -> f32 {
+  // One-sided difference of the SMOOTH interface distance along dir, picking the STEEPER side. The
+  // unsigned distance has a V-crease at the surface: a central difference straddling it cancels (fake
+  // zero gradient \u2192 degenerate normal). Taking the steeper one-sided difference follows the true \xB11
+  // slope AWAY from the interface, so the normal stays well-defined right at the shell \u2014 computed on
+  // the fly only at shell samples, no stored normal. Uses the blurred distance (attr.b) so the normal
+  // is smooth (no JFA facets); the SHARP sdfTex.a still drives shell membership (surface stays at 0).
+  let dp = bdist_seg${s}(wp + dir * h) - c;
+  let dm = c - bdist_seg${s}(wp - dir * h);
+  return select(dm, dp, abs(dp) > abs(dm)) / h;
 }` : ""}
 // Shell (surface) contribution at wp: crisp Phong shell around sdf=0. Weighted by (1-mode) so it
 // morphs smoothly into the volume contribution across a blurred surface\u2194volume boundary.
@@ -2083,10 +2107,15 @@ fn surface_seg${s}(wp : vec3<f32>, rd : vec3<f32>, sdf : f32, band : f32, step :
   let T = clamp(op0 * seg_op, 0.0, 1.0);      // TARGET surface opacity (per-segment \xD7 field)
   if (T <= 0.0) { return vec4<f32>(0.0); }
   let h = step;
+${this.interfaceMode ? `  let hg = 1.5 * step;
+  let dc = bdist_seg${s}(wp);
   let g = vec3<f32>(
+    g1_seg${s}(dc, wp, vec3<f32>(1,0,0), hg),
+    g1_seg${s}(dc, wp, vec3<f32>(0,1,0), hg),
+    g1_seg${s}(dc, wp, vec3<f32>(0,0,1), hg));` : `  let g = vec3<f32>(
     vgrad_seg${s}(wp + vec3<f32>(h,0,0)) - vgrad_seg${s}(wp - vec3<f32>(h,0,0)),
     vgrad_seg${s}(wp + vec3<f32>(0,h,0)) - vgrad_seg${s}(wp - vec3<f32>(0,h,0)),
-    vgrad_seg${s}(wp + vec3<f32>(0,0,h)) - vgrad_seg${s}(wp - vec3<f32>(0,0,h))) / (2.0 * h);
+    vgrad_seg${s}(wp + vec3<f32>(0,0,h)) - vgrad_seg${s}(wp - vec3<f32>(0,0,h))) / (2.0 * h);`}
   let glen = length(g);
   if (glen < 1e-5) { return vec4<f32>(0.0); }
   var n = g / glen;
@@ -2100,12 +2129,14 @@ fn surface_seg${s}(wp : vec3<f32>, rd : vec3<f32>, sdf : f32, band : f32, step :
   // built-in silhouette AA).
   let a = max(1.0 - d_mm / band, 0.0);
   if (a <= 0.0) { return vec4<f32>(0.0); }
-  // Convert ray-step to d_mm-distance with the RAW gradient projection |dot(rd,g)| = |d(d_mm)/ds|
-  // (includes |grad sdf|, which the distance blur pulls below 1) so \u03A3(a/band)\xB7\u0394d_mm = \u222B(a/band)dd = 1
-  // exactly. \u21920 at grazing = built-in silhouette AA.
-  let rate = max(abs(dot(rd, g)), 1e-3);
+  // Convert ray-step to d_mm-distance. Outer: RAW gradient projection |dot(rd,g)| = |d(d_mm)/ds|
+  // (includes |grad sdf|, which the distance blur pulls below 1). Interface: the re-signed gradient has
+  // an arbitrary magnitude (a sign jump at the interface), so use the UNIT normal cosine |dot(rd,n)| \u2014
+  // still \u21920 at grazing (silhouette AA), and keeps opacity thickness-consistent.
+  let rate = max(abs(dot(rd, ${this.interfaceMode ? "n" : "g"})), 1e-3);
   let tau = -log(1.0 - min(T, 0.9999)) * (a / band) * (step * rate);
-  let op = 1.0 - exp(-tau);
+  var op = 1.0 - exp(-tau);
+${this.interfaceMode ? `  op = op * pres_seg${s}(wp);   // gate to GENUINELY in-segment voxels \u2014 kills the bled colour/opacity halo beyond the real edge` : ""}
   if (op <= 0.0004) { return vec4<f32>(0.0); }
   let ka = u_material.seg${s}_shade.x; let kd = u_material.seg${s}_shade.y;
   let ks = u_material.seg${s}_shade.z; let sh = u_material.seg${s}_shade.w;
@@ -2944,13 +2975,20 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let c = vec3<i32>(gid);
   let my = labelAt(c);
   let meIn = my != 0u;
+  let allMode = u.params.y > 0.5;                   // 0 = outer boundary only; 1 = ANY label change (multi-material interfaces)
   var boundary = false;
   var region = my;                                  // inside voxel \u2192 own label
   let offs = array<vec3<i32>, 6>(vec3<i32>(1,0,0), vec3<i32>(-1,0,0), vec3<i32>(0,1,0), vec3<i32>(0,-1,0), vec3<i32>(0,0,1), vec3<i32>(0,0,-1));
   for (var i = 0; i < 6; i = i + 1) {
     let nl = labelAt(c + offs[i]);
-    let nIn = nl != 0u;
-    if (nIn != meIn) { boundary = true; if (!meIn) { region = nl; } }  // outside boundary \u2192 adopt inside neighbour's label
+    // outer mode: boundary at inside\u2194outside (segment\u2194background). all mode: boundary at ANY label change
+    // (segment\u2194background AND segment\u2194segment) so embedded/nested structures get an interface shell too.
+    let isChange = select((nl != 0u) != meIn, nl != my, allMode);
+    // outer: a background boundary voxel adopts the neighbour's label (so the outer shell renders on both
+    // sides). all: every voxel keeps its OWN label (background stays 0 = transparent), so the region
+    // COLOUR changes across EVERY interface \u2014 including the outer one \u2014 which the shader's on-the-fly
+    // re-signing needs to recover a clean inside/outside normal there too.
+    if (isChange) { boundary = true; if (my == 0u && !allMode) { region = nl; } }
   }
   var seed = vec4<f32>(0.0, 0.0, 0.0, 0.0);
   if (boundary) { seed = vec4<f32>((u.ijkToRAS * vec4<f32>(vec3<f32>(gid), 1.0)).xyz, f32(region)); }
@@ -3013,12 +3051,18 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let ld = vec3<i32>(u.dims.xyz) - vec3<i32>(2 * pad);
   let inRange = all(lc >= vec3<i32>(0)) && all(lc < ld);
   let ins = inRange && textureLoad(t_label, lc, 0).r != 0u;
-  let sdf = select(dist, -dist, ins);
+  // outer mode: SIGNED (neg inside the union) \u2014 smooth zero-crossing = clean normals. all mode:
+  // UNSIGNED distance to the nearest interface (every label change is a wall; no global inside/outside).
+  let sdf = select(select(dist, -dist, ins), dist, u.params.y > 0.5);
   let lbl = u32(s.w + 0.5) & 255u;
   let pal = select(vec4<f32>(0.0), u_pal[lbl], valid);
   let mode = select(0.0, u_mode[lbl].x, valid);
   textureStore(t_out, c, vec4<f32>(pal.rgb, sdf));
-  textureStore(t_attr, c, vec4<f32>(pal.a, mode, 0.0, 0.0));   // .r = per-segment opacity, .g = shading mode
+  // .r = opacity, .g = shading mode, .b = distance (seam-blurred \u2192 SMOOTH distance for the interface-mode
+  // normal; sdfTex.a stays sharp for shell membership), .a = CRISP presence (1 inside a real segment, 0
+  // background) \u2014 the FULLBLUR carries it unblurred so the shader can tell a genuine in-segment voxel
+  // from one that merely caught BLED colour/opacity outside any segment, and gate the shell to the real edge.
+  textureStore(t_attr, c, vec4<f32>(pal.a, mode, sdf, select(0.0, 1.0, ins)));
 }`
 );
 var BLUR_WGSL2 = (
@@ -3086,13 +3130,14 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let dmax = vec3<i32>(u.dims.xyz) - vec3<i32>(1);
   var av = vec3<i32>(0);
   if (u.axis_r.x == 0u) { av = vec3<i32>(1,0,0); } else if (u.axis_r.x == 1u) { av = vec3<i32>(0,1,0); } else { av = vec3<i32>(0,0,1); }
-  var sum = textureLoad(t_in, c, 0) * wt(0u);
+  let center = textureLoad(t_in, c, 0);
+  var sum = center.rgb * wt(0u);
   let R = i32(u.axis_r.y);
   for (var i = 1; i <= R; i = i + 1) {
-    sum = sum + wt(u32(i)) * (textureLoad(t_in, clamp(c + av * i, vec3<i32>(0), dmax), 0)
-                            + textureLoad(t_in, clamp(c - av * i, vec3<i32>(0), dmax), 0));
+    sum = sum + wt(u32(i)) * (textureLoad(t_in, clamp(c + av * i, vec3<i32>(0), dmax), 0).rgb
+                            + textureLoad(t_in, clamp(c - av * i, vec3<i32>(0), dmax), 0).rgb);
   }
-  textureStore(t_out, c, sum);
+  textureStore(t_out, c, vec4<f32>(sum, center.a));
 }`
 );
 function gaussHalfKernel2(sigma) {
@@ -3108,17 +3153,14 @@ function gaussHalfKernel2(sigma) {
   return { radius, w };
 }
 var JfaSdfBaker = class {
-  // original (label) dims, before padding
-  // `pad` voxels of background are added on every side so segments touching the labelmap edge get a
-  // real cap + in-bounds gradient neighbourhood (docs/ALGORITHMS.md border artifact). The SDF textures,
-  // dispatch, seeds, blur and readback all run on the PADDED grid; `dims`/`ijkToRAS` become the padded
-  // grid's, and `sdfDims()`/`sdfIjkToRAS()` expose them to the SegmentField.
-  constructor(dev, labelTex, dims, ijkToRAS, smoothSigmaVoxels = 1, pad = 2) {
+  // 0 = outer boundary (signed); 1 = any label change (unsigned, multi-material)
+  constructor(dev, labelTex, dims, ijkToRAS, smoothSigmaVoxels = 1, pad = 2, boundaryMode = "outer") {
     this.labelTex = labelTex;
     this.dims = dims;
     this.ijkToRAS = ijkToRAS;
     this.dev = dev;
     this.smoothSigma = smoothSigmaVoxels;
+    this.bmode = boundaryMode === "all" ? 1 : 0;
     this.pad = pad;
     this.labelDims = [dims[0], dims[1], dims[2]];
     this.dims = [dims[0] + 2 * pad, dims[1] + 2 * pad, dims[2] + 2 * pad];
@@ -3182,6 +3224,12 @@ var JfaSdfBaker = class {
   pad;
   // background margin (voxels) padded around the labelmap
   labelDims;
+  // original (label) dims, before padding
+  // `pad` voxels of background are added on every side so segments touching the labelmap edge get a
+  // real cap + in-bounds gradient neighbourhood (docs/ALGORITHMS.md border artifact). The SDF textures,
+  // dispatch, seeds, blur and readback all run on the PADDED grid; `dims`/`ijkToRAS` become the padded
+  // grid's, and `sdfDims()`/`sdfIjkToRAS()` expose them to the SegmentField.
+  bmode;
   /** The resident colorized-SDF texture (rgba16float: .rgb = per-label colour, .a = signed mm).
    *  Identity stable across bakes → the SceneRenderer bind group stays valid; a live edit updates in
    *  place. */
@@ -3251,7 +3299,7 @@ var JfaSdfBaker = class {
     u[18] = this.dims[2];
     u[19] = this.pad;
     f[20] = step;
-    f[21] = 0;
+    f[21] = this.bmode;
     f[22] = 0;
     f[23] = 0;
     this.dev.queue.writeBuffer(this.uni, 0, ab);
@@ -3373,7 +3421,6 @@ var JfaSdfBaker = class {
 
 // logic/segmentation-logic.ts
 var SegmentationLogic = class {
-  // quiescence before the settle-refine (sdf mode; capability-tuned)
   constructor(device, seg, opts = {}) {
     this.seg = seg;
     this.renderMode = opts.renderMode ?? "sdf";
@@ -3381,9 +3428,10 @@ var SegmentationLogic = class {
     this.bandMm = opts.bandMm;
     this.opacity = opts.opacity ?? 1;
     this.refineDelayMs = opts.refineDelayMs ?? 180;
+    this.boundaryMode = opts.boundaryMode ?? "outer";
     this.setLabelColor(1, opts.color ?? [0.3, 0.85, 0.55]);
     if (this.renderMode === "sdf") {
-      this.sdf = new JfaSdfBaker(device, seg.masterTexture(), seg.dims, seg.ijkToRAS);
+      this.sdf = new JfaSdfBaker(device, seg.masterTexture(), seg.dims, seg.ijkToRAS, 1, 2, this.boundaryMode);
     } else {
       this.baker = new ColorizeBaker(device, seg.masterTexture(), seg.dims);
       this.presenceTex = this.baker.output();
@@ -3415,6 +3463,8 @@ var SegmentationLogic = class {
   unsubDirty;
   refineTimer;
   refineDelayMs;
+  // quiescence before the settle-refine (sdf mode; capability-tuned)
+  boundaryMode;
   /** Assign a display colour to a label id (0..255). Keeps the current opacity (defaults to 1 =
    *  opaque). Takes effect on the next rebake. */
   setLabelColor(id, rgb) {
@@ -3474,7 +3524,8 @@ var SegmentationLogic = class {
     if (!this.segField) {
       const tex = this.sdf ? this.sdf.sdfTexture() : this.presenceTex;
       const voxelMm = Math.min(...this.seg.spacingMm());
-      const band = this.bandMm ?? (this.renderMode === "sdf" ? 0.65 * voxelMm : void 0);
+      const interfaceMode = this.renderMode === "sdf" && this.boundaryMode === "all";
+      const band = this.bandMm ?? (this.renderMode === "sdf" ? (interfaceMode ? 1.5 : 0.65) * voxelMm : void 0);
       const fdims = this.sdf ? this.sdf.sdfDims() : this.seg.dims;
       const fijk = this.sdf ? this.sdf.sdfIjkToRAS() : this.seg.ijkToRAS;
       this.segField = new SegmentField(tex, fdims, [1, 1, 1], {
@@ -3485,8 +3536,9 @@ var SegmentationLogic = class {
         colorFromTexture: true,
         bandMm: band,
         clippable: false,
-        attrTexture: this.sdf ? this.sdf.attrTexture() : void 0
+        attrTexture: this.sdf ? this.sdf.attrTexture() : void 0,
         // per-segment opacity (sdf)
+        interfaceMode
       });
     }
     return this.segField;
