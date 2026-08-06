@@ -2643,6 +2643,41 @@ function labelmapHasInternalBoundary(lab, dims) {
   }
   return false;
 }
+function resampleIsotropic(lab, dims, ijkToRAS, maxDim, maxVoxels = Infinity) {
+  const sp = spacingFromIjkToRAS2(ijkToRAS);
+  const ext = [dims[0] * sp[0], dims[1] * sp[1], dims[2] * sp[2]];
+  let vox = Math.max(...ext) / maxDim;
+  const count = (v) => Math.max(1, Math.round(ext[0] / v)) * Math.max(1, Math.round(ext[1] / v)) * Math.max(1, Math.round(ext[2] / v));
+  let coarsened = false;
+  if (count(vox) > maxVoxels) {
+    vox = Math.cbrt(ext[0] * ext[1] * ext[2] / maxVoxels);
+    coarsened = true;
+  }
+  const cd = [Math.max(1, Math.round(ext[0] / vox)), Math.max(1, Math.round(ext[1] / vox)), Math.max(1, Math.round(ext[2] / vox))];
+  const [nx, ny, nz] = dims, [cx, cy, cz] = cd;
+  const out = new Uint32Array(cx * cy * cz);
+  if (cx === nx && cy === ny && cz === nz) {
+    for (let i = 0; i < out.length; i++) out[i] = lab[i];
+    return { lab: out, dims, ijkToRAS, vox, coarsened };
+  }
+  for (let z = 0; z < cz; z++) {
+    const sz = Math.min(nz - 1, Math.floor((z + 0.5) * nz / cz));
+    for (let y = 0; y < cy; y++) {
+      const sy = Math.min(ny - 1, Math.floor((y + 0.5) * ny / cy));
+      for (let x = 0; x < cx; x++) {
+        const sx = Math.min(nx - 1, Math.floor((x + 0.5) * nx / cx));
+        out[(z * cy + y) * cx + x] = lab[(sz * ny + sy) * nx + sx];
+      }
+    }
+  }
+  const r = [nx / cx, ny / cy, nz / cz], m = ijkToRAS.slice();
+  for (let row = 0; row < 3; row++) {
+    m[row * 4] *= r[0];
+    m[row * 4 + 1] *= r[1];
+    m[row * 4 + 2] *= r[2];
+  }
+  return { lab: out, dims: cd, ijkToRAS: m, vox, coarsened };
+}
 function spacingFromIjkToRAS2(ijkToRAS) {
   const col = (c) => Math.hypot(ijkToRAS[c], ijkToRAS[4 + c], ijkToRAS[8 + c]);
   return [col(0), col(1), col(2)];
@@ -3357,39 +3392,6 @@ function modalityLUT(modality, maxAlpha = 0.42) {
   }
   return lut;
 }
-function cappedLabelmap(lab, dims, ijkToRAS, maxDim) {
-  const scale2 = Math.min(1, maxDim / Math.max(...dims));
-  const cd = [
-    Math.max(1, Math.round(dims[0] * scale2)),
-    Math.max(1, Math.round(dims[1] * scale2)),
-    Math.max(1, Math.round(dims[2] * scale2))
-  ];
-  const [nx, ny, nz] = dims, [cx, cy, cz] = cd;
-  if (cx === nx && cy === ny && cz === nz) {
-    const out2 = new Uint32Array(nx * ny * nz);
-    for (let i = 0; i < out2.length; i++) out2[i] = lab[i];
-    return { lab: out2, dims, ijkToRAS };
-  }
-  const out = new Uint32Array(cx * cy * cz);
-  for (let z = 0; z < cz; z++) {
-    const sz = Math.min(nz - 1, Math.floor((z + 0.5) * nz / cz));
-    for (let y = 0; y < cy; y++) {
-      const sy = Math.min(ny - 1, Math.floor((y + 0.5) * ny / cy));
-      for (let x = 0; x < cx; x++) {
-        const sx = Math.min(nx - 1, Math.floor((x + 0.5) * nx / cx));
-        out[(z * cy + y) * cx + x] = lab[(sz * ny + sy) * nx + sx];
-      }
-    }
-  }
-  const r = [nx / cx, ny / cy, nz / cz];
-  const m = ijkToRAS.slice();
-  for (let row = 0; row < 3; row++) {
-    m[row * 4] *= r[0];
-    m[row * 4 + 1] *= r[1];
-    m[row * 4 + 2] *= r[2];
-  }
-  return { lab: out, dims: cd, ijkToRAS: m };
-}
 function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
   const dev = gpu.device;
   const dims = ct.dims;
@@ -3430,7 +3432,8 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
   let segLogic;
   let editable;
   if (seg && segments.length > 0) {
-    const cap = cappedLabelmap(seg.lab, dims, ct.ijkToRAS, opts.sdfMaxDim ?? SDF_MAX_DIM);
+    const cap = resampleIsotropic(seg.lab, dims, ct.ijkToRAS, opts.sdfMaxDim ?? SDF_MAX_DIM, opts.sdfMaxVoxels);
+    if (cap.coarsened) console.warn(`SEGRoulette: SDF grid coarsened to fit the device memory budget (${cap.dims.join("\xD7")}, ${cap.vox.toFixed(2)}mm) \u2014 a remote render server would allow full resolution.`);
     editable = new EditableSegmentation(dev, cap.dims, { ijkToRAS: cap.ijkToRAS });
     const boundaryMode = labelmapHasInternalBoundary(cap.lab, cap.dims) ? "all" : "outer";
     segLogic = new SegmentationLogic(dev, editable, { renderMode: "sdf", opacity: 1, boundaryMode, refineDelayMs: opts.refineDelayMs });
@@ -3589,6 +3592,13 @@ var SegBudget = class _SegBudget {
   /** SDF grid cap per axis for large volumes (SEGRoulette / microCT). */
   sdfMaxDim() {
     return this.tier === "high" ? 384 : this.tier === "mid" ? 256 : 128;
+  }
+  /** TOTAL SDF voxel budget — the memory ceiling for the isotropic resample (~64 B/voxel across the
+   *  JFA seed + sdf/attr/scratch textures, so mid ≈ 256³ ≈ 1.1 GB). Thick-slice anisotropy is upsampled
+   *  toward isotropic (no per-slice gaps), and this caps how far, so a weaker device coarsens gracefully
+   *  instead of OOMing (the caller can then suggest remote rendering). NOT sdfMaxDim³ — high stays ~2 GB. */
+  sdfMaxVoxels() {
+    return this.tier === "high" ? 320 ** 3 : this.tier === "mid" ? 256 ** 3 : 128 ** 3;
   }
   /** Debounce before the settle-refine fires (ms). Fast → near-immediate (dynamic); slow → patient. */
   refineDelayMs() {
@@ -5197,7 +5207,7 @@ async function main() {
       lastEntry = res.entry;
       status("baking segmentation surface\u2026");
       rs?.destroy();
-      rs = buildSegrouletteScene(gpu, srgb, res.ct, res.seg, { sdfMaxDim: budget.sdfMaxDim(), refineDelayMs: budget.refineDelayMs() });
+      rs = buildSegrouletteScene(gpu, srgb, res.ct, res.seg, { sdfMaxDim: budget.sdfMaxDim(), sdfMaxVoxels: budget.sdfMaxVoxels(), refineDelayMs: budget.refineDelayMs() });
       sliceIx = new SliceInteractor({ ijkToRAS: rs.ijkToRAS, rasLo: rs.rasLo, rasHi: rs.rasHi });
       for (const p of planes) off[p.cell] = slicerDefaultOffset01(p.orient, rs.dims, rs.ijkToRAS, rs.rasLo, rs.rasHi);
       const framed = framedCamera(rs.center, rs.radius);
