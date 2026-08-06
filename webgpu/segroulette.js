@@ -1800,7 +1800,10 @@ fn col_seg${s}(wp : vec3<f32>) -> vec3<f32> {   // per-label colour of the neare
   let t4 = u_material.seg${s}_p2t * vec4<f32>(transform_point_seg${s}(wp), 1.0);
   let t = t4.xyz;
   if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { return vec3<f32>(0.0); }
-  return textureSampleLevel(t_seg${s}, s_lin, t, 0.0).rgb;
+  let pm = textureSampleLevel(t_seg${s}, s_lin, t, 0.0).rgb;   // PREMULTIPLIED (rgb\xB7opacity)${this.attrTex ? `
+  let a = textureSampleLevel(t_attr${s}, s_lin, t, 0.0).r;      // per-segment opacity (crisp) \u2014 un-premultiply to the true colour, so a hidden neighbour's colour doesn't bleed in
+  return pm / max(a, 1e-3);` : `
+  return pm;`}
 }${this.attrTex ? `
 fn attr_seg${s}(wp : vec3<f32>) -> vec2<f32> {   // per-segment (.x = opacity, .y = shading mode)
   let t4 = u_material.seg${s}_p2t * vec4<f32>(transform_point_seg${s}(wp), 1.0);
@@ -2867,7 +2870,11 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let lbl = u32(s.w + 0.5) & 255u;
   let pal = select(vec4<f32>(0.0), u_pal[lbl], valid);
   let mode = select(0.0, u_mode[lbl].x, valid);
-  textureStore(t_out, c, vec4<f32>(pal.rgb, sdf));
+  // PREMULTIPLIED colour (rgb\xB7opacity): the colour-seam blur then can't bleed a HIDDEN (opacity 0)
+  // segment's colour into a visible neighbour \u2014 an invisible organ was still tinting the organ it
+  // abutted (looked like half-opacity). The shader divides by the per-segment opacity to recover the
+  // true colour, so a 0-opacity region contributes nothing to the blend.
+  textureStore(t_out, c, vec4<f32>(pal.rgb * pal.a, sdf));
   // .r = opacity, .g = shading mode, .b = distance (seam-blurred \u2192 SMOOTH distance for the interface-mode
   // normal; sdfTex.a stays sharp for shell membership), .a = CRISP presence (1 inside a real segment, 0
   // background) \u2014 the FULLBLUR carries it unblurred so the shader can tell a genuine in-segment voxel
@@ -2941,13 +2948,13 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   var av = vec3<i32>(0);
   if (u.axis_r.x == 0u) { av = vec3<i32>(1,0,0); } else if (u.axis_r.x == 1u) { av = vec3<i32>(0,1,0); } else { av = vec3<i32>(0,0,1); }
   let center = textureLoad(t_in, c, 0);
-  var sum = center.rgb * wt(0u);
+  var gb = center.gb * wt(0u);
   let R = i32(u.axis_r.y);
   for (var i = 1; i <= R; i = i + 1) {
-    sum = sum + wt(u32(i)) * (textureLoad(t_in, clamp(c + av * i, vec3<i32>(0), dmax), 0).rgb
-                            + textureLoad(t_in, clamp(c - av * i, vec3<i32>(0), dmax), 0).rgb);
+    gb = gb + wt(u32(i)) * (textureLoad(t_in, clamp(c + av * i, vec3<i32>(0), dmax), 0).gb
+                          + textureLoad(t_in, clamp(c - av * i, vec3<i32>(0), dmax), 0).gb);
   }
-  textureStore(t_out, c, vec4<f32>(sum, center.a));
+  textureStore(t_out, c, vec4<f32>(center.r, gb.x, gb.y, center.a));
 }`
 );
 function gaussHalfKernel2(sigma) {
