@@ -57,11 +57,10 @@ button:focus-visible{outline:2px solid var(--mm);outline-offset:2px}
 .chartbox{background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:6px 4px 2px;overflow-x:auto}
 #chart{width:100%;min-width:1080px;height:520px}
 .hint{color:var(--ink-3);font-size:11.5px;margin:8px 2px 0;max-width:96ch}
-.detail{display:grid;grid-template-columns:minmax(320px,1fr) 1.3fr;gap:14px;margin-top:16px}
-@media(max-width:1000px){.detail{grid-template-columns:1fr}}
+.detail{display:flex;flex-direction:column;gap:14px;margin-top:16px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:14px 16px;min-width:0}
 .card h2{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--ink-3);margin:0 0 10px;font-weight:600}
-.tblwrap{overflow:auto;max-height:330px}
+.tblwrap{overflow:auto;max-height:420px}
 table{border-collapse:collapse;width:100%;font-size:12.5px}
 th,td{text-align:left;padding:5px 9px;border-bottom:1px solid var(--line);white-space:nowrap}
 th{position:sticky;top:0;background:var(--panel);color:var(--ink-3);font-size:10px;
@@ -255,7 +254,7 @@ function show(pid, {live=false}={}){
   pane.innerHTML = caseHead(c) + chips + `
     <div style="position:relative;margin-top:10px">
       <iframe id="live" src="spine-compare.html?case=${c.pid}&coll=${coll}"
-        style="width:100%;aspect-ratio:4/4.4;border:1px solid var(--line);border-radius:8px;background:#05060a"
+        style="width:100%;height:82vh;border:1px solid var(--line);border-radius:8px;background:#05060a"
         allow="fullscreen"></iframe>
     </div>
     <p style="color:var(--ink-3);font-size:11px;margin:6px 0 0">SlicerLive scene — SPINEPS vs reference rows, linked

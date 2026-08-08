@@ -4336,8 +4336,30 @@ async function fetchZarrVolume(blobBase, z, onBytes, concurrency = 12) {
   const worker = async () => {
     while (idx < jobs.length) {
       const [kk, jj, ii] = jobs[idx++];
-      const gz = await (await fetch(chunkUrl(kk, jj, ii))).arrayBuffer();
-      onBytes?.(gz.byteLength);
+      const resp = await fetch(chunkUrl(kk, jj, ii));
+      let gz;
+      if (resp.body && onBytes) {
+        const parts = [];
+        const rd = resp.body.getReader();
+        let total = 0;
+        for (; ; ) {
+          const { done, value } = await rd.read();
+          if (done) break;
+          parts.push(value);
+          total += value.byteLength;
+          onBytes(value.byteLength);
+        }
+        const all = new Uint8Array(total);
+        let o = 0;
+        for (const p of parts) {
+          all.set(p, o);
+          o += p.byteLength;
+        }
+        gz = all.buffer;
+      } else {
+        gz = await resp.arrayBuffer();
+        onBytes?.(gz.byteLength);
+      }
       const chunk = new Ctor(await inflateDeflate(gz));
       const z0 = kk * cz, y0 = jj * cy, x0 = ii * cx;
       const zw = Math.min(cz, nz - z0), yw = Math.min(cy, ny - y0), xw = Math.min(cx, nx - x0);
@@ -5257,7 +5279,7 @@ var SegmentationLogic = class {
   }
 };
 
-// render/demos/spine-compare-scene.ts
+// examples/spine/spine-compare-scene.ts
 var BUCKET = "https://js2.jetstream-cloud.org:8001/swift/v1/spine-review/";
 var LEVEL_NAME = {
   1: "C1",
@@ -5367,6 +5389,76 @@ var METHOD_COLORS = {
   ]
 };
 var flat = (m) => Array.isArray(m[0]) ? m.flat() : m;
+function invertAffine(m) {
+  const r = [
+    m[0],
+    m[1],
+    m[2],
+    m[4],
+    m[5],
+    m[6],
+    m[8],
+    m[9],
+    m[10]
+  ];
+  const det = r[0] * (r[4] * r[8] - r[5] * r[7]) - r[1] * (r[3] * r[8] - r[5] * r[6]) + r[2] * (r[3] * r[7] - r[4] * r[6]);
+  const i = [
+    (r[4] * r[8] - r[5] * r[7]) / det,
+    (r[2] * r[7] - r[1] * r[8]) / det,
+    (r[1] * r[5] - r[2] * r[4]) / det,
+    (r[5] * r[6] - r[3] * r[8]) / det,
+    (r[0] * r[8] - r[2] * r[6]) / det,
+    (r[2] * r[3] - r[0] * r[5]) / det,
+    (r[3] * r[7] - r[4] * r[6]) / det,
+    (r[1] * r[6] - r[0] * r[7]) / det,
+    (r[0] * r[4] - r[1] * r[3]) / det
+  ];
+  const t = [
+    m[3],
+    m[7],
+    m[11]
+  ];
+  return [
+    i[0],
+    i[1],
+    i[2],
+    -(i[0] * t[0] + i[1] * t[1] + i[2] * t[2]),
+    i[3],
+    i[4],
+    i[5],
+    -(i[3] * t[0] + i[4] * t[1] + i[5] * t[2]),
+    i[6],
+    i[7],
+    i[8],
+    -(i[6] * t[0] + i[7] * t[1] + i[8] * t[2]),
+    0,
+    0,
+    0,
+    1
+  ];
+}
+function resampleLabels(lab, dims, ijkToRAS, outDims, outIjkToRAS) {
+  const [nx, ny, nz] = dims, [ox, oy, oz] = outDims;
+  const m = invertAffine(ijkToRAS);
+  const g = outIjkToRAS;
+  const out = new Uint8Array(ox * oy * oz);
+  for (let k = 0; k < oz; k++) {
+    for (let j = 0; j < oy; j++) {
+      for (let i = 0; i < ox; i++) {
+        const rx = g[0] * i + g[1] * j + g[2] * k + g[3];
+        const ry = g[4] * i + g[5] * j + g[6] * k + g[7];
+        const rz = g[8] * i + g[9] * j + g[10] * k + g[11];
+        const si = Math.round(m[0] * rx + m[1] * ry + m[2] * rz + m[3]);
+        const sj = Math.round(m[4] * rx + m[5] * ry + m[6] * rz + m[7]);
+        const sk = Math.round(m[8] * rx + m[9] * ry + m[10] * rz + m[11]);
+        if (si >= 0 && si < nx && sj >= 0 && sj < ny && sk >= 0 && sk < nz) {
+          out[(k * oy + j) * ox + i] = lab[(sk * ny + sj) * nx + si];
+        }
+      }
+    }
+  }
+  return out;
+}
 function levelGeometry(lab, dims, ijkToRAS) {
   const [nx, ny, nz] = dims;
   const acc = /* @__PURE__ */ new Map();
@@ -5485,48 +5577,25 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
   const dev = gpu.device;
   const vol = meta.volumes;
   const track = (msg) => (n) => onProgress?.(msg, n);
-  const [ct, sp, ref] = await Promise.all([
+  const [ctLow, sp, ref] = await Promise.all([
     fetchZarrVolume(base, {
-      ...vol.ct_med,
+      ...vol.ct_low,
       dataset: "."
-    }, track("CT")),
+    }, track("CT preview")),
     fetchZarrVolume(base, {
       ...vol.spineps_med,
       dataset: "."
-    }, track("SPINEPS")),
+    }, track("SPINEPS labels")),
     fetchZarrVolume(base, {
       ...vol.ref_med,
       dataset: "."
-    }, track("reference"))
+    }, track("reference labels"))
   ]);
-  const dims = ct.dims;
-  const ijkToRAS = flat(meta.ijkToRAS_med);
-  const spLab = foldSubregions(Uint8Array.from(sp.data));
-  const refLab = Uint8Array.from(ref.data);
-  const ctField = new ImageField(dev, ct.data, dims, [
-    1,
-    1,
-    1
-  ], ctLUT(), {
-    clim: [
-      CT_LEV - CT_WIN / 2,
-      CT_LEV + CT_WIN / 2
-    ],
-    ijkToRAS,
-    shade: [
-      0.25,
-      0.7,
-      0.45,
-      20
-    ]
-  });
-  const [rasLo, rasHi] = ctField.aabb();
-  const center = [
-    (rasLo[0] + rasHi[0]) / 2,
-    (rasLo[1] + rasHi[1]) / 2,
-    (rasLo[2] + rasHi[2]) / 2
-  ];
-  const radius = Math.hypot(rasHi[0] - rasLo[0], rasHi[1] - rasLo[1], rasHi[2] - rasLo[2]) / 2;
+  const medDims = sp.dims;
+  const medRAS = flat(meta.ijkToRAS_med);
+  const lowRAS = flat(meta.ijkToRAS_low);
+  const spMed = foldSubregions(Uint8Array.from(sp.data));
+  const refMed = Uint8Array.from(ref.data);
   const levelPalette = new Float32Array(256 * 4);
   for (let l = 1; l < 256; l++) {
     const [r, g, b] = levelColor(l);
@@ -5535,22 +5604,46 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
     levelPalette[l * 4 + 2] = b;
     levelPalette[l * 4 + 3] = 1;
   }
+  const mkCtField = (v, ijk) => new ImageField(dev, v.data, v.dims, [
+    1,
+    1,
+    1
+  ], ctLUT(), {
+    clim: [
+      CT_LEV - CT_WIN / 2,
+      CT_LEV + CT_WIN / 2
+    ],
+    ijkToRAS: ijk,
+    shade: [
+      0.25,
+      0.7,
+      0.45,
+      20
+    ]
+  });
+  let ctField = mkCtField(ctLow, lowRAS);
+  let ctDims = ctLow.dims, ctRAS = lowRAS;
+  const [rasLo0, rasHi0] = ctField.aabb();
+  const bakeOverlay = (lab) => {
+    const l = ctDims === medDims ? lab : resampleLabels(lab, medDims, medRAS, ctDims, ctRAS);
+    return bakeColorizeRGBA(dev, l, ctDims, levelPalette, 0);
+  };
   const makeRow = (key, lab) => {
-    const overlayTex = bakeColorizeRGBA(dev, lab, dims, levelPalette, 0);
+    const overlayTex = bakeOverlay(lab);
     const slice = new SliceRenderer(gpu, format);
-    slice.setVolume(ctField.patientToTexture(), rasLo, rasHi);
+    slice.setVolume(ctField.patientToTexture(), rasLo0, rasHi0);
     slice.setTextures(ctField.volumeTexture(), overlayTex);
     slice.setWindowLevel(CT_WIN, CT_LEV);
     slice.setOverlayOpacity(0.5);
-    const editable = new EditableSegmentation(dev, dims, {
-      ijkToRAS
+    const editable = new EditableSegmentation(dev, medDims, {
+      ijkToRAS: medRAS
     });
     const logic = new SegmentationLogic(dev, editable, {
       renderMode: "sdf",
       boundaryMode: "outer",
       opacity: 1
     });
-    const levels = levelGeometry(lab, dims, ijkToRAS);
+    const levels = levelGeometry(lab, medDims, medRAS);
     for (const [l] of levels) {
       logic.setLabelColor(l, levelColor(l));
       logic.setLabelOpacity(l, 1);
@@ -5569,20 +5662,22 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
       scene,
       logic,
       levels,
+      overlayTex,
+      lab,
       destroy() {
         logic.destroy();
         editable.destroy();
-        overlayTex.destroy();
+        this.overlayTex.destroy();
       }
     };
   };
   onProgress?.("baking SPINEPS shell", 0);
-  const rowSp = makeRow("spineps", spLab);
+  const rowSp = makeRow("spineps", spMed);
   onProgress?.("baking reference shell", 0);
-  const rowRef = makeRow("ref", refLab);
+  const rowRef = makeRow("ref", refMed);
   const mkBig = (key, lab, levels) => {
-    const editable = new EditableSegmentation(dev, dims, {
-      ijkToRAS
+    const editable = new EditableSegmentation(dev, medDims, {
+      ijkToRAS: medRAS
     });
     const logic = new SegmentationLogic(dev, editable, {
       renderMode: "sdf",
@@ -5601,36 +5696,21 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
     };
   };
   onProgress?.("baking combined 3D", 0);
-  const bigSp = mkBig("spineps", spLab, rowSp.levels);
-  const bigRef = mkBig("ref", refLab, rowRef.levels);
+  const bigSp = mkBig("spineps", spMed, rowSp.levels);
+  const bigRef = mkBig("ref", refMed, rowRef.levels);
   const big = new SceneRenderer(gpu, format);
   const methodOp = {
     spineps: 1,
     ref: 0.5
   };
   let bigVolOp = 0;
-  const bigCtLut = (o) => {
+  const bigCtLutScaled = (o) => {
     const l = ctLUT().slice();
     for (let i = 0; i < 256; i++) l[i * 4 + 3] = Math.round(l[i * 4 + 3] * o);
     return l;
   };
-  const bigCtField = new ImageField(dev, ct.data, dims, [
-    1,
-    1,
-    1
-  ], bigCtLut(1), {
-    clim: [
-      CT_LEV - CT_WIN / 2,
-      CT_LEV + CT_WIN / 2
-    ],
-    ijkToRAS,
-    shade: [
-      0.25,
-      0.7,
-      0.45,
-      20
-    ]
-  });
+  let bigCtField = mkCtField(ctLow, lowRAS);
+  bigCtField.setLUT(bigCtLutScaled(bigVolOp || 1));
   let clip = null;
   const rebuildBig = () => {
     const f = [];
@@ -5643,14 +5723,18 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
     else big.clearClip();
   };
   rebuildBig();
-  return {
+  const scObj = {
     meta,
-    dims,
-    ijkToRAS,
-    rasLo,
-    rasHi,
-    center,
-    radius,
+    dims: ctDims,
+    ijkToRAS: ctRAS,
+    rasLo: rasLo0,
+    rasHi: rasHi0,
+    center: [
+      (rasLo0[0] + rasHi0[0]) / 2,
+      (rasLo0[1] + rasHi0[1]) / 2,
+      (rasLo0[2] + rasHi0[2]) / 2
+    ],
+    radius: Math.hypot(rasHi0[0] - rasLo0[0], rasHi0[1] - rasLo0[1], rasHi0[2] - rasLo0[2]) / 2,
     win: CT_WIN,
     lev: CT_LEV,
     rows: [
@@ -5662,6 +5746,7 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
       spineps: bigSp.logic,
       ref: bigRef.logic
     },
+    upgraded: Promise.resolve(),
     setMethodOpacity(key, o) {
       const was = methodOp[key] > 1e-3;
       methodOp[key] = Math.max(0, Math.min(1, o));
@@ -5673,7 +5758,7 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
     setBigVolumeOpacity(o) {
       const was = bigVolOp > 1e-3;
       bigVolOp = Math.max(0, Math.min(1, o));
-      bigCtField.setLUT(bigCtLut(bigVolOp));
+      bigCtField.setLUT(bigCtLutScaled(bigVolOp));
       if (was !== bigVolOp > 1e-3) rebuildBig();
     },
     bigVolumeOpacity: () => bigVolOp,
@@ -5730,6 +5815,40 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
       bigRef.editable.destroy();
     }
   };
+  scObj.upgraded = (async () => {
+    const ctMed = await fetchZarrVolume(base, {
+      ...vol.ct_med,
+      dataset: "."
+    }, track("full-res CT"));
+    ctField = mkCtField(ctMed, medRAS);
+    ctDims = ctMed.dims;
+    ctRAS = medRAS;
+    const [lo, hi] = ctField.aabb();
+    scObj.dims = ctDims;
+    scObj.ijkToRAS = ctRAS;
+    scObj.rasLo = lo;
+    scObj.rasHi = hi;
+    for (const row of [
+      rowSp,
+      rowRef
+    ]) {
+      const nt = bakeOverlay(row.lab);
+      row.slice.setVolume(ctField.patientToTexture(), lo, hi);
+      row.slice.setTextures(ctField.volumeTexture(), nt);
+      row.overlayTex.destroy();
+      row.overlayTex = nt;
+      row.scene.build([
+        ctField,
+        row.logic.field()
+      ]);
+      row.scene.setBackground(0.05, 0.06, 0.09);
+    }
+    bigCtField = mkCtField(ctMed, medRAS);
+    bigCtField.setLUT(bigCtLutScaled(bigVolOp || 1));
+    rebuildBig();
+    onProgress?.("full-res CT in", 0);
+  })();
+  return scObj;
 }
 async function loadCaseMeta(coll, pid) {
   const base = `${BUCKET}${coll}/${pid}/zarr/`;
@@ -5741,7 +5860,7 @@ async function loadCaseMeta(coll, pid) {
   };
 }
 
-// render/demos/spine-compare-browser.ts
+// examples/spine/spine-compare-browser.ts
 var ORIENTS = [
   "axial",
   "sagittal",
@@ -5793,6 +5912,10 @@ async function main() {
     bytes += n;
     status(`${coll}/${pid}: ${msg} \u2014 ${(bytes / 1e6).toFixed(1)} MB`);
   });
+  sc.upgraded.then(() => {
+    drawAll();
+    status(`${coll}/${pid} \u2014 full-res CT loaded`);
+  }).catch(() => status(`${coll}/${pid} \u2014 full-res CT failed to load (showing preview res)`, true));
   const keys = [
     "spineps",
     "ref"
