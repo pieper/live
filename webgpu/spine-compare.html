@@ -4,8 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <!-- spine-compare — vertebra-by-vertebra SPINEPS vs IDC-reference comparison for one
-     spine-review case: two method rows (linked MPR + 3D), a big all-3D method-colour
-     view with extent control, and per-level jump buttons. ?case=<pid>&coll=<mets|myeloma> -->
+     spine-review case: two method rows (linked MPR + 3D, one shared slice state), an
+     extent mode (1 vert … full spine), and per-level buttons that FOCUS every view on
+     that bone. ?case=<pid>&coll=<mets|myeloma> -->
 <title>spine-compare — SPINEPS vs reference</title>
 <style>
   :root { color-scheme: dark; }
@@ -13,15 +14,16 @@
                font: 12px -apple-system, system-ui, sans-serif; }
   #page { display: flex; flex-direction: column; height: 100vh; }
   header { display: flex; align-items: center; gap: 12px; padding: 5px 12px; background: #0b0e16;
-           border-bottom: 1px solid #1b2740; flex: 0 0 auto; }
+           border-bottom: 1px solid #1b2740; flex: 0 0 auto; flex-wrap: wrap; }
   header h1 { font-size: 13px; margin: 0; color: #9fb3d0; font-weight: 700; letter-spacing: .3px; }
   #info { color: #7d92b5; }
   #status { margin-left: auto; color: #9fb3d0; }
   #cols, #extent { display: flex; gap: 4px; }
+  #extent { border-left: 1px solid #1b2740; padding-left: 12px; }
   .chip { font: 600 11px -apple-system, system-ui, sans-serif; color: #d6e2f2; background: #1b2740;
           border: 1px solid #33507e; border-radius: 4px; padding: 2px 8px; cursor: pointer; }
   .chip.on { background: #2b6cb0; border-color: #3f86d0; color: #fff; }
-  #rows { flex: 1 1 52%; display: flex; flex-direction: column; gap: 2px; min-height: 0; }
+  #rows { flex: 1; display: flex; flex-direction: column; gap: 2px; min-height: 0; }
   .mrow { flex: 1; display: flex; gap: 2px; min-height: 0; }
   .mlabel { writing-mode: vertical-rl; transform: rotate(180deg); text-align: center;
             font-weight: 700; letter-spacing: .5px; padding: 0 1px; flex: 0 0 16px; }
@@ -32,10 +34,6 @@
   .cell canvas { width: 100%; height: 100%; display: block; background: #000; touch-action: none; }
   .cell .lab { position: absolute; top: 4px; left: 6px; font-weight: 700; font-size: 10px;
                opacity: .75; pointer-events: none; color: #9fb3d0; }
-  #bigwrap { flex: 1 1 48%; position: relative; min-height: 0; border-top: 1px solid #1b2740; }
-  #bigwrap canvas { width: 100%; height: 100%; display: block; background: #000; touch-action: none; }
-  #bigwrap .lab { position: absolute; top: 5px; left: 8px; font-weight: 700; color: #9fb3d0; pointer-events: none; }
-  #extent { position: absolute; top: 4px; right: 8px; z-index: 2; }
   #levels { flex: 0 0 auto; display: flex; gap: 3px; overflow-x: auto; padding: 5px 10px;
             background: #0b0e16; border-top: 1px solid #1b2740; }
   #levels button.lvl { flex: 0 0 auto; display: flex; flex-direction: column; align-items: center; gap: 1px;
@@ -61,6 +59,12 @@
         <button id="col-coronal" class="chip on">Coronal</button>
         <button id="col-threeD" class="chip on">3D</button>
       </div>
+      <div id="extent">
+        <button id="ext-one" class="chip">1 vert</button>
+        <button id="ext-pm1" class="chip">±1</button>
+        <button id="ext-pm3" class="chip">±3</button>
+        <button id="ext-full" class="chip on">full spine</button>
+      </div>
       <span id="status">loading…</span>
     </header>
     <div id="rows">
@@ -77,16 +81,6 @@
         <div class="cell"><canvas id="c-ref-sagittal"></canvas><div class="lab">Sagittal</div></div>
         <div class="cell"><canvas id="c-ref-coronal"></canvas><div class="lab">Coronal</div></div>
         <div class="cell"><canvas id="c-ref-threeD"></canvas><div class="lab">3D</div></div>
-      </div>
-    </div>
-    <div id="bigwrap">
-      <canvas id="c-big"></canvas>
-      <div class="lab">Both methods · 3D</div>
-      <div id="extent">
-        <button id="ext-one" class="chip">1 vert</button>
-        <button id="ext-pm1" class="chip">±1</button>
-        <button id="ext-pm3" class="chip">±3</button>
-        <button id="ext-full" class="chip on">full spine</button>
       </div>
     </div>
     <div id="levels"></div>

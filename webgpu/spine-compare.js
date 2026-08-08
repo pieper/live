@@ -5131,6 +5131,7 @@ var JfaSdfBaker = class {
 var SegmentationLogic = class {
   seg;
   renderMode;
+  clippable;
   sdf;
   baker;
   presenceTex;
@@ -5156,6 +5157,7 @@ var SegmentationLogic = class {
     this.opacity = opts.opacity ?? 1;
     this.refineDelayMs = opts.refineDelayMs ?? 180;
     this.boundaryMode = opts.boundaryMode ?? "outer";
+    this.clippable = opts.clippable ?? false;
     this.setLabelColor(1, opts.color ?? [
       0.3,
       0.85,
@@ -5253,7 +5255,7 @@ var SegmentationLogic = class {
         mode: this.renderMode === "sdf" ? "sdf" : "surface",
         colorFromTexture: true,
         bandMm: band,
-        clippable: false,
+        clippable: this.clippable,
         attrTexture: this.sdf ? this.sdf.attrTexture() : void 0,
         interfaceMode
       });
@@ -5604,11 +5606,17 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
     levelPalette[l * 4 + 2] = b;
     levelPalette[l * 4 + 3] = 1;
   }
+  let volOpacity = 1;
+  const scaledLut = (o) => {
+    const l = ctLUT().slice();
+    for (let i = 0; i < 256; i++) l[i * 4 + 3] = Math.round(l[i * 4 + 3] * o);
+    return l;
+  };
   const mkCtField = (v, ijk) => new ImageField(dev, v.data, v.dims, [
     1,
     1,
     1
-  ], ctLUT(), {
+  ], scaledLut(volOpacity), {
     clim: [
       CT_LEV - CT_WIN / 2,
       CT_LEV + CT_WIN / 2
@@ -5628,20 +5636,25 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
     const l = ctDims === medDims ? lab : resampleLabels(lab, medDims, medRAS, ctDims, ctRAS);
     return bakeColorizeRGBA(dev, l, ctDims, levelPalette, 0);
   };
+  const slice = new SliceRenderer(gpu, format);
+  slice.setVolume(ctField.patientToTexture(), rasLo0, rasHi0);
+  slice.setWindowLevel(CT_WIN, CT_LEV);
+  slice.setOverlayOpacity(0.5);
+  const methodOp = {
+    spineps: 1,
+    ref: 1
+  };
+  let clip = null;
   const makeRow = (key, lab) => {
     const overlayTex = bakeOverlay(lab);
-    const slice = new SliceRenderer(gpu, format);
-    slice.setVolume(ctField.patientToTexture(), rasLo0, rasHi0);
-    slice.setTextures(ctField.volumeTexture(), overlayTex);
-    slice.setWindowLevel(CT_WIN, CT_LEV);
-    slice.setOverlayOpacity(0.5);
     const editable = new EditableSegmentation(dev, medDims, {
       ijkToRAS: medRAS
     });
     const logic = new SegmentationLogic(dev, editable, {
       renderMode: "sdf",
       boundaryMode: "outer",
-      opacity: 1
+      opacity: 1,
+      clippable: true
     });
     const levels = levelGeometry(lab, medDims, medRAS);
     for (const [l] of levels) {
@@ -5651,78 +5664,36 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
     editable.loadLabelmap(lab);
     logic.refineNow();
     const scene = new SceneRenderer(gpu, format);
-    scene.build([
-      ctField,
-      logic.field()
-    ]);
-    scene.setBackground(0.05, 0.06, 0.09);
-    return {
+    const row = {
       key,
-      slice,
+      overlayTex,
       scene,
       logic,
       levels,
-      overlayTex,
       lab,
+      rebuild() {
+        const f = [];
+        if (volOpacity > 1e-3) f.push(ctField);
+        if (methodOp[key] > 1e-3) f.push(logic.field());
+        scene.build(f);
+        scene.setBackground(0.05, 0.06, 0.09);
+        if (clip) scene.setClipBox(clip.lo, clip.hi);
+        else scene.clearClip();
+      },
       destroy() {
         logic.destroy();
         editable.destroy();
         this.overlayTex.destroy();
       }
     };
+    row.rebuild();
+    return row;
   };
   onProgress?.("baking SPINEPS shell", 0);
   const rowSp = makeRow("spineps", spMed);
   onProgress?.("baking reference shell", 0);
   const rowRef = makeRow("ref", refMed);
-  const mkBig = (key, lab, levels) => {
-    const editable = new EditableSegmentation(dev, medDims, {
-      ijkToRAS: medRAS
-    });
-    const logic = new SegmentationLogic(dev, editable, {
-      renderMode: "sdf",
-      boundaryMode: "outer",
-      opacity: 1
-    });
-    for (const [l] of levels) {
-      logic.setLabelColor(l, METHOD_COLORS[key]);
-      logic.setLabelOpacity(l, 1);
-    }
-    editable.loadLabelmap(lab);
-    logic.refineNow();
-    return {
-      logic,
-      editable
-    };
-  };
-  onProgress?.("baking combined 3D", 0);
-  const bigSp = mkBig("spineps", spMed, rowSp.levels);
-  const bigRef = mkBig("ref", refMed, rowRef.levels);
-  const big = new SceneRenderer(gpu, format);
-  const methodOp = {
-    spineps: 1,
-    ref: 0.5
-  };
-  let bigVolOp = 0;
-  const bigCtLutScaled = (o) => {
-    const l = ctLUT().slice();
-    for (let i = 0; i < 256; i++) l[i * 4 + 3] = Math.round(l[i * 4 + 3] * o);
-    return l;
-  };
-  let bigCtField = mkCtField(ctLow, lowRAS);
-  bigCtField.setLUT(bigCtLutScaled(bigVolOp || 1));
-  let clip = null;
-  const rebuildBig = () => {
-    const f = [];
-    if (bigVolOp > 1e-3) f.push(bigCtField);
-    if (methodOp.spineps > 1e-3) f.push(bigSp.logic.field());
-    if (methodOp.ref > 1e-3) f.push(bigRef.logic.field());
-    big.build(f);
-    big.setBackground(0.04, 0.05, 0.08);
-    if (clip) big.setClipBox(clip.lo, clip.hi);
-    else big.clearClip();
-  };
-  rebuildBig();
+  const rowOf = (key) => key === "spineps" ? rowSp : rowRef;
   const scObj = {
     meta,
     dims: ctDims,
@@ -5737,36 +5708,39 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
     radius: Math.hypot(rasHi0[0] - rasLo0[0], rasHi0[1] - rasLo0[1], rasHi0[2] - rasLo0[2]) / 2,
     win: CT_WIN,
     lev: CT_LEV,
+    slice,
     rows: [
       rowSp,
       rowRef
     ],
-    big,
-    bigLogic: {
-      spineps: bigSp.logic,
-      ref: bigRef.logic
+    bindRowSlice(key) {
+      slice.setTextures(ctField.volumeTexture(), rowOf(key).overlayTex);
     },
     upgraded: Promise.resolve(),
     setMethodOpacity(key, o) {
       const was = methodOp[key] > 1e-3;
       methodOp[key] = Math.max(0, Math.min(1, o));
-      (key === "spineps" ? bigSp : bigRef).logic.setGlobalOpacity(methodOp[key]);
-      if (was !== methodOp[key] > 1e-3) rebuildBig();
-      else big.syncUniforms();
+      rowOf(key).logic.setGlobalOpacity(methodOp[key]);
+      if (was !== methodOp[key] > 1e-3) rowOf(key).rebuild();
+      else rowOf(key).scene.syncUniforms();
     },
     methodOpacity: (key) => methodOp[key],
-    setBigVolumeOpacity(o) {
-      const was = bigVolOp > 1e-3;
-      bigVolOp = Math.max(0, Math.min(1, o));
-      bigCtField.setLUT(bigCtLutScaled(bigVolOp));
-      if (was !== bigVolOp > 1e-3) rebuildBig();
+    setVolumeOpacity(o) {
+      const was = volOpacity > 1e-3;
+      volOpacity = Math.max(0, Math.min(1, o));
+      ctField.setLUT(scaledLut(volOpacity));
+      if (was !== volOpacity > 1e-3) {
+        rowSp.rebuild();
+        rowRef.rebuild();
+      }
     },
-    bigVolumeOpacity: () => bigVolOp,
+    volumeOpacity: () => volOpacity,
     setExtent(label, count) {
       if (label == null || count >= 99) {
         clip = null;
-        rebuildBig();
-        return;
+        rowSp.rebuild();
+        rowRef.rebuild();
+        return null;
       }
       const lo = [
         Infinity,
@@ -5793,8 +5767,9 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
       }
       if (!any) {
         clip = null;
-        rebuildBig();
-        return;
+        rowSp.rebuild();
+        rowRef.rebuild();
+        return null;
       }
       for (let d = 0; d < 3; d++) {
         lo[d] -= 12;
@@ -5804,15 +5779,16 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
         lo,
         hi
       };
-      rebuildBig();
+      rowSp.rebuild();
+      rowRef.rebuild();
+      return {
+        lo,
+        hi
+      };
     },
     destroy() {
       rowSp.destroy();
       rowRef.destroy();
-      bigSp.logic.destroy();
-      bigSp.editable.destroy();
-      bigRef.logic.destroy();
-      bigRef.editable.destroy();
     }
   };
   scObj.upgraded = (async () => {
@@ -5828,24 +5804,16 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
     scObj.ijkToRAS = ctRAS;
     scObj.rasLo = lo;
     scObj.rasHi = hi;
+    slice.setVolume(ctField.patientToTexture(), lo, hi);
     for (const row of [
       rowSp,
       rowRef
     ]) {
       const nt = bakeOverlay(row.lab);
-      row.slice.setVolume(ctField.patientToTexture(), lo, hi);
-      row.slice.setTextures(ctField.volumeTexture(), nt);
       row.overlayTex.destroy();
       row.overlayTex = nt;
-      row.scene.build([
-        ctField,
-        row.logic.field()
-      ]);
-      row.scene.setBackground(0.05, 0.06, 0.09);
+      row.rebuild();
     }
-    bigCtField = mkCtField(ctMed, medRAS);
-    bigCtField.setLUT(bigCtLutScaled(bigVolOp || 1));
-    rebuildBig();
     onProgress?.("full-res CT in", 0);
   })();
   return scObj;
@@ -5941,16 +5909,6 @@ async function main() {
       });
     }
   }
-  cv["c-big"] = document.getElementById("c-big");
-  cx["c-big"] = cv["c-big"].getContext("webgpu");
-  cx["c-big"].configure({
-    device: gpu.device,
-    format: preferred,
-    viewFormats: [
-      srgb
-    ],
-    alphaMode: "opaque"
-  });
   const rowOf = (k) => sc.rows[k === "spineps" ? 0 : 1];
   const off = {
     axial: slicerDefaultOffset01("axial", sc.dims, sc.ijkToRAS, sc.rasLo, sc.rasHi),
@@ -5966,23 +5924,23 @@ async function main() {
   const drawSlice = (k, o) => {
     const c = cv[`c-${k}-${o}`];
     if (!c || !c.width) return;
-    const row = rowOf(k);
-    row.slice.setPlane(o, off[o]);
-    row.slice.renderToView(cx[`c-${k}-${o}`].getCurrentTexture().createView({
+    sc.bindRowSlice(k);
+    sc.slice.setPlane(o, off[o]);
+    sc.slice.renderToView(cx[`c-${k}-${o}`].getCurrentTexture().createView({
       format: srgb
     }), c.width, c.height);
   };
-  const draw3dCell = (id, scene) => {
-    const c = cv[id];
+  const draw3dCell = (k) => {
+    const c = cv[`c-${k}-threeD`];
     if (!c || !c.width) return;
+    const scene = rowOf(k).scene;
     scene.setCamera(camera.position, camera.focalPoint, camera.viewUp, camera.viewAngle, c.width, c.height);
-    scene.renderToView(cx[id].getCurrentTexture().createView({
+    scene.renderToView(cx[`c-${k}-threeD`].getCurrentTexture().createView({
       format: srgb
     }), c.width, c.height);
   };
   const drawAll3d = () => {
-    for (const k of keys) draw3dCell(`c-${k}-threeD`, rowOf(k).scene);
-    draw3dCell("c-big", sc.big);
+    for (const k of keys) draw3dCell(k);
     xhairRedraw();
   };
   const drawSlices = () => {
@@ -5995,10 +5953,7 @@ async function main() {
   };
   const xhair = createCrosshair(true);
   const overlays = {};
-  for (const id of [
-    ...keys.flatMap((k) => cellNames.map((c) => `c-${k}-${c}`)),
-    "c-big"
-  ]) {
+  for (const id of keys.flatMap((k) => cellNames.map((c) => `c-${k}-${c}`))) {
     const o = document.createElement("canvas");
     o.style.cssText = "position:absolute;inset:0;width:100%;height:100%;pointer-events:none;background:transparent;";
     cv[id].parentElement.appendChild(o);
@@ -6019,13 +5974,12 @@ async function main() {
       g.setTransform(c.width / w, 0, 0, c.height / h, 0, 0);
       g.clearRect(0, 0, w, h);
       if (!xhair.visible || !xhair.ras) continue;
-      if (id.endsWith("threeD") || id === "c-big") {
+      if (id.endsWith("threeD")) {
         const s = rasToScreen3D(camera, xhair.ras, w, h);
         if (s) drawCross(g, s.x * w, s.y * h);
       } else {
         const o = id.split("-").pop();
-        const k = id.split("-")[1];
-        const pr = rowOf(k).slice.rasToView(o, off[o], xhair.ras, w / h);
+        const pr = sc.slice.rasToView(o, off[o], xhair.ras, w / h);
         if (pr.u >= 0 && pr.u <= 1 && pr.v >= 0 && pr.v <= 1) drawCross(g, pr.u * w, pr.v * h);
       }
     }
@@ -6051,30 +6005,17 @@ async function main() {
       cv[`c-${k}-${o}`].addEventListener("pointermove", (e) => {
         if (!isShiftHover(e)) return;
         const { u, v, aspect } = uvOf(cv[`c-${k}-${o}`], e);
-        const ras = rowOf(k).slice.viewToRas(o, off[o], u, v, aspect);
+        const ras = sc.slice.viewToRas(o, off[o], u, v, aspect);
         xhair.set(ras);
         jumpAll(ras);
       });
     }
   }
-  for (const [id, scene] of [
-    [
-      "c-spineps-threeD",
-      () => sc.rows[0].scene
-    ],
-    [
-      "c-ref-threeD",
-      () => sc.rows[1].scene
-    ],
-    [
-      "c-big",
-      () => sc.big
-    ]
-  ]) {
+  for (const k of keys) {
     let inFlight = false, queued = null;
     const pick = async (u, v) => {
       inFlight = true;
-      const ras = await scene().pick(u, v);
+      const ras = await rowOf(k).scene.pick(u, v);
       inFlight = false;
       if (ras) {
         xhair.set(ras);
@@ -6086,9 +6027,9 @@ async function main() {
         pick(q.u, q.v);
       }
     };
-    cv[id].addEventListener("pointermove", (e) => {
+    cv[`c-${k}-threeD`].addEventListener("pointermove", (e) => {
       if (!isShiftHover(e)) return;
-      const { u, v } = uvOf(cv[id], e);
+      const { u, v } = uvOf(cv[`c-${k}-threeD`], e);
       if (inFlight) queued = {
         u,
         v
@@ -6100,7 +6041,7 @@ async function main() {
     for (const o of ORIENTS) {
       attachSliceControls(cv[`c-${k}-${o}`], {
         orient: o,
-        getSlice: () => rowOf(k).slice,
+        getSlice: () => sc.slice,
         step: (fwd) => {
           off[o] = sliceIx.wheel(o, off[o], fwd);
         },
@@ -6111,15 +6052,9 @@ async function main() {
       });
     }
   }
-  for (const id of [
-    "c-spineps-threeD",
-    "c-ref-threeD",
-    "c-big"
-  ]) {
-    attachCameraControls(cv[id], camera, {
-      onChange: drawAll3d
-    });
-  }
+  for (const k of keys) attachCameraControls(cv[`c-${k}-threeD`], camera, {
+    onChange: drawAll3d
+  });
   const shown = {
     axial: true,
     sagittal: true,
@@ -6127,11 +6062,7 @@ async function main() {
     threeD: true
   };
   const applyColumns = () => {
-    for (const k of keys) {
-      for (const c of cellNames) {
-        cv[`c-${k}-${c}`].parentElement.classList.toggle("hidden", !shown[c]);
-      }
-    }
+    for (const k of keys) for (const c of cellNames) cv[`c-${k}-${c}`].parentElement.classList.toggle("hidden", !shown[c]);
     resize();
   };
   for (const c of cellNames) {
@@ -6162,21 +6093,77 @@ async function main() {
       99
     ]
   ];
-  const applyExtent = () => {
-    sc.setExtent(extent >= 99 ? null : currentLevel, extent);
+  const SLICE_MARGIN = 1.5;
+  const frameCamera = (center, radius) => {
+    const d = [
+      camera.focalPoint[0] - camera.position[0],
+      camera.focalPoint[1] - camera.position[1],
+      camera.focalPoint[2] - camera.position[2]
+    ];
+    const len = Math.hypot(d[0], d[1], d[2]) || 1;
+    const dist = radius / Math.tan(camera.viewAngle / 2 * Math.PI / 180);
+    camera.focalPoint = [
+      ...center
+    ];
+    camera.position = [
+      center[0] - d[0] / len * dist,
+      center[1] - d[1] / len * dist,
+      center[2] - d[2] / len * dist
+    ];
+  };
+  const applyFocus = () => {
+    const box = sc.setExtent(extent >= 99 ? null : currentLevel, extent);
     for (const [id, n] of extents) el(id)?.classList.toggle("on", extent === n);
-    draw3dCell("c-big", sc.big);
-    xhairRedraw();
+    if (box) {
+      const c = [
+        (box.lo[0] + box.hi[0]) / 2,
+        (box.lo[1] + box.hi[1]) / 2,
+        (box.lo[2] + box.hi[2]) / 2
+      ];
+      const ext = [
+        box.hi[0] - box.lo[0],
+        box.hi[1] - box.lo[1],
+        box.hi[2] - box.lo[2]
+      ];
+      const fov = (a, b) => [
+        Math.max(30, ext[a] * SLICE_MARGIN),
+        Math.max(30, ext[b] * SLICE_MARGIN)
+      ];
+      const [axU, axV] = fov(0, 1);
+      sc.slice.setMirrorFrame("axial", c, axU, axV);
+      const [coU, coV] = fov(0, 2);
+      sc.slice.setMirrorFrame("coronal", c, coU, coV);
+      const [saU, saV] = fov(1, 2);
+      sc.slice.setMirrorFrame("sagittal", c, saU, saV);
+      frameCamera(c, Math.hypot(ext[0], ext[1], ext[2]) / 2 * 1.15);
+    } else {
+      for (const o of ORIENTS) sc.slice.resetView(o);
+      frameCamera(sc.center, sc.radius);
+    }
+    drawAll();
   };
   for (const [id, n] of extents) el(id)?.addEventListener("click", () => {
     extent = n;
-    applyExtent();
+    applyFocus();
   });
   const nameToLabel = Object.fromEntries(Object.entries(LEVEL_NAME).map(([n, s]) => [
     s,
     Number(n)
   ]));
   const strip = el("levels");
+  const selectLevel = (label) => {
+    currentLevel = label;
+    if (extent >= 99) extent = 0;
+    const g = sc.rows[0].levels.get(label) ?? sc.rows[1].levels.get(label);
+    if (g) {
+      xhair.set(g.centroid);
+      jumpAll(g.centroid);
+    }
+    applyFocus();
+    for (const bb of strip.querySelectorAll("button")) {
+      bb.classList.toggle("sel", bb.dataset.label === String(label));
+    }
+  };
   const detail = entry?.levels ?? {};
   const order = Object.keys(LEVEL_NAME).map(Number).sort((a, b) => {
     const rank = (l) => l === 28 ? 19.5 : l;
@@ -6190,48 +6177,37 @@ async function main() {
     const b = document.createElement("button");
     const dice = d?.d;
     b.className = "lvl " + (dice == null ? "nodata" : dice >= 0.7 ? "good" : dice >= 0.3 ? "warn" : "bad");
+    b.dataset.label = String(label);
     b.innerHTML = `${name}${dice != null ? `<span>${dice.toFixed(2)}</span>` : ""}${d && d.b !== name ? `<em>\u2192${d.b}</em>` : ""}`;
     b.title = d ? `Dice ${dice?.toFixed(3)} vs same-named reference; SPINEPS best match ${d.b}` : "no reference at this level";
-    b.addEventListener("click", () => {
-      currentLevel = label;
-      for (const bb of strip.querySelectorAll("button")) bb.classList.toggle("sel", bb === b);
-      const gg = sc.rows[0].levels.get(label) ?? sc.rows[1].levels.get(label);
-      if (gg) {
-        xhair.set(gg.centroid);
-        jumpAll(gg.centroid);
-      }
-      if (extent < 99) applyExtent();
-    });
+    b.addEventListener("click", () => selectLevel(label));
     strip.appendChild(b);
   }
   const controls = [
     {
-      label: "SPINEPS",
+      label: "SPINEPS shell",
       getOpacity: () => sc.methodOpacity("spineps"),
       setOpacity: (o) => {
         sc.setMethodOpacity("spineps", o);
-        draw3dCell("c-big", sc.big);
-        xhairRedraw();
+        drawAll3d();
       },
       color: METHOD_COLORS.spineps
     },
     {
-      label: "Reference",
+      label: "Reference shell",
       getOpacity: () => sc.methodOpacity("ref"),
       setOpacity: (o) => {
         sc.setMethodOpacity("ref", o);
-        draw3dCell("c-big", sc.big);
-        xhairRedraw();
+        drawAll3d();
       },
       color: METHOD_COLORS.ref
     },
     {
-      label: "CT volume",
-      getOpacity: () => sc.bigVolumeOpacity(),
+      label: "CT volume (3D)",
+      getOpacity: () => sc.volumeOpacity(),
       setOpacity: (o) => {
-        sc.setBigVolumeOpacity(o);
-        draw3dCell("c-big", sc.big);
-        xhairRedraw();
+        sc.setVolumeOpacity(o);
+        drawAll3d();
       },
       color: [
         0.75,
@@ -6242,14 +6218,13 @@ async function main() {
   ];
   installChrome({
     controls,
-    anchor: cv["c-big"].parentElement ?? void 0
+    anchor: cv["c-ref-threeD"].parentElement ?? void 0
   });
   const cmp = entry?.compare;
   el("info").textContent = `${coll}/${pid} \xB7 ${cmp ? `${cmp.n_agree}/${cmp.n_ref_labels} agree \xB7 ${cmp.n_shifted} shifted \xB7 mean Dice ${cmp.mean_dice_same?.toFixed(3)}` : "no compare record"}`;
   const resize = () => {
     const dpr = Math.min(2, globalThis.devicePixelRatio || 1);
-    for (const [id, c] of Object.entries(cv)) {
-      void id;
+    for (const c of Object.values(cv)) {
       c.width = Math.floor(c.clientWidth * dpr);
       c.height = Math.floor(c.clientHeight * dpr);
     }
@@ -6257,21 +6232,12 @@ async function main() {
   };
   globalThis.addEventListener("resize", resize);
   resize();
-  status(`${coll}/${pid} ready \u2014 shift+move to crosshair-link, scroll a slice, drag any 3D to orbit (linked), click a level to jump`);
+  status(`${coll}/${pid} ready \u2014 click a vertebra to focus it, scroll a slice, drag any 3D to orbit (linked), shift+move to crosshair`);
   globalThis.addEventListener("message", (ev) => {
     const d = ev.data;
     if (d?.type !== "jumpLevel" || !d.name) return;
     const label = nameToLabel[d.name];
-    const g = label != null ? sc.rows[0].levels.get(label) ?? sc.rows[1].levels.get(label) : void 0;
-    if (g) {
-      currentLevel = label;
-      xhair.set(g.centroid);
-      jumpAll(g.centroid);
-      if (extent < 99) applyExtent();
-      for (const bb of strip.querySelectorAll("button")) {
-        bb.classList.toggle("sel", bb.textContent?.startsWith(d.name) ?? false);
-      }
-    }
+    if (label != null && (sc.rows[0].levels.get(label) ?? sc.rows[1].levels.get(label))) selectLevel(label);
   });
   globalThis.__cmpDbg = {
     ready: () => true,
@@ -6299,21 +6265,21 @@ async function main() {
     })),
     jumpLevel: (name) => {
       const label = nameToLabel[name];
-      const g = label != null ? sc.rows[0].levels.get(label) ?? sc.rows[1].levels.get(label) : void 0;
-      if (g) {
-        xhair.set(g.centroid);
-        jumpAll(g.centroid);
-      }
+      if (label == null) return null;
+      const g = sc.rows[0].levels.get(label) ?? sc.rows[1].levels.get(label);
+      if (g) selectLevel(label);
       return g?.centroid ?? null;
     },
+    zoom: (o) => sc.slice.zoom(o),
+    extent: () => extent,
     setExtent: (n) => {
       extent = n;
-      applyExtent();
+      applyFocus();
     },
     methodOpacity: (k) => sc.methodOpacity(k),
     setMethodOpacity: (k, o) => {
       sc.setMethodOpacity(k, o);
-      draw3dCell("c-big", sc.big);
+      drawAll3d();
     }
   };
 }
