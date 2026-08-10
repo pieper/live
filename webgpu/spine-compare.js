@@ -1504,6 +1504,21 @@ function framedCamera(center, radius, distMul = 2.6) {
   ], 30);
 }
 
+// render/demos/view-grid.ts
+function attachDoubleClick(canvas, onDbl) {
+  let last = 0, lx = 0, ly = 0;
+  canvas.addEventListener("pointerdown", (e) => {
+    const dbl = e.timeStamp - last < 350 && Math.hypot(e.clientX - lx, e.clientY - ly) < 6;
+    last = dbl ? 0 : e.timeStamp;
+    lx = e.clientX;
+    ly = e.clientY;
+    if (dbl) {
+      e.preventDefault();
+      onDbl();
+    }
+  });
+}
+
 // render/demos/crosshair.ts
 function createCrosshair(visible = true) {
   const listeners = /* @__PURE__ */ new Set();
@@ -6015,7 +6030,9 @@ async function main() {
   const preferred = navigator.gpu.getPreferredCanvasFormat();
   const srgb = preferred + "-srgb";
   status("loading case list\u2026");
-  const casesDoc = await (await fetch(BUCKET + "cases.json")).json();
+  const casesDoc = await (await fetch(BUCKET + "cases.json", {
+    cache: "no-cache"
+  })).json();
   let pid = PARAMS.get("case") ?? "";
   let coll = PARAMS.get("coll") ?? "";
   if (!pid) {
@@ -6213,6 +6230,12 @@ async function main() {
         redraw: () => {
           for (const kk of keys) drawSlice(kk, o);
           xhairRedraw();
+        },
+        hooks: {
+          onDoubleClick: () => {
+            toggleMax(`c-${k}-${o}`);
+            return true;
+          }
         }
       });
     }
@@ -6220,6 +6243,23 @@ async function main() {
   for (const k of keys) attachCameraControls(cv[`c-${k}-threeD`], camera, {
     onChange: drawAll3d
   });
+  let maxed = null;
+  const toggleMax = (id) => {
+    maxed = maxed === id ? null : id;
+    const rowsEl = el("rows");
+    rowsEl.classList.toggle("maxmode", !!maxed);
+    for (const k of keys) {
+      for (const c of cellNames) {
+        const cell = cv[`c-${k}-${c}`].parentElement;
+        cell.classList.toggle("max", maxed === `c-${k}-${c}`);
+      }
+    }
+    for (const r of rowsEl.querySelectorAll(".mrow")) {
+      r.classList.toggle("hasmax", !!maxed && !!r.querySelector(".cell.max"));
+    }
+    resize();
+  };
+  for (const k of keys) attachDoubleClick(cv[`c-${k}-threeD`], () => toggleMax(`c-${k}-threeD`));
   const shown = {
     axial: true,
     sagittal: true,
@@ -6359,8 +6399,9 @@ async function main() {
     const dice = d?.d;
     b.className = "lvl " + (dice == null ? "nodata" : dice >= 0.7 ? "good" : dice >= 0.3 ? "warn" : "bad");
     b.dataset.label = String(label);
-    b.innerHTML = `${name}${dice != null ? `<span>${dice.toFixed(2)}</span>` : ""}${d && d.b !== name ? `<em>\u2192${d.b}</em>` : ""}`;
-    b.title = d ? `Dice ${dice?.toFixed(3)} vs same-named reference; SPINEPS best match ${d.b}` : "no reference at this level";
+    const best = d && d.b !== name && d.db != null ? ` ${d.db.toFixed(2)}` : "";
+    b.innerHTML = `${name}${dice != null ? `<span>${dice.toFixed(2)}</span>` : ""}${d && d.b !== name ? `<em>\u2192${d.b}${best}</em>` : ""}`;
+    b.title = d ? d.b !== name ? `Dice ${dice?.toFixed(3)} vs same-named reference \u2014 but as ${d.b} it matches with Dice ${d.db?.toFixed(3) ?? "?"} (label shift)` : `Dice ${dice?.toFixed(3)} vs the same-named reference level` : "no reference at this level";
     b.addEventListener("click", () => selectLevel(label));
     strip.appendChild(b);
     levelSeq.push(label);
