@@ -5716,10 +5716,12 @@ function levelGeometry(lab, dims, ijkToRAS) {
   }
   return out;
 }
-function foldSubregions(lab) {
-  for (let i = 0; i < lab.length; i++) if (lab[i] > 100) lab[i] = lab[i] - 100;
-  return lab;
-}
+var DISC_COLOR = [
+  0.72,
+  0.72,
+  0.66
+];
+var isDisc = (label) => label > 100;
 var CT_WIN = 1400;
 var CT_LEV = 400;
 function ctLUT(maxAlpha = 0.32) {
@@ -5754,11 +5756,11 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
   const medDims = sp.dims;
   const medRAS = flat(meta.ijkToRAS_med);
   const lowRAS = flat(meta.ijkToRAS_low);
-  const spMed = foldSubregions(Uint8Array.from(sp.data));
+  const spMed = Uint8Array.from(sp.data);
   const refMed = Uint8Array.from(ref.data);
   const levelPalette = new Float32Array(256 * 4);
   for (let l = 1; l < 256; l++) {
-    const [r, g, b] = levelColor(l);
+    const [r, g, b] = isDisc(l) ? DISC_COLOR : levelColor(l);
     levelPalette[l * 4] = r;
     levelPalette[l * 4 + 1] = g;
     levelPalette[l * 4 + 2] = b;
@@ -5802,7 +5804,12 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
     spineps: 1,
     ref: 1
   };
+  let discOp = 1;
   let clip = null;
+  let extentState = {
+    label: null,
+    count: 99
+  };
   const makeRow = (key, lab) => {
     const overlayTex = bakeOverlay(lab);
     const cap = resampleIsotropic(lab, medDims, medRAS, 256);
@@ -5817,7 +5824,7 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
     });
     const levels = levelGeometry(lab, medDims, medRAS);
     for (const [l] of levels) {
-      logic.setLabelColor(l, levelColor(l));
+      logic.setLabelColor(l, isDisc(l) ? DISC_COLOR : levelColor(l));
       logic.setLabelOpacity(l, 1);
     }
     editable.loadLabelmap(cap.lab);
@@ -5898,6 +5905,10 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
     },
     volumeOpacity: () => volOpacity,
     setExtent(label, count) {
+      extentState = {
+        label,
+        count
+      };
       const applyVisibility = (inRange) => {
         for (const row of [
           rowSp,
@@ -5905,7 +5916,8 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
         ]) {
           let changed = false;
           for (const [l] of row.levels) {
-            const o = inRange(l) ? 1 : 0;
+            const vis = isDisc(l) ? inRange(l - 100) || inRange(l - 100 + 1) : inRange(l);
+            const o = vis ? isDisc(l) ? discOp : 1 : 0;
             if (row.shown.get(l) !== o) {
               row.logic.setLabelOpacity(l, o);
               row.shown.set(l, o);
@@ -5946,7 +5958,7 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
         rowRef.levels
       ]) {
         for (const [l, g] of levels) {
-          if (Math.abs(l - label) > count) continue;
+          if (isDisc(l) || Math.abs(l - label) > count) continue;
           any = true;
           for (let d = 0; d < 3; d++) {
             if (g.lo[d] < lo[d]) lo[d] = g.lo[d];
@@ -5977,7 +5989,21 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
     },
     visibleLevels: (key) => [
       ...rowOf(key).levels.keys()
-    ].filter((l) => (rowOf(key).shown.get(l) ?? 1) > 0),
+    ].filter((l) => !isDisc(l) && (rowOf(key).shown.get(l) ?? 1) > 0),
+    setDiscOpacity(o) {
+      discOp = Math.max(0, Math.min(1, o));
+      for (let l = 101; l < 256; l++) levelPalette[l * 4 + 3] = discOp;
+      for (const row of [
+        rowSp,
+        rowRef
+      ]) {
+        const nt = bakeOverlay(row.lab);
+        row.overlayTex.destroy();
+        row.overlayTex = nt;
+      }
+      this.setExtent(extentState.label, extentState.count);
+    },
+    discOpacity: () => discOp,
     destroy() {
       rowSp.destroy();
       rowRef.destroy();
@@ -6491,6 +6517,19 @@ async function main() {
         0.78,
         0.85
       ]
+    },
+    {
+      label: "Discs (SPINEPS)",
+      getOpacity: () => sc.discOpacity(),
+      setOpacity: (o) => {
+        sc.setDiscOpacity(o);
+        requestDraw();
+      },
+      color: [
+        0.72,
+        0.72,
+        0.66
+      ]
     }
   ];
   installChrome({
@@ -6579,7 +6618,7 @@ async function main() {
     }),
     levels: (k) => [
       ...rowOf(k).levels.values()
-    ].map((g) => ({
+    ].filter((g) => g.label < 100).map((g) => ({
       label: g.label,
       name: g.name,
       voxels: g.voxels,
