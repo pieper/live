@@ -5664,6 +5664,8 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
     editable.loadLabelmap(lab);
     logic.refineNow();
     const scene = new SceneRenderer(gpu, format);
+    const shown = /* @__PURE__ */ new Map();
+    for (const [l] of levels) shown.set(l, 1);
     const row = {
       key,
       overlayTex,
@@ -5671,6 +5673,7 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
       logic,
       levels,
       lab,
+      shown,
       rebuild() {
         const f = [];
         if (volOpacity > 1e-3) f.push(ctField);
@@ -5736,7 +5739,25 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
     },
     volumeOpacity: () => volOpacity,
     setExtent(label, count) {
+      const applyVisibility = (inRange) => {
+        for (const row of [
+          rowSp,
+          rowRef
+        ]) {
+          let changed = false;
+          for (const [l] of row.levels) {
+            const o = inRange(l) ? 1 : 0;
+            if (row.shown.get(l) !== o) {
+              row.logic.setLabelOpacity(l, o);
+              row.shown.set(l, o);
+              changed = true;
+            }
+          }
+          if (changed) row.logic.refineNow();
+        }
+      };
       if (label == null || count >= 99) {
+        applyVisibility(() => true);
         clip = null;
         rowSp.rebuild();
         rowRef.rebuild();
@@ -5766,11 +5787,13 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
         }
       }
       if (!any) {
+        applyVisibility(() => true);
         clip = null;
         rowSp.rebuild();
         rowRef.rebuild();
         return null;
       }
+      applyVisibility((l) => Math.abs(l - label) <= count);
       for (let d = 0; d < 3; d++) {
         lo[d] -= 12;
         hi[d] += 12;
@@ -5786,6 +5809,9 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
         hi
       };
     },
+    visibleLevels: (key) => [
+      ...rowOf(key).levels.keys()
+    ].filter((l) => (rowOf(key).shown.get(l) ?? 1) > 0),
     destroy() {
       rowSp.destroy();
       rowRef.destroy();
@@ -6271,6 +6297,7 @@ async function main() {
       return g?.centroid ?? null;
     },
     zoom: (o) => sc.slice.zoom(o),
+    visibleLevels: (k) => sc.visibleLevels(k),
     extent: () => extent,
     setExtent: (n) => {
       extent = n;
