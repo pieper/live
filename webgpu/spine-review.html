@@ -130,7 +130,7 @@ Drag on any axis to filter; hover a line to preview, click to open the interacti
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
 <script type="module">
 const BUCKET = 'https://js2.jetstream-cloud.org:8001/swift/v1/spine-review/';
-const P = await (await fetch(BUCKET + 'payload.json')).json();
+const P = await (await fetch(BUCKET + 'payload.json', {cache: 'no-cache'})).json();
 const ZARR_READY = {};   // pid -> bool, filled lazily
 const collOf = c => c.coll === 'mets' ? 'mets' : 'myeloma';
 const LEVELS = P.levels, CASES = P.cases.filter(c=>c.ok);
