@@ -5899,6 +5899,7 @@ async function main() {
   }
   const entry = casesDoc.cases.find((c) => c.pid === pid && (!coll || c.collection === coll));
   coll = entry?.collection ?? coll;
+  el("case-btn").textContent = `${coll}/${pid} \u25BE`;
   status(`loading ${coll}/${pid}\u2026`);
   const { meta, base } = await loadCaseMeta(coll, pid);
   let bytes = 0;
