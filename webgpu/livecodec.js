@@ -2921,8 +2921,12 @@ async function main() {
   const runNeural = async () => {
     const r = race.neural;
     try {
+      const tSess = performance.now();
       const sessionP = ort.InferenceSession.create(BUCKET + "model/decoder.onnx", {
         executionProviders: ["webgpu", "wasm"]
+      }).then((s) => {
+        console.log(`livecodec: ort session ready in ${((performance.now() - tSess) / 1e3).toFixed(1)} s`);
+        return s;
       });
       sessionP.catch(() => {
       });
@@ -2939,12 +2943,14 @@ async function main() {
       const vol = sc.rows.neural.vol;
       const zfDims = [1, sh.C, sh.Df, sh.Hf, sh.Wf];
       const zfZero = new ort.Tensor("float32", new Float32Array(sh.C * sh.Df * sh.Hf * sh.Wf), zfDims);
+      const tDec = performance.now();
       for (let ch = 0; ch < sh.chunks; ch++) {
         r.note = `decode ${ch + 1}/${sh.chunks}`;
         const zcUp = new ort.Tensor("float32", dequantCoarseUp(coarseCodes, ch, sh, dec), zfDims);
         const res = await session.run({ zf: zfZero, zc_up: zcUp });
         mapOutputToHU(res.volume.data, vol, ch * sh.chunkZ, Z, sh, dec);
       }
+      console.log(`livecodec: coarse decode ${sh.chunks} chunks in ${((performance.now() - tDec) / 1e3).toFixed(1)} s`);
       sc.writeSlab("neural", 0, Z);
       r.tFirst = elapsed("neural");
       r.note = "";
@@ -3053,6 +3059,15 @@ async function main() {
       console.error(e);
     }
   };
+  globalThis.__lcDbg = {
+    ready: () => true,
+    scan: () => scan.id,
+    dims: () => sc.dims,
+    offsets: () => ({ ...off }),
+    race: () => JSON.parse(JSON.stringify(race)),
+    camera: () => ({ position: [...camera.position], focalPoint: [...camera.focalPoint] }),
+    volSample: (k, z, y, x) => sc.rows[k].vol[(z * Y + y) * X + x]
+  };
   const start = performance.now();
   race.neural.t0 = start;
   race.htj2k.t0 = start;
@@ -3067,15 +3082,6 @@ async function main() {
   await Promise.all([runNeural(), runHTJ2K()]);
   updateBars();
   drawAll();
-  globalThis.__lcDbg = {
-    ready: () => true,
-    scan: () => scan.id,
-    dims: () => sc.dims,
-    offsets: () => ({ ...off }),
-    race: () => JSON.parse(JSON.stringify(race)),
-    camera: () => ({ position: [...camera.position], focalPoint: [...camera.focalPoint] }),
-    volSample: (k, z, y, x) => sc.rows[k].vol[(z * Y + y) * X + x]
-  };
 }
 main().catch((e) => {
   status("error: " + (e?.message ?? e), true);
