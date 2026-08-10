@@ -5356,6 +5356,7 @@ var SegmentationLogic = class {
       this.sdf.setPalette(this.palette);
       this.sdf.rebakeAttr();
       for (const cb of this.redrawCbs) cb();
+      this.scheduleRefine();
     } else this.rebake();
   }
   /** A SegmentField bound to the shared render texture — hand this to the SceneRenderer once; edits
@@ -5781,7 +5782,7 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
     });
     const logic = new SegmentationLogic(dev, editable, {
       renderMode: "sdf",
-      boundaryMode: "outer",
+      boundaryMode: "all",
       opacity: 1,
       clippable: true
     });
@@ -6114,6 +6115,7 @@ async function main() {
     drawSlices();
     drawAll3d();
   };
+  for (const k of keys) rowOf(k).logic.onRedraw(() => drawAll3d());
   const xhair = createCrosshair(true);
   const overlays = {};
   for (const id of keys.flatMap((k) => cellNames.map((c) => `c-${k}-${c}`))) {
