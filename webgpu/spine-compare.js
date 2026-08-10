@@ -6248,6 +6248,51 @@ async function main() {
   });
   const cmp = entry?.compare;
   el("info").textContent = `${coll}/${pid} \xB7 ${cmp ? `${cmp.n_agree}/${cmp.n_ref_labels} agree \xB7 ${cmp.n_shifted} shifted \xB7 mean Dice ${cmp.mean_dice_same?.toFixed(3)}` : "no compare record"}`;
+  const caseBtn = el("case-btn");
+  const panel = el("case-panel");
+  const listEl = el("case-list");
+  const search = el("case-search");
+  caseBtn.textContent = `${coll}/${pid} \u25BE`;
+  const sorted = [
+    ...casesDoc.cases
+  ].sort((a, b) => (a.compare?.mean_dice_same ?? 2) - (b.compare?.mean_dice_same ?? 2));
+  const renderList = (filter = "") => {
+    const f = filter.trim().toLowerCase();
+    listEl.innerHTML = "";
+    for (const c of sorted) {
+      if (f && !c.pid.toLowerCase().includes(f) && !c.collection.includes(f)) continue;
+      const m = c.compare;
+      const dice = m?.mean_dice_same;
+      const cls = dice == null ? "" : dice < 0.3 ? "bad" : dice < 0.7 ? "warn" : "good";
+      const b = document.createElement("button");
+      b.className = "crow" + (c.pid === pid && c.collection === coll ? " cur" : "");
+      b.innerHTML = `<span class="pid">${c.pid}</span><span class="pill ${c.collection}">${c.collection}</span><span class="st ${cls}">${m ? `${m.n_agree}/${m.n_ref_labels} \xB7 ${m.n_shifted}\u21C5 \xB7 ${dice?.toFixed(2)}` : "\u2014"}</span>`;
+      b.title = m ? `${m.n_agree}/${m.n_ref_labels} levels agree \xB7 ${m.n_shifted} shifted \xB7 mean Dice ${dice?.toFixed(3)}` : "no compare record";
+      b.addEventListener("click", () => {
+        location.search = `?case=${c.pid}&coll=${c.collection}`;
+      });
+      listEl.appendChild(b);
+    }
+  };
+  const togglePanel = (show) => {
+    const on = show ?? panel.hidden;
+    panel.hidden = !on;
+    if (on) {
+      renderList(search.value);
+      search.focus();
+    }
+  };
+  caseBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    togglePanel();
+  });
+  search.addEventListener("input", () => renderList(search.value));
+  document.addEventListener("click", (e) => {
+    if (!panel.hidden && !panel.contains(e.target)) togglePanel(false);
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") togglePanel(false);
+  });
   const resize = () => {
     const dpr = Math.min(2, globalThis.devicePixelRatio || 1);
     for (const c of Object.values(cv)) {
