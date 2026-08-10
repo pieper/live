@@ -4657,7 +4657,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 var FINAL_WGSL = (
   /* wgsl */
   `
-struct U { ijkToRAS : mat4x4<f32>, dims : vec4<u32>, params : vec4<f32> };
+struct U { ijkToRAS : mat4x4<f32>, dims : vec4<u32>, params : vec4<f32>, origin : vec4<i32> };
 @group(0) @binding(0) var t_seed_in : texture_3d<f32>;
 @group(0) @binding(1) var t_label : texture_3d<u32>;
 @group(0) @binding(2) var t_out : texture_storage_3d<rgba16float, write>;
@@ -4667,9 +4667,9 @@ struct U { ijkToRAS : mat4x4<f32>, dims : vec4<u32>, params : vec4<f32> };
 @group(0) @binding(6) var<uniform> u_mode : array<vec4<f32>, 256>;   // .x = shading mode (0 surface, 1 volume)
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  if (any(gid >= u.dims.xyz)) { return; }
-  let c = vec3<i32>(gid);
-  let p = (u.ijkToRAS * vec4<f32>(vec3<f32>(gid), 1.0)).xyz;
+  let c = vec3<i32>(gid) + u.origin.xyz;   // region-limited dispatch offsets into the grid
+  if (any(c >= vec3<i32>(u.dims.xyz))) { return; }
+  let p = (u.ijkToRAS * vec4<f32>(vec3<f32>(c), 1.0)).xyz;
   let s = textureLoad(t_seed_in, c, 0);
   let valid = s.w > 0.5;
   let dist = select(1e3, distance(p, s.xyz), valid);
@@ -4699,15 +4699,15 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 var BLUR_WGSL2 = (
   /* wgsl */
   `
-struct BU { dims : vec4<u32>, axis_r : vec4<u32>, w : array<vec4<f32>, 4> };
+struct BU { dims : vec4<u32>, axis_r : vec4<u32>, w : array<vec4<f32>, 4>, origin : vec4<i32> };
 @group(0) @binding(0) var t_in : texture_3d<f32>;
 @group(0) @binding(1) var t_out : texture_storage_3d<rgba16float, write>;
 @group(0) @binding(2) var<uniform> u : BU;
 fn wt(i : u32) -> f32 { return u.w[i >> 2u][i & 3u]; }
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  if (any(gid >= u.dims.xyz)) { return; }
-  let c = vec3<i32>(gid);
+  let c = vec3<i32>(gid) + u.origin.xyz;
+  if (any(c >= vec3<i32>(u.dims.xyz))) { return; }
   let dmax = vec3<i32>(u.dims.xyz) - vec3<i32>(1);
   var av = vec3<i32>(0);
   if (u.axis_r.x == 0u) { av = vec3<i32>(1,0,0); } else if (u.axis_r.x == 1u) { av = vec3<i32>(0,1,0); } else { av = vec3<i32>(0,0,1); }
@@ -4724,15 +4724,15 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 var COLBLUR_WGSL = (
   /* wgsl */
   `
-struct BU { dims : vec4<u32>, axis_r : vec4<u32>, w : array<vec4<f32>, 4> };
+struct BU { dims : vec4<u32>, axis_r : vec4<u32>, w : array<vec4<f32>, 4>, origin : vec4<i32> };
 @group(0) @binding(0) var t_in : texture_3d<f32>;
 @group(0) @binding(1) var t_out : texture_storage_3d<rgba16float, write>;
 @group(0) @binding(2) var<uniform> u : BU;
 fn wt(i : u32) -> f32 { return u.w[i >> 2u][i & 3u]; }
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  if (any(gid >= u.dims.xyz)) { return; }
-  let c = vec3<i32>(gid);
+  let c = vec3<i32>(gid) + u.origin.xyz;
+  if (any(c >= vec3<i32>(u.dims.xyz))) { return; }
   let dmax = vec3<i32>(u.dims.xyz) - vec3<i32>(1);
   var av = vec3<i32>(0);
   if (u.axis_r.x == 0u) { av = vec3<i32>(1,0,0); } else if (u.axis_r.x == 1u) { av = vec3<i32>(0,1,0); } else { av = vec3<i32>(0,0,1); }
@@ -4749,15 +4749,15 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 var FULLBLUR_WGSL = (
   /* wgsl */
   `
-struct BU { dims : vec4<u32>, axis_r : vec4<u32>, w : array<vec4<f32>, 4> };
+struct BU { dims : vec4<u32>, axis_r : vec4<u32>, w : array<vec4<f32>, 4>, origin : vec4<i32> };
 @group(0) @binding(0) var t_in : texture_3d<f32>;
 @group(0) @binding(1) var t_out : texture_storage_3d<rgba16float, write>;
 @group(0) @binding(2) var<uniform> u : BU;
 fn wt(i : u32) -> f32 { return u.w[i >> 2u][i & 3u]; }
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  if (any(gid >= u.dims.xyz)) { return; }
-  let c = vec3<i32>(gid);
+  let c = vec3<i32>(gid) + u.origin.xyz;
+  if (any(c >= vec3<i32>(u.dims.xyz))) { return; }
   let dmax = vec3<i32>(u.dims.xyz) - vec3<i32>(1);
   var av = vec3<i32>(0);
   if (u.axis_r.x == 0u) { av = vec3<i32>(1,0,0); } else if (u.axis_r.x == 1u) { av = vec3<i32>(0,1,0); } else { av = vec3<i32>(0,0,1); }
@@ -4854,7 +4854,7 @@ var JfaSdfBaker = class {
     this.attrScratch = mk("rgba16float", GPUTextureUsage.COPY_SRC);
     this.sdfScratch = mk("rgba16float", GPUTextureUsage.COPY_SRC);
     this.uni = dev.createBuffer({
-      size: 96,
+      size: 112,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     });
     this.palBuf = dev.createBuffer({
@@ -4965,8 +4965,12 @@ var JfaSdfBaker = class {
     m.set(modes.subarray(0, Math.min(modes.length, 256 * 4)));
     this.dev.queue.writeBuffer(this.modeBuf, 0, m);
   }
-  writeUni(step) {
-    const ab = new ArrayBuffer(96);
+  writeUni(step, origin = [
+    0,
+    0,
+    0
+  ]) {
+    const ab = new ArrayBuffer(112);
     const f = new Float32Array(ab), u = new Uint32Array(ab);
     f.set(transpose4(this.ijkToRAS), 0);
     u[16] = this.dims[0];
@@ -4977,6 +4981,11 @@ var JfaSdfBaker = class {
     f[21] = this.bmode;
     f[22] = 0;
     f[23] = 0;
+    const i32v = new Int32Array(ab);
+    i32v[24] = origin[0];
+    i32v[25] = origin[1];
+    i32v[26] = origin[2];
+    i32v[27] = 0;
     this.dev.queue.writeBuffer(this.uni, 0, ab);
   }
   /** FAST bake for LIVE editing: plain JFA (approximate) + a light distance-only blur (crisp colour
@@ -5001,9 +5010,31 @@ var JfaSdfBaker = class {
    *  routed to the scratch texture (discarded — the blurred resident sdfTex stays pristine) and
    *  re-blur the attribute seams. ~4 passes instead of the ~20-pass init+JFA+blur sweep, which is
    *  what makes per-vertebra focus switching real-time. */
-  rebakeAttr(blurSeams = false) {
-    const dev = this.dev, [gx, gy, gz] = this.g;
-    this.writeUni(0);
+  rebakeAttr(blurSeams = false, regionIjk) {
+    const dev = this.dev, [dx, dy, dz] = this.dims;
+    const region = regionIjk && {
+      lo: [
+        Math.max(0, regionIjk.lo[0]),
+        Math.max(0, regionIjk.lo[1]),
+        Math.max(0, regionIjk.lo[2])
+      ],
+      hi: [
+        Math.min(dx, regionIjk.hi[0]),
+        Math.min(dy, regionIjk.hi[1]),
+        Math.min(dz, regionIjk.hi[2])
+      ]
+    };
+    const [gx, gy, gz] = region ? [
+      Math.ceil((region.hi[0] - region.lo[0]) / 4),
+      Math.ceil((region.hi[1] - region.lo[1]) / 4),
+      Math.ceil((region.hi[2] - region.lo[2]) / 4)
+    ] : this.g;
+    if (region && (gx <= 0 || gy <= 0 || gz <= 0)) return;
+    this.writeUni(0, region ? region.lo : [
+      0,
+      0,
+      0
+    ]);
     const enc = dev.createCommandEncoder();
     const bf = dev.createBindGroup({
       layout: this.finalPipe.getBindGroupLayout(0),
@@ -5052,7 +5083,7 @@ var JfaSdfBaker = class {
     dev.queue.submit([
       enc.finish()
     ]);
-    if (blurSeams) this.blurStage(this.fullBlurPipe, 1, this.attrTex, this.attrScratch);
+    if (blurSeams) this.blurStage(this.fullBlurPipe, 1, this.attrTex, this.attrScratch, region);
   }
   /** Blur the attribute seams of the CURRENT attr texture in place (no re-finalize) — the
    *  cheapest possible settle after a run of rebakeAttr(false) visibility steps. */
@@ -5185,8 +5216,8 @@ var JfaSdfBaker = class {
   }
   /** 3 separable Gaussian passes with the given pipeline (which channels it blurs), tex↔scratch,
    *  ending in scratch → copied back to `tex` so its identity stays stable for the renderer. */
-  blurStage(pipe, sigma, tex, scratch) {
-    const dev = this.dev, [gx, gy, gz] = this.g, [dx, dy, dz] = this.dims;
+  blurStage(pipe, sigma, tex, scratch, region) {
+    const dev = this.dev, [dx, dy, dz] = this.dims;
     const { radius, w } = gaussHalfKernel2(sigma);
     const passes = [
       [
@@ -5206,17 +5237,40 @@ var JfaSdfBaker = class {
       ]
     ];
     const enc = dev.createCommandEncoder();
+    let passIdx = 0;
     for (const [srcT, dstT, axis] of passes) {
-      const ab = new ArrayBuffer(96);
-      const u32 = new Uint32Array(ab), f32 = new Float32Array(ab);
+      const expand = region ? (2 - passIdx) * radius : 0;
+      const lo = region ? [
+        Math.max(0, region.lo[0] - expand),
+        Math.max(0, region.lo[1] - expand),
+        Math.max(0, region.lo[2] - expand)
+      ] : [
+        0,
+        0,
+        0
+      ];
+      const hi = region ? [
+        Math.min(dx, region.hi[0] + expand),
+        Math.min(dy, region.hi[1] + expand),
+        Math.min(dz, region.hi[2] + expand)
+      ] : [
+        dx,
+        dy,
+        dz
+      ];
+      const ab = new ArrayBuffer(112);
+      const u32 = new Uint32Array(ab), f32 = new Float32Array(ab), i32 = new Int32Array(ab);
       u32[0] = dx;
       u32[1] = dy;
       u32[2] = dz;
       u32[4] = axis;
       u32[5] = radius;
       f32.set(w, 8);
+      i32[24] = lo[0];
+      i32[25] = lo[1];
+      i32[26] = lo[2];
       const ub = dev.createBuffer({
-        size: 96,
+        size: 112,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
       });
       dev.queue.writeBuffer(ub, 0, ab);
@@ -5242,14 +5296,30 @@ var JfaSdfBaker = class {
       const bp = enc.beginComputePass();
       bp.setPipeline(pipe);
       bp.setBindGroup(0, b);
-      bp.dispatchWorkgroups(gx, gy, gz);
+      bp.dispatchWorkgroups(Math.ceil((hi[0] - lo[0]) / 4), Math.ceil((hi[1] - lo[1]) / 4), Math.ceil((hi[2] - lo[2]) / 4));
       bp.end();
+      passIdx++;
     }
-    enc.copyTextureToTexture({
-      texture: scratch
-    }, {
-      texture: tex
-    }, this.dims);
+    if (region) {
+      const sz = [
+        region.hi[0] - region.lo[0],
+        region.hi[1] - region.lo[1],
+        region.hi[2] - region.lo[2]
+      ];
+      enc.copyTextureToTexture({
+        texture: scratch,
+        origin: region.lo
+      }, {
+        texture: tex,
+        origin: region.lo
+      }, sz);
+    } else {
+      enc.copyTextureToTexture({
+        texture: scratch
+      }, {
+        texture: tex
+      }, this.dims);
+    }
     dev.queue.submit([
       enc.finish()
     ]);
@@ -5268,6 +5338,54 @@ var JfaSdfBaker = class {
 };
 
 // logic/segmentation-logic.ts
+function invertAffine(m) {
+  const r = [
+    m[0],
+    m[1],
+    m[2],
+    m[4],
+    m[5],
+    m[6],
+    m[8],
+    m[9],
+    m[10]
+  ];
+  const det = r[0] * (r[4] * r[8] - r[5] * r[7]) - r[1] * (r[3] * r[8] - r[5] * r[6]) + r[2] * (r[3] * r[7] - r[4] * r[6]);
+  const i = [
+    (r[4] * r[8] - r[5] * r[7]) / det,
+    (r[2] * r[7] - r[1] * r[8]) / det,
+    (r[1] * r[5] - r[2] * r[4]) / det,
+    (r[5] * r[6] - r[3] * r[8]) / det,
+    (r[0] * r[8] - r[2] * r[6]) / det,
+    (r[2] * r[3] - r[0] * r[5]) / det,
+    (r[3] * r[7] - r[4] * r[6]) / det,
+    (r[1] * r[6] - r[0] * r[7]) / det,
+    (r[0] * r[4] - r[1] * r[3]) / det
+  ];
+  const t = [
+    m[3],
+    m[7],
+    m[11]
+  ];
+  return [
+    i[0],
+    i[1],
+    i[2],
+    -(i[0] * t[0] + i[1] * t[1] + i[2] * t[2]),
+    i[3],
+    i[4],
+    i[5],
+    -(i[3] * t[0] + i[4] * t[1] + i[5] * t[2]),
+    i[6],
+    i[7],
+    i[8],
+    -(i[6] * t[0] + i[7] * t[1] + i[8] * t[2]),
+    0,
+    0,
+    0,
+    1
+  ];
+}
 var SegmentationLogic = class {
   seg;
   renderMode;
@@ -5372,21 +5490,78 @@ var SegmentationLogic = class {
     }
   }
   /** FAST per-segment opacity refresh: attr-only rebake (no JFA re-sweep) — for visibility
-   *  toggles where the labelmap and colours are unchanged. Real-time, unlike refineNow(). */
-  refreshOpacity() {
-    if (this.sdf) {
-      this.sdf.setPalette(this.palette);
-      this.sdf.rebakeAttr(false);
+   *  toggles where the labelmap and colours are unchanged.
+   *
+   *  With `regionRAS` (the bbox of the labels whose opacity changed): the finalize AND the
+   *  seam blur run region-limited in one shot — full settled quality lands immediately, no
+   *  two-phase. Without it: full-volume fast pass + a debounced full-volume seam blur. */
+  refreshOpacity(regionRAS) {
+    if (!this.sdf) {
+      this.rebake();
+      return;
+    }
+    this.sdf.setPalette(this.palette);
+    if (regionRAS) {
+      const dims = this.sdf.sdfDims();
+      const inv = invertAffine(this.sdf.sdfIjkToRAS());
+      const lo = [
+        Infinity,
+        Infinity,
+        Infinity
+      ];
+      const hi = [
+        -Infinity,
+        -Infinity,
+        -Infinity
+      ];
+      for (const x of [
+        regionRAS.lo[0],
+        regionRAS.hi[0]
+      ]) for (const y of [
+        regionRAS.lo[1],
+        regionRAS.hi[1]
+      ]) for (const z of [
+        regionRAS.lo[2],
+        regionRAS.hi[2]
+      ]) {
+        const i = inv[0] * x + inv[1] * y + inv[2] * z + inv[3];
+        const j = inv[4] * x + inv[5] * y + inv[6] * z + inv[7];
+        const k = inv[8] * x + inv[9] * y + inv[10] * z + inv[11];
+        lo[0] = Math.min(lo[0], i);
+        lo[1] = Math.min(lo[1], j);
+        lo[2] = Math.min(lo[2], k);
+        hi[0] = Math.max(hi[0], i);
+        hi[1] = Math.max(hi[1], j);
+        hi[2] = Math.max(hi[2], k);
+      }
+      const M = 8;
+      const region = {
+        lo: [
+          Math.floor(lo[0]) - M,
+          Math.floor(lo[1]) - M,
+          Math.floor(lo[2]) - M
+        ],
+        hi: [
+          Math.ceil(hi[0]) + M,
+          Math.ceil(hi[1]) + M,
+          Math.ceil(hi[2]) + M
+        ]
+      };
+      void dims;
+      this.sdf.rebakeAttr(true, region);
       for (const cb of this.redrawCbs) cb();
-      if (this.attrSettleTimer !== void 0) clearTimeout(this.attrSettleTimer);
-      this.attrSettleTimer = setTimeout(() => {
-        this.attrSettleTimer = void 0;
-        if (this.sdf) {
-          this.sdf.blurAttrOnly();
-          for (const cb of this.redrawCbs) cb();
-        }
-      }, 600);
-    } else this.rebake();
+      return;
+    }
+    this.sdf.rebakeAttr(false);
+    for (const cb of this.redrawCbs) cb();
+    if (this.attrSettleTimer !== void 0) clearTimeout(this.attrSettleTimer);
+    this.attrSettleTimer = setTimeout(() => {
+      this.attrSettleTimer = void 0;
+      if (this.sdf) {
+        this.sdf.blurAttrOnly();
+        for (const cb of this.redrawCbs) cb();
+      }
+    }, 600);
   }
   /** A SegmentField bound to the shared render texture — hand this to the SceneRenderer once; edits
    *  update it in place. Colour comes from the texture (per-label); the uniform supplies opacity. */
@@ -5549,7 +5724,7 @@ var METHOD_COLORS = {
   ]
 };
 var flat = (m) => Array.isArray(m[0]) ? m.flat() : m;
-function invertAffine(m) {
+function invertAffine2(m) {
   const r = [
     m[0],
     m[1],
@@ -5599,7 +5774,7 @@ function invertAffine(m) {
 }
 function resampleLabels(lab, dims, ijkToRAS, outDims, outIjkToRAS) {
   const [nx, ny, nz] = dims, [ox, oy, oz] = outDims;
-  const m = invertAffine(ijkToRAS);
+  const m = invertAffine2(ijkToRAS);
   const g = outIjkToRAS;
   const out = new Uint8Array(ox * oy * oz);
   for (let k = 0; k < oz; k++) {
@@ -5914,17 +6089,49 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
           rowSp,
           rowRef
         ]) {
-          let changed = false;
+          const changed = [];
           for (const [l] of row.levels) {
             const vis = isDisc(l) ? inRange(l - 100) || inRange(l - 100 + 1) : inRange(l);
             const o = vis ? isDisc(l) ? discOp : 1 : 0;
             if (row.shown.get(l) !== o) {
               row.logic.setLabelOpacity(l, o);
               row.shown.set(l, o);
-              changed = true;
+              changed.push(l);
             }
           }
-          if (changed) row.logic.refreshOpacity();
+          if (!changed.length) continue;
+          if (changed.length <= row.levels.size / 2) {
+            const lo2 = [
+              Infinity,
+              Infinity,
+              Infinity
+            ], hi2 = [
+              -Infinity,
+              -Infinity,
+              -Infinity
+            ];
+            for (const l of changed) {
+              const g = row.levels.get(l);
+              for (let d = 0; d < 3; d++) {
+                if (g.lo[d] < lo2[d]) lo2[d] = g.lo[d];
+                if (g.hi[d] > hi2[d]) hi2[d] = g.hi[d];
+              }
+            }
+            row.logic.refreshOpacity({
+              lo: [
+                lo2[0],
+                lo2[1],
+                lo2[2]
+              ],
+              hi: [
+                hi2[0],
+                hi2[1],
+                hi2[2]
+              ]
+            });
+          } else {
+            row.logic.refreshOpacity();
+          }
         }
       };
       const applyClip = () => {
