@@ -4395,6 +4395,65 @@ async function fetchZarrVolume(blobBase, z, onBytes, concurrency = 12) {
 }
 
 // algorithms/geom.ts
+function resampleIsotropic(lab, dims, ijkToRAS, maxDim, maxVoxels = Infinity) {
+  const sp = spacingFromIjkToRAS2(ijkToRAS);
+  const ext = [
+    dims[0] * sp[0],
+    dims[1] * sp[1],
+    dims[2] * sp[2]
+  ];
+  let vox = Math.max(...ext) / maxDim;
+  const count = (v) => Math.max(1, Math.round(ext[0] / v)) * Math.max(1, Math.round(ext[1] / v)) * Math.max(1, Math.round(ext[2] / v));
+  let coarsened = false;
+  if (count(vox) > maxVoxels) {
+    vox = Math.cbrt(ext[0] * ext[1] * ext[2] / maxVoxels);
+    coarsened = true;
+  }
+  const cd = [
+    Math.max(1, Math.round(ext[0] / vox)),
+    Math.max(1, Math.round(ext[1] / vox)),
+    Math.max(1, Math.round(ext[2] / vox))
+  ];
+  const [nx, ny, nz] = dims, [cx, cy, cz] = cd;
+  const out = new Uint32Array(cx * cy * cz);
+  if (cx === nx && cy === ny && cz === nz) {
+    for (let i = 0; i < out.length; i++) out[i] = lab[i];
+    return {
+      lab: out,
+      dims,
+      ijkToRAS,
+      vox,
+      coarsened
+    };
+  }
+  for (let z = 0; z < cz; z++) {
+    const sz = Math.min(nz - 1, Math.floor((z + 0.5) * nz / cz));
+    for (let y = 0; y < cy; y++) {
+      const sy = Math.min(ny - 1, Math.floor((y + 0.5) * ny / cy));
+      for (let x = 0; x < cx; x++) {
+        const sx = Math.min(nx - 1, Math.floor((x + 0.5) * nx / cx));
+        out[(z * cy + y) * cx + x] = lab[(sz * ny + sy) * nx + sx];
+      }
+    }
+  }
+  const r = [
+    nx / cx,
+    ny / cy,
+    nz / cz
+  ], m = ijkToRAS.slice();
+  for (let row = 0; row < 3; row++) {
+    m[row * 4] *= r[0];
+    m[row * 4 + 1] *= r[1];
+    m[row * 4 + 2] *= r[2];
+  }
+  return {
+    lab: out,
+    dims: cd,
+    ijkToRAS: m,
+    vox,
+    coarsened
+  };
+}
 function spacingFromIjkToRAS2(ijkToRAS) {
   const col = (c) => Math.hypot(ijkToRAS[c], ijkToRAS[4 + c], ijkToRAS[8 + c]);
   return [
@@ -4721,6 +4780,7 @@ var JfaSdfBaker = class {
   sdfTex;
   attrTex;
   attrScratch;
+  lastSeed;
   sdfScratch;
   uni;
   palBuf;
@@ -4745,6 +4805,7 @@ var JfaSdfBaker = class {
     this.labelTex = labelTex;
     this.dims = dims;
     this.ijkToRAS = ijkToRAS;
+    this.lastSeed = 0;
     this.dev = dev;
     this.smoothSigma = smoothSigmaVoxels;
     this.bmode = boundaryMode === "all" ? 1 : 0;
@@ -4920,6 +4981,63 @@ var JfaSdfBaker = class {
       1
     ], this.smoothSigma, 1);
   }
+  /** ATTR-ONLY rebake for palette/opacity changes (per-segment visibility): the distance field
+   *  doesn't move, so re-run ONLY the finalize (from the last sweep's seed) with its sdf writes
+   *  routed to the scratch texture (discarded — the blurred resident sdfTex stays pristine) and
+   *  re-blur the attribute seams. ~4 passes instead of the ~20-pass init+JFA+blur sweep, which is
+   *  what makes per-vertebra focus switching real-time. */
+  rebakeAttr() {
+    const dev = this.dev, [gx, gy, gz] = this.g;
+    this.writeUni(0);
+    const enc = dev.createCommandEncoder();
+    const bf = dev.createBindGroup({
+      layout: this.finalPipe.getBindGroupLayout(0),
+      entries: [
+        {
+          binding: 0,
+          resource: this.seed[this.lastSeed].createView()
+        },
+        {
+          binding: 1,
+          resource: this.labelTex.createView()
+        },
+        {
+          binding: 2,
+          resource: this.sdfScratch.createView()
+        },
+        {
+          binding: 3,
+          resource: {
+            buffer: this.uni
+          }
+        },
+        {
+          binding: 4,
+          resource: {
+            buffer: this.palBuf
+          }
+        },
+        {
+          binding: 5,
+          resource: this.attrTex.createView()
+        },
+        {
+          binding: 6,
+          resource: {
+            buffer: this.modeBuf
+          }
+        }
+      ]
+    });
+    const p = enc.beginComputePass();
+    p.setPipeline(this.finalPipe);
+    p.setBindGroup(0, bf);
+    p.dispatchWorkgroups(gx, gy, gz);
+    p.end();
+    dev.queue.submit([
+      enc.finish()
+    ]);
+  }
   /** One full sweep: init → JFA (schedule + extra) → finalize → blur .a → optional blur .rgb. */
   sweep(extraSteps, distSigma, colorSigma) {
     const dev = this.dev, [gx, gy, gz] = this.g;
@@ -4991,6 +5109,7 @@ var JfaSdfBaker = class {
       ]);
       src = dst;
     }
+    this.lastSeed = src;
     enc = dev.createCommandEncoder();
     const bf = dev.createBindGroup({
       layout: this.finalPipe.getBindGroupLayout(0),
@@ -5229,6 +5348,15 @@ var SegmentationLogic = class {
       this.sdf.refine();
       for (const cb of this.redrawCbs) cb();
     }
+  }
+  /** FAST per-segment opacity refresh: attr-only rebake (no JFA re-sweep) — for visibility
+   *  toggles where the labelmap and colours are unchanged. Real-time, unlike refineNow(). */
+  refreshOpacity() {
+    if (this.sdf) {
+      this.sdf.setPalette(this.palette);
+      this.sdf.rebakeAttr();
+      for (const cb of this.redrawCbs) cb();
+    } else this.rebake();
   }
   /** A SegmentField bound to the shared render texture — hand this to the SceneRenderer once; edits
    *  update it in place. Colour comes from the texture (per-label); the uniform supplies opacity. */
@@ -5647,8 +5775,9 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
   let clip = null;
   const makeRow = (key, lab) => {
     const overlayTex = bakeOverlay(lab);
-    const editable = new EditableSegmentation(dev, medDims, {
-      ijkToRAS: medRAS
+    const cap = resampleIsotropic(lab, medDims, medRAS, 256);
+    const editable = new EditableSegmentation(dev, cap.dims, {
+      ijkToRAS: cap.ijkToRAS
     });
     const logic = new SegmentationLogic(dev, editable, {
       renderMode: "sdf",
@@ -5661,7 +5790,7 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
       logic.setLabelColor(l, levelColor(l));
       logic.setLabelOpacity(l, 1);
     }
-    editable.loadLabelmap(lab);
+    editable.loadLabelmap(cap.lab);
     logic.refineNow();
     const scene = new SceneRenderer(gpu, format);
     const shown = /* @__PURE__ */ new Map();
@@ -5753,14 +5882,23 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
               changed = true;
             }
           }
-          if (changed) row.logic.refineNow();
+          if (changed) row.logic.refreshOpacity();
+        }
+      };
+      const applyClip = () => {
+        for (const row of [
+          rowSp,
+          rowRef
+        ]) {
+          if (clip) row.scene.setClipBox(clip.lo, clip.hi);
+          else row.scene.clearClip();
+          row.scene.syncUniforms();
         }
       };
       if (label == null || count >= 99) {
         applyVisibility(() => true);
         clip = null;
-        rowSp.rebuild();
-        rowRef.rebuild();
+        applyClip();
         return null;
       }
       const lo = [
@@ -5789,8 +5927,7 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
       if (!any) {
         applyVisibility(() => true);
         clip = null;
-        rowSp.rebuild();
-        rowRef.rebuild();
+        applyClip();
         return null;
       }
       applyVisibility((l) => Math.abs(l - label) <= count);
@@ -5802,8 +5939,7 @@ async function buildSpineCompareScene(gpu, format, meta, base, onProgress) {
         lo,
         hi
       };
-      rowSp.rebuild();
-      rowRef.rebuild();
+      applyClip();
       return {
         lo,
         hi
@@ -6196,6 +6332,22 @@ async function main() {
     const rank = (l) => l === 28 ? 19.5 : l;
     return rank(a) - rank(b);
   });
+  const levelSeq = [];
+  const stepLevel = (delta) => {
+    if (!levelSeq.length) return;
+    const i = currentLevel == null ? delta > 0 ? 0 : levelSeq.length - 1 : Math.max(0, Math.min(levelSeq.length - 1, levelSeq.indexOf(currentLevel) + delta));
+    if (levelSeq[i] !== currentLevel) selectLevel(levelSeq[i]);
+  };
+  const navBtn = (txt, delta, title) => {
+    const b = document.createElement("button");
+    b.className = "lvlnav";
+    b.textContent = txt;
+    b.title = title;
+    b.addEventListener("click", () => stepLevel(delta));
+    strip.appendChild(b);
+    return b;
+  };
+  navBtn("\u25C0", -1, "previous level (\u2190)");
   for (const label of order) {
     const name = LEVEL_NAME[label];
     const d = detail[name];
@@ -6209,7 +6361,19 @@ async function main() {
     b.title = d ? `Dice ${dice?.toFixed(3)} vs same-named reference; SPINEPS best match ${d.b}` : "no reference at this level";
     b.addEventListener("click", () => selectLevel(label));
     strip.appendChild(b);
+    levelSeq.push(label);
   }
+  navBtn("\u25B6", 1, "next level (\u2192)");
+  document.addEventListener("keydown", (e) => {
+    if (e.target?.tagName === "INPUT") return;
+    if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      stepLevel(-1);
+    } else if (e.key === "ArrowRight") {
+      e.preventDefault();
+      stepLevel(1);
+    }
+  });
   const controls = [
     {
       label: "SPINEPS shell",
@@ -6344,6 +6508,8 @@ async function main() {
     },
     zoom: (o) => sc.slice.zoom(o),
     visibleLevels: (k) => sc.visibleLevels(k),
+    currentLevel: () => currentLevel,
+    stepLevel: (d) => stepLevel(d),
     extent: () => extent,
     setExtent: (n) => {
       extent = n;
