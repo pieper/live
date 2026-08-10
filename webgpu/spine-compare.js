@@ -5001,7 +5001,7 @@ var JfaSdfBaker = class {
    *  routed to the scratch texture (discarded — the blurred resident sdfTex stays pristine) and
    *  re-blur the attribute seams. ~4 passes instead of the ~20-pass init+JFA+blur sweep, which is
    *  what makes per-vertebra focus switching real-time. */
-  rebakeAttr() {
+  rebakeAttr(blurSeams = false) {
     const dev = this.dev, [gx, gy, gz] = this.g;
     this.writeUni(0);
     const enc = dev.createCommandEncoder();
@@ -5052,6 +5052,12 @@ var JfaSdfBaker = class {
     dev.queue.submit([
       enc.finish()
     ]);
+    if (blurSeams) this.blurStage(this.fullBlurPipe, 1, this.attrTex, this.attrScratch);
+  }
+  /** Blur the attribute seams of the CURRENT attr texture in place (no re-finalize) — the
+   *  cheapest possible settle after a run of rebakeAttr(false) visibility steps. */
+  blurAttrOnly() {
+    this.blurStage(this.fullBlurPipe, 1, this.attrTex, this.attrScratch);
   }
   /** One full sweep: init → JFA (schedule + extra) → finalize → blur .a → optional blur .rgb. */
   sweep(extraSteps, distSigma, colorSigma) {
@@ -5266,6 +5272,7 @@ var SegmentationLogic = class {
   seg;
   renderMode;
   clippable;
+  attrSettleTimer;
   sdf;
   baker;
   presenceTex;
@@ -5369,9 +5376,16 @@ var SegmentationLogic = class {
   refreshOpacity() {
     if (this.sdf) {
       this.sdf.setPalette(this.palette);
-      this.sdf.rebakeAttr();
+      this.sdf.rebakeAttr(false);
       for (const cb of this.redrawCbs) cb();
-      this.scheduleRefine();
+      if (this.attrSettleTimer !== void 0) clearTimeout(this.attrSettleTimer);
+      this.attrSettleTimer = setTimeout(() => {
+        this.attrSettleTimer = void 0;
+        if (this.sdf) {
+          this.sdf.blurAttrOnly();
+          for (const cb of this.redrawCbs) cb();
+        }
+      }, 600);
     } else this.rebake();
   }
   /** A SegmentField bound to the shared render texture — hand this to the SceneRenderer once; edits
@@ -6111,14 +6125,31 @@ async function main() {
       format: srgb
     }), c.width, c.height);
   };
+  let fast3d = false;
+  let settle3dTimer = 0;
   const draw3dCell = (k) => {
     const c = cv[`c-${k}-threeD`];
     if (!c || !c.width) return;
     const scene = rowOf(k).scene;
-    scene.setCamera(camera.position, camera.focalPoint, camera.viewUp, camera.viewAngle, c.width, c.height);
-    scene.renderToView(cx[`c-${k}-threeD`].getCurrentTexture().createView({
+    const view = cx[`c-${k}-threeD`].getCurrentTexture().createView({
       format: srgb
-    }), c.width, c.height);
+    });
+    if (fast3d) {
+      const rw = Math.max(16, Math.round(c.width * 0.5)), rh = Math.max(16, Math.round(c.height * 0.5));
+      scene.setCamera(camera.position, camera.focalPoint, camera.viewUp, camera.viewAngle, rw, rh);
+      scene.renderUpscaled(view, rw, rh, c.width, c.height);
+    } else {
+      scene.setCamera(camera.position, camera.focalPoint, camera.viewUp, camera.viewAngle, c.width, c.height);
+      scene.renderToView(view, c.width, c.height);
+    }
+  };
+  const touch3d = () => {
+    fast3d = true;
+    clearTimeout(settle3dTimer);
+    settle3dTimer = setTimeout(() => {
+      fast3d = false;
+      drawAll3d();
+    }, 350);
   };
   const drawAll3d = () => {
     for (const k of keys) draw3dCell(k);
@@ -6132,7 +6163,16 @@ async function main() {
     drawSlices();
     drawAll3d();
   };
-  for (const k of keys) rowOf(k).logic.onRedraw(() => drawAll3d());
+  let drawRaf = 0;
+  const requestDraw = () => {
+    touch3d();
+    if (drawRaf) return;
+    drawRaf = requestAnimationFrame(() => {
+      drawRaf = 0;
+      drawAll();
+    });
+  };
+  for (const k of keys) rowOf(k).logic.onRedraw(requestDraw);
   const xhair = createCrosshair(true);
   const overlays = {};
   for (const id of keys.flatMap((k) => cellNames.map((c) => `c-${k}-${c}`))) {
@@ -6171,7 +6211,7 @@ async function main() {
       const a = o === "axial" ? 2 : o === "coronal" ? 1 : 0;
       off[o] = Math.max(0, Math.min(1, (ras[a] - sc.rasLo[a]) / (sc.rasHi[a] - sc.rasLo[a])));
     }
-    drawAll();
+    requestDraw();
   };
   const isShiftHover = (e) => e.shiftKey && e.buttons === 0;
   const uvOf = (c, e) => {
@@ -6241,7 +6281,10 @@ async function main() {
     }
   }
   for (const k of keys) attachCameraControls(cv[`c-${k}-threeD`], camera, {
-    onChange: drawAll3d
+    onChange: () => {
+      touch3d();
+      drawAll3d();
+    }
   });
   let maxed = null;
   const toggleMax = (id) => {
@@ -6345,7 +6388,7 @@ async function main() {
       for (const o of ORIENTS) sc.slice.resetView(o);
       frameCamera(sc.center, sc.radius);
     }
-    drawAll();
+    requestDraw();
   };
   for (const [id, n] of extents) el(id)?.addEventListener("click", () => {
     extent = n;
