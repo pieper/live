@@ -1,0 +1,59 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>decodeSubResolution test</title>
+<script src="https://cdn.jsdelivr.net/npm/@cornerstonejs/codec-openjph/dist/openjphjs.js"></script>
+<pre id="log"></pre>
+<script type="module">
+const log = (m) => { document.getElementById("log").textContent += m + "\n"; console.log(m); };
+try {
+  const openjph = await Module();
+  const dec = new openjph.HTJ2KDecoder();
+  const [idx, bin, truth] = await Promise.all([
+    fetch("index.json").then(r => r.json()),
+    fetch("slices.bin").then(r => r.arrayBuffer()).then(b => new Uint8Array(b)),
+    fetch("truth.bin").then(r => r.arrayBuffer()).then(b => new Uint16Array(b)),
+  ]);
+  log(`layout=${idx.layout} rounds=${idx.rounds} slices=${idx.slices.length}`);
+  const R = idx.rounds;
+  const W = 512, H = 512;
+  // test slices 0, 11, 23 at every round count k+1 (k = last included part)
+  for (const s of [idx.slices[0], idx.slices[11], idx.slices[23]]) {
+    for (let k = 0; k < R; k++) {
+      const parts = s.parts.slice(0, k + 1);
+      const len = parts.reduce((t, p) => t + p[1], 0);
+      const enc = dec.getEncodedBuffer(len);
+      let o = 0;
+      for (const [off, n] of parts) { enc.set(bin.subarray(off, off + n), o); o += n; }
+      const level = R - 1 - k;
+      dec.decodeSubResolution(level);
+      const fi = dec.getFrameInfo ? dec.getFrameInfo() : null;
+      const out = dec.getDecodedBuffer();
+      const u16 = new Uint16Array(out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength));
+      const dim = Math.round(Math.sqrt(u16.length));
+      let msg = `z=${s.z} k=${k} level=${level} bytes=${len} decodedLen=${u16.length} dim=${dim}x${dim}`;
+      if (fi) msg += ` frameInfo=${fi.width}x${fi.height} bpp=${fi.bitsPerSample} signed=${fi.isSigned}`;
+      if (k === R - 1) {
+        // full prefix must be lossless vs truth
+        let maxd = 0;
+        const base = s.z * W * H;
+        for (let i = 0; i < W * H; i++) {
+          const d = Math.abs(u16[i] - truth[base + i]);
+          if (d > maxd) maxd = d;
+        }
+        msg += ` FINAL maxdiff=${maxd}`;
+      } else {
+        // spot-check center pixel roughly tracks truth (lossy at low res)
+        const c = (dim >> 1) * dim + (dim >> 1);
+        const scale = W / dim;
+        const tc = (s.z * H + Math.floor((dim >> 1) * scale)) * W + Math.floor((dim >> 1) * scale);
+        msg += ` center=${u16[c]} truthNear=${truth[tc]}`;
+      }
+      log(msg);
+    }
+  }
+  log("TEST DONE");
+} catch (e) {
+  log("ERROR " + (e?.message ?? e));
+  console.error(e);
+}
+</script>

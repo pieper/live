@@ -4,7 +4,7 @@ async function initDevice() {
   if (!gpu) throw new Error("WebGPU not available (need Chrome/Edge/Safari or Deno --unstable-webgpu)");
   const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
   if (!adapter) throw new Error("no WebGPU adapter");
-  const want = ["float32-filterable", "timestamp-query"].filter((f) => adapter.features.has(f));
+  const want = ["float32-filterable", "timestamp-query", "shader-f16"].filter((f) => adapter.features.has(f));
   const lim = adapter.limits;
   const requiredLimits = {};
   const raise = (k) => {
@@ -16,6 +16,444 @@ async function initDevice() {
   raise("maxTextureDimension3D");
   const device = await adapter.requestDevice({ requiredFeatures: want, requiredLimits });
   return { adapter, device, features: new Set(want) };
+}
+
+// examples/livecodec/wgpu-net.js
+var U = GPUBufferUsage;
+var f32tof16 = (() => {
+  const b = new ArrayBuffer(4), f = new Float32Array(b), i = new Uint32Array(b);
+  return (x) => {
+    f[0] = x;
+    const bits = i[0];
+    const s = bits >>> 16 & 32768;
+    let e = bits >>> 23 & 255;
+    let m = bits & 8388607;
+    if (e === 255) return s | 31744 | (m ? 512 : 0);
+    e = e - 127 + 15;
+    if (e >= 31) return s | 31744;
+    if (e <= 0) {
+      if (e < -10) return s;
+      m |= 8388608;
+      return s | m >>> 14 - e;
+    }
+    return s | e << 10 | m >>> 13;
+  };
+})();
+var f16tof32 = (h) => {
+  const s = h & 32768 ? -1 : 1;
+  const e = h >> 10 & 31;
+  const m = h & 1023;
+  if (e === 0) return s * Math.pow(2, -14) * (m / 1024);
+  if (e === 31) return m ? NaN : s * Infinity;
+  return s * Math.pow(2, e - 15) * (1 + m / 1024);
+};
+var toF16 = (a) => {
+  const u = new Uint16Array(a.length);
+  for (let i = 0; i < a.length; i++) u[i] = f32tof16(a[i]);
+  return u;
+};
+var _f16lut = null;
+var fromF16 = (u) => {
+  if (!_f16lut) {
+    _f16lut = new Float32Array(65536);
+    for (let i = 0; i < 65536; i++) _f16lut[i] = f16tof32(i);
+  }
+  const a = new Float32Array(u.length);
+  for (let i = 0; i < u.length; i++) a[i] = _f16lut[u[i]];
+  return a;
+};
+function genConv(TM, TN, silu = false, kb = null) {
+  const AS = 64 * TM, BS = 64 * TN, ACC = TM * TN;
+  let af = "", bf = "", fma = "", wr = "";
+  for (let i = 0; i < TM; i++) af += `af[${i}u]=As[(ar+${i}u)*4u+k4];`;
+  for (let j = 0; j < TN; j++) bf += `bf[${j}u]=Bs[(br+${j}u)*4u+k4];`;
+  for (let i = 0; i < TM; i++) for (let j = 0; j < TN; j++) fma += `acc[${i * TN + j}u]+=f32(dot(af[${i}u],bf[${j}u]));`;
+  for (let i = 0; i < TM; i++) for (let j = 0; j < TN; j++) {
+    wr += silu ? `{let gm=rowBase+ar+${i}u;let gn=colBase+br+${j}u;if(gm<d.Co&&gn<Nvox){let v=acc[${i * TN + j}u]+f32(bias[gm]);outp[gm*Nvox+gn]=f16(v/(1.0+exp(-v)));}}` : `{let gm=rowBase+ar+${i}u;let gn=colBase+br+${j}u;if(gm<d.Co&&gn<Nvox){outp[gm*Nvox+gn]=f16(acc[${i * TN + j}u])+bias[gm];}}`;
+  }
+  let gB;
+  if (kb) {
+    const { KD, KH, KW, pz, py, px } = kb, taps = KD * KH * KW;
+    const zCheck = KD === 1 && pz === 0 ? "let iz=i32(oz);" : `let iz=i32(oz)+i32(kz)-${pz}; if(iz<0||iz>=i32(d.ID)){return f16(0);}`;
+    gB = `fn gB(gk:u32,oz:u32,oy:u32,ox:u32)->f16{ let ci=gk/${taps}u; let tap=gk%${taps}u;
+  let kz=tap/${KH * KW}u; let ky=(tap/${KW}u)%${KH}u; let kx=tap%${KW}u;
+  ${zCheck}
+  let iy=i32(oy)+i32(ky)-${py}; let ix=i32(ox)+i32(kx)-${px};
+  if(iy<0||iy>=i32(d.IH)||ix<0||ix>=i32(d.IW)){return f16(0);}
+  return inp[((ci*d.ID+u32(iz))*d.IH+u32(iy))*d.IW+u32(ix)]; }`;
+  } else {
+    gB = `fn gB(gk:u32,oz:u32,oy:u32,ox:u32)->f16{ let taps=d.KD*d.KH*d.KW; let ci=gk/taps; let tap=gk%taps;
+  let kz=tap/(d.KH*d.KW); let ky=(tap/d.KW)%d.KH; let kx=tap%d.KW;
+  let iz=i32(oz*d.S)+i32(kz)-i32(d.pz); let iy=i32(oy*d.S)+i32(ky)-i32(d.py); let ix=i32(ox*d.S)+i32(kx)-i32(d.px);
+  if(iz<0||iz>=i32(d.ID)||iy<0||iy>=i32(d.IH)||ix<0||ix>=i32(d.IW)){return f16(0);}
+  return inp[((ci*d.ID+u32(iz))*d.IH+u32(iy))*d.IW+u32(ix)]; }`;
+  }
+  const ktot = kb ? `d.Ci*${kb.KD * kb.KH * kb.KW}u` : "d.Ci*d.KD*d.KH*d.KW";
+  return `struct D{Ci:u32,Co:u32,OD:u32,OH:u32,OW:u32,ID:u32,IH:u32,IW:u32,KD:u32,KH:u32,KW:u32,S:u32,pz:u32,py:u32,px:u32,aux:u32};
+@group(0)@binding(0) var<storage,read> inp:array<f16>; @group(0)@binding(1) var<storage,read> wgt:array<f16>;
+@group(0)@binding(2) var<storage,read> bias:array<f16>; @group(0)@binding(3) var<storage,read_write> outp:array<f16>;
+@group(0)@binding(4) var<uniform> d:D;
+var<workgroup> As:array<vec4<f16>,${AS}>; var<workgroup> Bs:array<vec4<f16>,${BS}>;
+${gB}
+@compute @workgroup_size(16,16)
+fn main(@builtin(workgroup_id) wid:vec3<u32>,@builtin(local_invocation_id) lid:vec3<u32>){
+  let Nvox=d.OD*d.OH*d.OW; let Ktot=${ktot}; let Ktiles=(Ktot+15u)/16u;
+  let tid=lid.y*16u+lid.x; let rowBase=wid.y*${16 * TM}u; let ntile=wid.z*d.aux+wid.x; let colBase=ntile*${16 * TN}u;
+  let OHW=d.OH*d.OW; let ar=lid.y*${TM}u; let br=lid.x*${TN}u;
+  var acc:array<f32,${ACC}>; for(var i=0u;i<${ACC}u;i++){acc[i]=0.0;}
+  for(var kk:u32=0u;kk<Ktiles;kk++){
+    for(var e=tid;e<${AS}u;e+=256u){ let m=e/4u;let k4=e%4u;let gm=rowBase+m;let base=kk*16u+k4*4u; var v=vec4<f16>(0.0,0.0,0.0,0.0);
+      if(gm<d.Co){let o=gm*Ktot+base; if(base<Ktot){v.x=wgt[o];} if(base+1u<Ktot){v.y=wgt[o+1u];} if(base+2u<Ktot){v.z=wgt[o+2u];} if(base+3u<Ktot){v.w=wgt[o+3u];}} As[e]=v; }
+    for(var e=tid;e<${BS}u;e+=256u){ let n=e/4u;let k4=e%4u;let gn=colBase+n;let base=kk*16u+k4*4u; var v=vec4<f16>(0.0,0.0,0.0,0.0);
+      if(gn<Nvox){let oz=gn/OHW;let rem=gn%OHW;let oy=rem/d.OW;let ox=rem%d.OW; v.x=gB(base,oz,oy,ox);v.y=gB(base+1u,oz,oy,ox);v.z=gB(base+2u,oz,oy,ox);v.w=gB(base+3u,oz,oy,ox);} Bs[e]=v; }
+    workgroupBarrier();
+    for(var k4=0u;k4<4u;k4++){ var af:array<vec4<f16>,${TM}>; var bf:array<vec4<f16>,${TN}>; ${af} ${bf} ${fma} }
+    workgroupBarrier();
+  }
+  ${wr}
+}`;
+}
+var GN_STATS = `struct P{Cg:u32,D:u32,HW:u32,G:u32,ps:u32};
+@group(0)@binding(0) var<storage,read> x:array<f16>;
+@group(0)@binding(1) var<storage,read_write> st:array<f32>; @group(0)@binding(2) var<uniform> p:P;
+var<workgroup> ss:array<f32,256>; var<workgroup> sq:array<f32,256>;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid:vec3<u32>,@builtin(local_invocation_id) lid:vec3<u32>){
+  let w=wid.x; var g=w; var d0=0u; var N=p.Cg*p.D*p.HW;
+  if(p.ps==1u){ g=w/p.D; d0=w%p.D; N=p.Cg*p.HW; }
+  var s=0.0; var q=0.0;
+  for(var i=lid.x;i<N;i+=256u){ var idx=g*N+i;
+    if(p.ps==1u){ let cc=i/p.HW; let sp=i%p.HW; idx=((g*p.Cg+cc)*p.D+d0)*p.HW+sp; }
+    let v=f32(x[idx]); s+=v; q+=v*v; }
+  ss[lid.x]=s; sq[lid.x]=q; workgroupBarrier();
+  for(var t=128u;t>0u;t>>=1u){ if(lid.x<t){ss[lid.x]+=ss[lid.x+t];sq[lid.x]+=sq[lid.x+t];} workgroupBarrier(); }
+  if(lid.x==0u){ let m=ss[0]/f32(N); let vr=sq[0]/f32(N)-m*m; st[w*2u]=m; st[w*2u+1u]=inverseSqrt(max(vr,0.0)+1e-5); } }`;
+var GN_APPLY = `struct P{C:u32,Cg:u32,D:u32,HW:u32,ps:u32,gx:u32};
+@group(0)@binding(0) var<storage,read> x:array<f16>; @group(0)@binding(1) var<storage,read> st:array<f32>;
+@group(0)@binding(2) var<storage,read> sc:array<f16>; @group(0)@binding(3) var<storage,read> bi:array<f16>;
+@group(0)@binding(4) var<storage,read_write> y:array<f16>; @group(0)@binding(5) var<uniform> p:P;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid:vec3<u32>,@builtin(local_invocation_id) lid:vec3<u32>){
+  let idx=(wid.y*p.gx+wid.x)*256u+lid.x; if(idx>=p.C*p.D*p.HW){return;}
+  let c=idx/(p.D*p.HW); let g=c/p.Cg; var w=g;
+  if(p.ps==1u){ w=g*p.D+(idx/p.HW)%p.D; }
+  y[idx]=f16((f32(x[idx])-st[w*2u])*st[w*2u+1u]*f32(sc[c])+f32(bi[c])); }`;
+var GN_APPLY_SILU = GN_APPLY.replace(
+  "y[idx]=f16((f32(x[idx])-st[w*2u])*st[w*2u+1u]*f32(sc[c])+f32(bi[c])); }",
+  "let v=(f32(x[idx])-st[w*2u])*st[w*2u+1u]*f32(sc[c])+f32(bi[c]); y[idx]=f16(v/(1.0+exp(-v))); }"
+);
+var SILU = `struct P{n:u32,gx:u32}; @group(0)@binding(0) var<storage,read> a:array<f16>;
+@group(0)@binding(1) var<storage,read_write> y:array<f16>; @group(0)@binding(2) var<uniform> p:P;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid:vec3<u32>,@builtin(local_invocation_id) lid:vec3<u32>){
+  let i=(wid.y*p.gx+wid.x)*256u+lid.x; if(i>=p.n){return;} let v=f32(a[i]); y[i]=f16(v/(1.0+exp(-v))); }`;
+var ADD = `struct P{n:u32,gx:u32}; @group(0)@binding(0) var<storage,read> a:array<f16>;
+@group(0)@binding(1) var<storage,read> b:array<f16>; @group(0)@binding(2) var<storage,read_write> y:array<f16>;
+@group(0)@binding(3) var<uniform> p:P;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid:vec3<u32>,@builtin(local_invocation_id) lid:vec3<u32>){
+  let i=(wid.y*p.gx+wid.x)*256u+lid.x; if(i>=p.n){return;} y[i]=a[i]+b[i]; }`;
+var RESIZE = `struct D{C:u32,OD:u32,OH:u32,OW:u32,ID:u32,IH:u32,IW:u32,gx:u32};
+@group(0)@binding(0) var<storage,read> x:array<f16>; @group(0)@binding(1) var<storage,read_write> y:array<f16>;
+@group(0)@binding(2) var<uniform> d:D;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid:vec3<u32>,@builtin(local_invocation_id) lid:vec3<u32>){
+  let idx=(wid.y*d.gx+wid.x)*256u+lid.x; let Nout=d.C*d.OD*d.OH*d.OW; if(idx>=Nout){return;}
+  let OHW=d.OH*d.OW; let c=idx/(d.OD*OHW); let r=idx%(d.OD*OHW); let oz=r/OHW; let rr=r%OHW; let oy=rr/d.OW; let ox=rr%d.OW;
+  let iz=(oz*d.ID)/d.OD; let iy=(oy*d.IH)/d.OH; let ix=(ox*d.IW)/d.OW;   // nearest/floor asymmetric
+  y[idx]=x[((c*d.ID+iz)*d.IH+iy)*d.IW+ix]; }`;
+var SWAPAB = `struct P{A:u32,B:u32,S:u32,gx:u32};
+@group(0)@binding(0) var<storage,read> x:array<f16>; @group(0)@binding(1) var<storage,read_write> y:array<f16>;
+@group(0)@binding(2) var<uniform> p:P;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid:vec3<u32>,@builtin(local_invocation_id) lid:vec3<u32>){
+  let idx=(wid.y*p.gx+wid.x)*256u+lid.x; if(idx>=p.A*p.B*p.S){return;}
+  let a=idx/(p.B*p.S); let b=(idx/p.S)%p.B; let s=idx%p.S;
+  y[(b*p.A+a)*p.S+s]=x[idx]; }`;
+var Net = class {
+  constructor(dev, R, dtype = "f16") {
+    this.dev = dev;
+    this.R = R;
+    this.dtype = dtype;
+    this.esz = dtype === "f16" ? 2 : 4;
+    this.ext = {};
+    this.inBuf = {};
+    this.convTM = 4;
+    this.convTN = 4;
+  }
+  async load(graphUrl, weightsUrl) {
+    const dev = this.dev;
+    this.graph = await (await fetch(graphUrl)).json();
+    const wblob = new Uint16Array(await (await fetch(weightsUrl)).arrayBuffer());
+    this.prod = (s) => s.reduce((a, b) => a * b, 1);
+    this.mk = (b) => dev.createBuffer({ size: Math.max(16, b), usage: U.STORAGE | U.COPY_SRC | U.COPY_DST });
+    this.W = {};
+    for (const [n, w] of Object.entries(this.graph.weights)) {
+      const b = this.mk(w.numel * this.esz);
+      const src = wblob.subarray(w.offset, w.offset + w.numel);
+      dev.queue.writeBuffer(b, 0, this.dtype === "f16" ? src : fromF16(src));
+      this.W[n] = b;
+    }
+    this._plan();
+    return this;
+  }
+  bytesOf(n) {
+    return this.prod(this.graph.tensors[n]) * this.esz;
+  }
+  _plan() {
+    const g = this.graph, R = this.R;
+    const inSet = new Set(g.inputs.map((i) => i.name));
+    const cons = {};
+    for (const nd of g.nodes) for (const i of nd.in) (cons[i] = cons[i] || []).push(nd);
+    const skip = /* @__PURE__ */ new Set(), fuseOut = {};
+    for (const nd of g.nodes) if (nd.op === "Conv" || nd.op === "GroupNorm") {
+      const c = cons[nd.out[0]];
+      if (c && c.length === 1 && c[0].op === "Silu") {
+        skip.add(c[0]);
+        fuseOut[nd.out[0]] = c[0].out[0];
+      }
+    }
+    const ops = [];
+    for (const nd of g.nodes) {
+      if (skip.has(nd)) continue;
+      const fo = nd.op === "Conv" || nd.op === "GroupNorm" ? fuseOut[nd.out[0]] : void 0;
+      ops.push({ nd, out: fo || nd.out[0], fused: !!fo });
+    }
+    const lastUse = {};
+    ops.forEach((o, i) => {
+      for (const t of o.nd.in) lastUse[t] = i;
+    });
+    g.outputs.forEach((o) => lastUse[o.name] = 1e18);
+    const T = {}, pool = [];
+    this.zeroBias = {};
+    const acquire = (b) => {
+      let bi = -1;
+      for (let i = 0; i < pool.length; i++) if (pool[i].size >= b && (bi < 0 || pool[i].size < pool[bi].size)) bi = i;
+      return bi >= 0 ? pool.splice(bi, 1)[0] : this.mk(b);
+    };
+    const zB = (C) => this.zeroBias[C] = this.zeroBias[C] || this.mk(C * this.esz);
+    this.recs = [];
+    ops.forEach((o, i) => {
+      const nd = o.nd, tsr = g.tensors;
+      if (!inSet.has(o.out)) T[o.out] = acquire(this.bytesOf(o.out));
+      const r = { op: nd.op, ins: nd.in, out: o.out };
+      if (nd.op === "Conv") {
+        const os = tsr[o.out], is = tsr[nd.in[0]];
+        const Nvox = os[2] * os[3] * os[4];
+        r.bias = nd.bias ? nd.in[2] : null;
+        r.Co = nd.Co;
+        r.silu = o.fused;
+        r.kb = { KD: nd.KD, KH: nd.KH, KW: nd.KW, pz: nd.padZ, py: nd.padY, px: nd.padX };
+        r.cs = [nd.Ci, nd.Co, os[2], os[3], os[4], is[2], is[3], is[4], nd.KD, nd.KH, nd.KW, nd.S, nd.padZ, nd.padY, nd.padX];
+        this._convDispatch(r);
+      } else if (nd.op === "GroupNorm") {
+        const s = tsr[o.out];
+        const C = s[1], D = s[2], HW = s[3] * s[4];
+        const G = nd.G, Cg = C / G, ps = nd.perSlice ? 1 : 0, nInst = ps ? G * D : G;
+        r.stats = this.mk(nInst * 2 * 4);
+        r.u1 = R.uni([Cg, D, HW, G, ps]);
+        r.statsWg = [nInst, 1, 1];
+        const gd = R.grid(C * D * HW);
+        r.u2 = R.uni([C, Cg, D, HW, ps, gd.gx]);
+        r.wg = gd.wg;
+        r.applyK = o.fused ? R.GN_APPLY_SILU : R.GN_APPLY;
+      } else if (nd.op === "Silu" || nd.op === "Add") {
+        const n = this.prod(tsr[o.out]);
+        const gd = R.grid(n);
+        r.u = R.uni([n, gd.gx]);
+        r.wg = gd.wg;
+      } else if (nd.op === "Concat") {
+        r.parts = nd.in.map((x) => this.bytesOf(x));
+      } else if (nd.op === "Resize") {
+        const os = tsr[o.out], is = tsr[nd.in[0]];
+        const Nout = os[1] * os[2] * os[3] * os[4];
+        const gd = R.grid(Nout);
+        r.u = R.uni([os[1], os[2], os[3], os[4], is[2], is[3], is[4], gd.gx]);
+        r.wg = gd.wg;
+      } else if (nd.op === "SwapAB") {
+        const S = this.prod(tsr[o.out]) / (nd.A * nd.B);
+        const gd = R.grid(nd.A * nd.B * S);
+        r.u = R.uni([nd.A, nd.B, S, gd.gx]);
+        r.wg = gd.wg;
+      } else throw new Error("unsupported op " + nd.op);
+      r.inB = nd.in.map((n) => inSet.has(n) ? { inp: n } : this.W[n] || T[n]);
+      r.outB = T[o.out];
+      if (r.bias) r.biasB = this.W[r.bias];
+      this.recs.push(r);
+      for (const t of nd.in) if (lastUse[t] === i && !(t in this.W) && !inSet.has(t) && T[t]) {
+        pool.push(T[t]);
+        T[t] = null;
+      }
+    });
+    this.T = T;
+    this.zB = zB;
+  }
+  _convDispatch(r) {
+    const cs = r.cs, Nvox = cs[2] * cs[3] * cs[4];
+    const TM = Math.min(this.convTM, Math.max(1, Math.ceil(cs[1] / 16)));
+    const tileR = 16 * TM, tileC = 16 * this.convTN;
+    const gx = Math.min(65535, Math.ceil(Nvox / tileC));
+    r.u = this.R.uni([...cs, gx]);
+    r.wg = [gx, Math.ceil(cs[1] / tileR), Math.ceil(Nvox / tileC / gx)];
+    r.src = genConv(TM, this.convTN, r.silu, r.kb);
+  }
+  setInputBuffer(name, buf) {
+    this.ext[name] = buf;
+  }
+  setInputData(name, f32) {
+    if (!this.inBuf[name]) this.inBuf[name] = this.mk(this.bytesOf(name));
+    this.dev.queue.writeBuffer(this.inBuf[name], 0, this.dtype === "f16" ? toF16(f32) : f32);
+    this.ext[name] = this.inBuf[name];
+  }
+  run() {
+    const B = (x) => x && x.inp ? this.ext[x.inp] : x, R = this.R, enc = this.dev.createCommandEncoder();
+    for (const r of this.recs) {
+      const i = r.inB, out = r.outB;
+      if (r.op === "Conv") R.pass(enc, r.src, [B(i[0]), B(i[1]), r.bias ? r.biasB : this.zB(r.Co), out, r.u], r.wg);
+      else if (r.op === "GroupNorm") {
+        R.pass(enc, R.GN_STATS, [B(i[0]), r.stats, r.u1], r.statsWg);
+        R.pass(enc, r.applyK, [B(i[0]), r.stats, B(i[1]), B(i[2]), out, r.u2], r.wg);
+      } else if (r.op === "Silu") R.pass(enc, R.SILU, [B(i[0]), out, r.u], r.wg);
+      else if (r.op === "Add") R.pass(enc, R.ADD, [B(i[0]), B(i[1]), out, r.u], r.wg);
+      else if (r.op === "Concat") {
+        let off = 0;
+        i.forEach((x, k) => {
+          enc.copyBufferToBuffer(B(x), 0, out, off, r.parts[k]);
+          off += r.parts[k];
+        });
+      } else if (r.op === "Resize") R.pass(enc, R.RESIZE, [B(i[0]), out, r.u], r.wg);
+      else if (r.op === "SwapAB") R.pass(enc, R.SWAPAB, [B(i[0]), out, r.u], r.wg);
+    }
+    this.dev.queue.submit([enc.finish()]);
+  }
+  outBufFor(name) {
+    for (const r of this.recs) if (r.out === name) return r.outB;
+    return this.ext[name];
+  }
+  async read(name) {
+    const buf = this.outBufFor(name), n = this.prod(this.graph.tensors[name]);
+    const rb = this.dev.createBuffer({ size: n * this.esz, usage: U.MAP_READ | U.COPY_DST });
+    const e = this.dev.createCommandEncoder();
+    e.copyBufferToBuffer(buf, 0, rb, 0, n * this.esz);
+    this.dev.queue.submit([e.finish()]);
+    await rb.mapAsync(GPUMapMode.READ);
+    const out = this.dtype === "f16" ? fromF16(new Uint16Array(rb.getMappedRange().slice(0))) : new Float32Array(rb.getMappedRange().slice(0));
+    rb.unmap();
+    rb.destroy();
+    return out;
+  }
+  // ---- per-GPU conv autotuning (nnLive scheme: verify against the reference tiling, then time) ----
+  setConvConfig(TM, TN) {
+    this.convTM = TM;
+    this.convTN = TN;
+    for (const r of this.recs) if (r.op === "Conv") this._convDispatch(r);
+  }
+  async _verifyConfigs(configs) {
+    const dev = this.dev, R = this.R;
+    const Ci = 8, Co = 20, OD = 9, OH = 9, OW = 9, K = 3, pad = 1;
+    const Nin = Ci * OD * OH * OW, Nw = Co * Ci * K * K * K, Nout = Co * OD * OH * OW, Nvox = OD * OH * OW;
+    const rnd = (n, seed) => {
+      const a = new Float32Array(n);
+      let s = seed >>> 0;
+      for (let i = 0; i < n; i++) {
+        s = s * 1103515245 + 12345 & 2147483647;
+        a[i] = s / 2147483647 - 0.5;
+      }
+      return a;
+    };
+    const mkb = (f) => {
+      const b = this.mk(f.length * this.esz);
+      dev.queue.writeBuffer(b, 0, this.dtype === "f16" ? toF16(f) : f);
+      return b;
+    };
+    const inB = mkb(rnd(Nin, 1)), wB = mkb(rnd(Nw, 2)), biasB = mkb(rnd(Co, 3)), outB = this.mk(Nout * this.esz);
+    const readOut = async () => {
+      const rb = dev.createBuffer({ size: Nout * this.esz, usage: U.MAP_READ | U.COPY_DST });
+      const e = dev.createCommandEncoder();
+      e.copyBufferToBuffer(outB, 0, rb, 0, Nout * this.esz);
+      dev.queue.submit([e.finish()]);
+      await rb.mapAsync(GPUMapMode.READ);
+      const o = this.dtype === "f16" ? fromF16(new Uint16Array(rb.getMappedRange().slice(0))) : new Float32Array(rb.getMappedRange().slice(0));
+      rb.unmap();
+      rb.destroy();
+      return o;
+    };
+    const runCfg = (TM, TN) => {
+      const tileC = 16 * TN, tileR = 16 * TM, gx = Math.min(65535, Math.ceil(Nvox / tileC));
+      const u = R.uni([Ci, Co, OD, OH, OW, OD, OH, OW, K, K, K, 1, pad, pad, pad, gx]);
+      const wg = [gx, Math.ceil(Co / tileR), Math.ceil(Nvox / tileC / gx)];
+      const e = dev.createCommandEncoder();
+      R.pass(e, genConv(TM, TN), [inB, wB, biasB, outB, u], wg);
+      dev.queue.submit([e.finish()]);
+    };
+    runCfg(4, 4);
+    const ref = await readOut();
+    const ok = [];
+    for (const [TM, TN] of configs) {
+      try {
+        runCfg(TM, TN);
+        const o = await readOut();
+        let md = 0;
+        for (let i = 0; i < Nout; i++) {
+          const dd = Math.abs(o[i] - ref[i]);
+          if (dd > md) md = dd;
+        }
+        if (md < 0.05) ok.push([TM, TN]);
+      } catch (e) {
+      }
+    }
+    return ok.length ? ok : [[4, 4]];
+  }
+  // pick the fastest verified conv tiling for THIS gpu by timing the real forward. Inputs must be set.
+  async autotuneConv(candidates = [[4, 4], [2, 8], [8, 2], [2, 4], [4, 2]], reps = 3) {
+    const verified = await this._verifyConfigs(candidates);
+    let best = [4, 4], bestMs = Infinity;
+    for (const [TM, TN] of verified) {
+      this.setConvConfig(TM, TN);
+      this.run();
+      await this.dev.queue.onSubmittedWorkDone();
+      const t = performance.now();
+      for (let i = 0; i < reps; i++) this.run();
+      await this.dev.queue.onSubmittedWorkDone();
+      const ms = (performance.now() - t) / reps;
+      if (ms < bestMs - 0.5) {
+        bestMs = ms;
+        best = [TM, TN];
+      }
+    }
+    this.setConvConfig(best[0], best[1]);
+    return { TM: best[0], TN: best[1], ms: Math.round(bestMs), verified: verified.length, tried: candidates.length };
+  }
+};
+function makeRunner(dev, dtype = "f16") {
+  const pc = /* @__PURE__ */ new Map();
+  const xform = (src) => dtype === "f16" ? "enable f16;\n" + src : src.replace(/f16/g, "f32");
+  const pipe = (src) => {
+    if (pc.has(src)) return pc.get(src);
+    const m = dev.createShaderModule({ code: xform(src) });
+    const p = dev.createComputePipeline({ layout: "auto", compute: { module: m, entryPoint: "main" } });
+    pc.set(src, p);
+    return p;
+  };
+  const uni = (arr) => {
+    const b = dev.createBuffer({ size: Math.max(16, arr.length * 4), usage: U.UNIFORM | U.COPY_DST });
+    dev.queue.writeBuffer(b, 0, new Uint32Array(arr));
+    return b;
+  };
+  const pass = (enc, src, bufs, wg) => {
+    const p = pipe(src);
+    const bg = dev.createBindGroup({ layout: p.getBindGroupLayout(0), entries: bufs.map((b, i) => ({ binding: i, resource: { buffer: b } })) });
+    const cp = enc.beginComputePass();
+    cp.setPipeline(p);
+    cp.setBindGroup(0, bg);
+    cp.dispatchWorkgroups(wg[0], wg[1] || 1, wg[2] || 1);
+    cp.end();
+  };
+  const grid = (n) => {
+    const nWG = Math.ceil(n / 256), gx = Math.min(65535, nWG);
+    return { gx, wg: [gx, Math.ceil(nWG / gx), 1] };
+  };
+  return { pipe, uni, pass, grid, GN_STATS, GN_APPLY, GN_APPLY_SILU, SILU, ADD, RESIZE, SWAPAB };
 }
 
 // render/mat4.ts
@@ -425,6 +863,17 @@ var SliceRenderer = class {
   /** Reset pan/zoom for an orientation to the fitted view. */
   resetView(orient) {
     this.viewState[orient] = { panU: 0, panV: 0, zoom: 1 };
+  }
+  /** Snapshot per-orientation pan+zoom (e.g. to persist a view across reloads). */
+  getViewState() {
+    return structuredClone(this.viewState);
+  }
+  /** Restore a (possibly partial) snapshot from getViewState(). */
+  setViewState(vs) {
+    for (const k of Object.keys(vs)) {
+      const v = vs[k];
+      if (v && Number.isFinite(v.zoom) && v.zoom > 0) this.viewState[k] = { ...v };
+    }
   }
   /** Mirror Slicer's in-plane navigation for an orientation: drive pan + zoom from the slice
    *  node's RAS centre and field of view (mm). zoom = extent/FOV on the limiting axis (== 1 when
@@ -2498,11 +2947,56 @@ fn sample_field_img${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
 
 // examples/livecodec/livecodec-scene.ts
 var BUCKET = "https://js2.jetstream-cloud.org:8001/livecodec-demo/";
-async function streamFetch(url, onBytes) {
-  const resp = await fetch(url);
+var simBps = null;
+function setSimulatedBandwidth(bitsPerSec) {
+  simBps = bitsPerSec;
+}
+var LinkPacer = class {
+  t0 = 0;
+  bytes = 0;
+  async admit(n) {
+    if (simBps == null) return;
+    if (!this.t0) this.t0 = performance.now();
+    this.bytes += n;
+    const due = this.t0 + this.bytes * 8 / simBps * 1e3;
+    const wait = due - performance.now();
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+  }
+};
+var BandwidthMeter = class {
+  stats = [];
+  begin(name) {
+    const s = { name, bytes: 0, t0: performance.now(), t1: performance.now() };
+    this.stats.push(s);
+    return {
+      at: (cumulative) => {
+        s.bytes = cumulative;
+        s.t1 = performance.now();
+      },
+      add: (n) => {
+        s.bytes += n;
+        s.t1 = performance.now();
+      }
+    };
+  }
+  summary() {
+    const iv = this.stats.map((s) => [s.t0, s.t1]).sort((a, b) => a[0] - b[0]);
+    let seconds = 0, end = -Infinity;
+    for (const [a, b] of iv) {
+      seconds += Math.max(0, b - Math.max(a, end));
+      end = Math.max(end, b);
+    }
+    seconds /= 1e3;
+    const bytes = this.stats.reduce((t, s) => t + s.bytes, 0);
+    return { bytes, seconds, mbps: seconds > 0 ? bytes * 8 / seconds / 1e6 : 0, streams: this.stats };
+  }
+};
+async function streamFetch(url, onBytes, pacer) {
+  const resp = await fetch(url, { cache: "no-store" });
   if (!resp.ok) throw new Error(`HTTP ${resp.status} for ${url}`);
   if (!resp.body) {
     const buf = new Uint8Array(await resp.arrayBuffer());
+    await pacer?.admit(buf.byteLength);
     onBytes?.(buf.byteLength);
     return buf;
   }
@@ -2512,6 +3006,7 @@ async function streamFetch(url, onBytes) {
   for (; ; ) {
     const { done, value } = await rd.read();
     if (done) break;
+    await pacer?.admit(value.byteLength);
     parts.push(value);
     total += value.byteLength;
     onBytes?.(total);
@@ -2650,14 +3145,14 @@ function ijkToRASFromSpacing(shape, spacing) {
   const [Z, Y, X] = shape;
   const sx = spacing[2], sy = spacing[1], sz = spacing[0];
   return [
-    sx,
+    -sx,
     0,
     0,
-    -sx * (X - 1) / 2,
+    sx * (X - 1) / 2,
     0,
-    sy,
+    -sy,
     0,
-    -sy * (Y - 1) / 2,
+    sy * (Y - 1) / 2,
     0,
     0,
     sz,
@@ -2787,16 +3282,51 @@ async function main() {
   const scans = await loadScans();
   const wanted = PARAMS.get("scan") ?? "";
   const scan = scans.find((s) => s.id === wanted) ?? scans[Math.floor(Math.random() * scans.length)];
-  const base = `${BUCKET}scans/${scan.id}/`;
+  const dataOverride = PARAMS.get("data");
+  const base = dataOverride ? dataOverride.endsWith("/") ? dataOverride : dataOverride + "/" : `${BUCKET}scans/${scan.id}/`;
   const [Z, Y, X] = scan.shape;
   el("info").textContent = `scan ${scan.id}${scan.heldout ? " (held-out)" : ""} \xB7 ${Z}\xD7${Y}\xD7${X} @ ${scan.spacing.map((s) => s.toFixed(2)).join("/")} mm \xB7 raw ${fmtBytes(scan.bytes.raw)}`;
-  el("name-neural").textContent = `LiveCodec neural \u2014 coarse ${fmtBytes(scan.bytes.coarse)} \u2192 fine ${fmtBytes(scan.bytes.fine + scan.bytes.dc)}`;
-  el("name-htj2k").textContent = `HTJ2K \u2014 ${fmtBytes(scan.bytes.htj2k)}`;
+  el("name-neural").textContent = `LiveCodec neural \u2014 coarse ${fmtBytes(scan.bytes.coarse)} \u2192 fine ${fmtBytes(scan.bytes.fine + scan.bytes.dc)}` + (scan.bytes.residual ? ` \u2192 lossless ${fmtBytes(scan.bytes.residual)}` : "");
+  el("name-htj2k").textContent = `HTJ2K${scan.bytes.residual ? " lossless" : ""} \u2014 ${fmtBytes(scan.bytes.htj2k)}`;
   el("rand").addEventListener("click", () => {
     const others = scans.filter((s) => s.id !== scan.id);
     const pick = others[Math.floor(Math.random() * others.length)] ?? scan;
-    location.search = `?scan=${pick.id}`;
+    const p = new URLSearchParams(location.search);
+    p.set("scan", pick.id);
+    location.search = p.toString();
   });
+  const netSel = el("net");
+  const netParam = PARAMS.get("net") ?? netSel?.value ?? "25";
+  if (netSel) {
+    netSel.value = netParam;
+    netSel.addEventListener("change", () => {
+      const p = new URLSearchParams(location.search);
+      p.set("net", netSel.value);
+      p.set("scan", scan.id);
+      location.search = p.toString();
+    });
+  }
+  setSimulatedBandwidth(netParam === "off" ? null : Number(netParam) * 1e6);
+  const pacers = { neural: new LinkPacer(), htj2k: new LinkPacer() };
+  const meters = { neural: new BandwidthMeter(), htj2k: new BandwidthMeter() };
+  const reportIfDone = () => {
+    if (race.neural.tFinal == null || race.htj2k.tFinal == null) return;
+    const ns = meters.neural.summary(), hs = meters.htj2k.summary();
+    for (const [k, m] of [["neural", ns], ["htj2k", hs]]) {
+      const t = el(`times-${k}`);
+      if (t) t.textContent += ` \xB7 avg ${m.mbps.toFixed(1)} Mbps`;
+    }
+    const delta = Math.abs(ns.mbps - hs.mbps) / Math.max(ns.mbps, hs.mbps);
+    const target = netParam === "off" ? "" : ` \xB7 target ${netParam} Mbps`;
+    const verdict = delta <= 0.15 ? "delivery fair \u2713" : `\u26A0 unequal delivery`;
+    status(`measured: neural ${ns.mbps.toFixed(1)} Mbps \xB7 HTJ2K ${hs.mbps.toFixed(1)} Mbps \xB7 \u0394${(delta * 100).toFixed(0)}%${target} \u2014 ${verdict}`);
+    console.table([...ns.streams, ...hs.streams].map((x) => ({
+      stream: x.name,
+      MB: (x.bytes / 1e6).toFixed(2),
+      s: ((x.t1 - x.t0) / 1e3).toFixed(2),
+      Mbps: (x.bytes * 8 / Math.max(1, x.t1 - x.t0) / 1e3).toFixed(1)
+    })));
+  };
   status(`loading ${scan.id} meta\u2026`);
   const [meta, dec] = await Promise.all([loadScanMeta(scan.id), loadDecoderMeta()]);
   const sc = makeLiveCodecScene(gpu, srgb, scan.shape, scan.spacing);
@@ -2819,6 +3349,33 @@ async function main() {
   };
   const sliceIx = new SliceInteractor({ ijkToRAS: sc.ijkToRAS, rasLo: sc.rasLo, rasHi: sc.rasHi });
   const camera = framedCamera(sc.center, sc.radius);
+  const viewKey = `lcview:${scan.id}`;
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(viewKey) ?? "null");
+    if (saved) {
+      Object.assign(off, saved.off ?? {});
+      sc.slice.setViewState(saved.slice ?? {});
+      if (saved.camera) {
+        camera.position = saved.camera.position ?? camera.position;
+        camera.focalPoint = saved.camera.focalPoint ?? camera.focalPoint;
+        camera.viewUp = saved.camera.viewUp ?? camera.viewUp;
+        camera.viewAngle = saved.camera.viewAngle ?? camera.viewAngle;
+      }
+    }
+  } catch {
+  }
+  addEventListener("beforeunload", () => {
+    sessionStorage.setItem(viewKey, JSON.stringify({
+      off,
+      slice: sc.slice.getViewState(),
+      camera: {
+        position: camera.position,
+        focalPoint: camera.focalPoint,
+        viewUp: camera.viewUp,
+        viewAngle: camera.viewAngle
+      }
+    }));
+  });
   const drawSlice = (k, o) => {
     const c = cv[`c-${k}-${o}`];
     if (!c || !c.width) return;
@@ -2921,38 +3478,46 @@ async function main() {
   const runNeural = async () => {
     const r = race.neural;
     try {
-      const tSess = performance.now();
-      const sessionP = ort.InferenceSession.create(BUCKET + "model/decoder.onnx", {
-        executionProviders: ["webgpu", "wasm"]
-      }).then((s) => {
-        console.log(`livecodec: ort session ready in ${((performance.now() - tSess) / 1e3).toFixed(1)} s`);
-        return s;
+      const modelBase = PARAMS.get("model") ?? BUCKET + "model/";
+      const dtype = gpu.features.has("shader-f16") ? "f16" : "f32";
+      const tNet = performance.now();
+      const netP = new Net(gpu.device, makeRunner(gpu.device, dtype), dtype).load(modelBase + "decoder25.graph.json", modelBase + "decoder25.weights.bin").then((n) => {
+        console.log(`livecodec: wgsl decoder (${dtype}) ready in ${((performance.now() - tNet) / 1e3).toFixed(1)} s`);
+        return n;
       });
-      sessionP.catch(() => {
+      netP.catch(() => {
       });
       r.stage = "coarse";
       r.expected = scan.bytes.coarse;
       r.got = 0;
+      const mCoarse = meters.neural.begin("coarse.gz");
       const coarseGz = await streamFetch(base + "coarse.gz", (n) => {
         r.got = n;
-      });
+        mCoarse.at(n);
+      }, pacers.neural);
       const coarseCodes = await gunzip(coarseGz);
       r.note = "loading decoder";
-      const session = await sessionP;
+      const net = await netP;
       const sh = latentShapes(meta);
       const vol = sc.rows.neural.vol;
-      const zfDims = [1, sh.C, sh.Df, sh.Hf, sh.Wf];
-      const zfZero = new ort.Tensor("float32", new Float32Array(sh.C * sh.Df * sh.Hf * sh.Wf), zfDims);
+      const zfZero = new Float32Array(sh.C * sh.Df * sh.Hf * sh.Wf);
+      const decodeChunk = async (zf, ch) => {
+        net.setInputData("zf", zf);
+        net.setInputData("zc_up", dequantCoarseUp(coarseCodes, ch, sh, dec));
+        net.run();
+        const out = await net.read("volume");
+        const z0 = ch * sh.chunkZ;
+        mapOutputToHU(out, vol, z0, Z, sh, dec);
+        sc.writeSlab("neural", z0, Math.min(Z, z0 + sh.chunkZ));
+      };
       const tDec = performance.now();
       for (let ch = 0; ch < sh.chunks; ch++) {
         r.note = `decode ${ch + 1}/${sh.chunks}`;
-        const zcUp = new ort.Tensor("float32", dequantCoarseUp(coarseCodes, ch, sh, dec), zfDims);
-        const res = await session.run({ zf: zfZero, zc_up: zcUp });
-        mapOutputToHU(res.volume.data, vol, ch * sh.chunkZ, Z, sh, dec);
+        await decodeChunk(zfZero, ch);
+        if (ch === 0) r.tFirst = elapsed("neural");
+        requestDraw();
       }
       console.log(`livecodec: coarse decode ${sh.chunks} chunks in ${((performance.now() - tDec) / 1e3).toFixed(1)} s`);
-      sc.writeSlab("neural", 0, Z);
-      r.tFirst = elapsed("neural");
       r.note = "";
       requestDraw();
       r.stage = "fine+dc";
@@ -2960,26 +3525,23 @@ async function main() {
       r.got = 0;
       let fGot = 0, dGot = 0;
       const [fineGz, dcGz] = await Promise.all([
-        streamFetch(base + "fine.gz", (n) => {
+        streamFetch(base + "fine.gz", /* @__PURE__ */ ((m) => (n) => {
           fGot = n;
           r.got = fGot + dGot;
-        }),
-        streamFetch(base + "dc.gz", (n) => {
+          m.at(n);
+        })(meters.neural.begin("fine.gz")), pacers.neural),
+        streamFetch(base + "dc.gz", /* @__PURE__ */ ((m) => (n) => {
           dGot = n;
           r.got = fGot + dGot;
-        })
+          m.at(n);
+        })(meters.neural.begin("dc.gz")), pacers.neural)
       ]);
       const fineCodes = await gunzip(fineGz);
       const dcBytes = await gunzip(dcGz);
       const dcGrid = new Int8Array(dcBytes.buffer, dcBytes.byteOffset, dcBytes.byteLength);
       for (let ch = 0; ch < sh.chunks; ch++) {
         r.note = `refine ${ch + 1}/${sh.chunks}`;
-        const zf = new ort.Tensor("float32", dequantFine(fineCodes, ch, sh, dec), zfDims);
-        const zcUp = new ort.Tensor("float32", dequantCoarseUp(coarseCodes, ch, sh, dec), zfDims);
-        const res = await session.run({ zf, zc_up: zcUp });
-        const z0 = ch * sh.chunkZ;
-        mapOutputToHU(res.volume.data, vol, z0, Z, sh, dec);
-        sc.writeSlab("neural", z0, Math.min(Z, z0 + sh.chunkZ));
+        await decodeChunk(dequantFine(fineCodes, ch, sh, dec), ch);
         requestDraw();
       }
       r.note = "dc correction";
@@ -2988,12 +3550,172 @@ async function main() {
       }
       sc.writeSlab("neural", 0, Z);
       requestDraw();
-      r.note = "";
+      if (scan.bytes.residual) {
+        r.stage = "residual";
+        r.expected = scan.bytes.residual;
+        r.got = 0;
+        r.note = "";
+        const factory = globalThis.Module;
+        if (!factory) throw new Error("openjph script did not load");
+        const rDecoder = new (await factory()).HTJ2KDecoder();
+        const idxResp = await fetch(base + "residual-index.json", { cache: "no-store" });
+        if (!idxResp.ok) throw new Error(`residual-index.json HTTP ${idxResp.status}`);
+        const ridx = await idxResp.json();
+        const total = ridx.length ? ridx[ridx.length - 1].offset + ridx[ridx.length - 1].bytes : 0;
+        const sliceSize = X * Y;
+        const rbuf = new Uint8Array(total);
+        let received = 0, next = 0, flushed = 0;
+        const applySlice = (e) => {
+          const enc = rDecoder.getEncodedBuffer(e.bytes);
+          enc.set(rbuf.subarray(e.offset, e.offset + e.bytes));
+          rDecoder.decode();
+          const out = rDecoder.getDecodedBuffer();
+          const u16 = new Uint16Array(out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength));
+          const b = e.z * sliceSize;
+          for (let i = 0; i < sliceSize; i++) vol[b + i] += u16[i] - 4096;
+        };
+        const resp = await fetch(base + "residual.bin", { cache: "no-store" });
+        if (!resp.ok || !resp.body) throw new Error(`residual.bin HTTP ${resp.status}`);
+        const mRes = meters.neural.begin("residual.bin");
+        const rrd = resp.body.getReader();
+        for (; ; ) {
+          const { done, value } = await rrd.read();
+          if (done) break;
+          await pacers.neural.admit(value.byteLength);
+          mRes.add(value.byteLength);
+          rbuf.set(value, received);
+          received += value.byteLength;
+          r.got = received;
+          while (next < ridx.length && ridx[next].offset + ridx[next].bytes <= received) {
+            applySlice(ridx[next]);
+            next++;
+            r.note = `${next}/${ridx.length} slices`;
+            if (next - flushed >= 32) {
+              sc.writeSlab("neural", flushed, next);
+              flushed = next;
+              requestDraw();
+            }
+          }
+        }
+        while (next < ridx.length && ridx[next].offset + ridx[next].bytes <= received) {
+          applySlice(ridx[next]);
+          next++;
+        }
+        sc.writeSlab("neural", flushed, Z);
+        requestDraw();
+        r.note = "lossless";
+      }
       r.tFinal = elapsed("neural");
+      reportIfDone();
     } catch (e) {
       r.error = "neural: " + (e?.message ?? String(e));
       console.error(e);
     }
+  };
+  const runHTJ2KProgressive = async (idx, decoder, vol, r) => {
+    const sliceSize = X * Y;
+    const slices = idx.slices, nS = slices.length, R = idx.rounds;
+    const schedSlice = [];
+    const schedEnd = [];
+    const roundEnd = [];
+    for (let rnd = 0; rnd < R; rnd++) {
+      for (let si = 0; si < nS; si++) {
+        const p = slices[si].parts[rnd];
+        if (p) {
+          schedSlice.push(si);
+          schedEnd.push(p[0] + p[1]);
+        }
+      }
+      roundEnd.push(schedSlice.length);
+    }
+    const total = schedEnd.length ? schedEnd[schedEnd.length - 1] : 0;
+    r.stage = "slices";
+    r.expected = total;
+    r.got = 0;
+    const buf = new Uint8Array(total);
+    const arrived = new Uint8Array(nS);
+    const applied = new Uint8Array(nS);
+    const decodePrefix = (si) => {
+      const s = slices[si], k = arrived[si];
+      let len = 0;
+      for (let i = 0; i < k; i++) len += s.parts[i][1];
+      const enc = decoder.getEncodedBuffer(len);
+      let o = 0;
+      for (let i = 0; i < k; i++) {
+        const [off2, n] = s.parts[i];
+        enc.set(buf.subarray(off2, off2 + n), o);
+        o += n;
+      }
+      const level = s.parts.length - k;
+      decoder.decodeSubResolution(level);
+      const out = decoder.getDecodedBuffer();
+      const u16 = new Uint16Array(out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength));
+      const b = s.z * sliceSize;
+      if (level === 0) {
+        const n = Math.min(sliceSize, u16.length);
+        for (let i = 0; i < n; i++) vol[b + i] = u16[i] - 1024;
+      } else {
+        const w = Math.max(1, Math.ceil(X / (1 << level)));
+        const h = Math.max(1, Math.ceil(Y / (1 << level)));
+        for (let y = 0; y < Y; y++) {
+          const srow = Math.min(h - 1, y * h / Y | 0) * w;
+          const drow = b + y * X;
+          for (let x = 0; x < X; x++) {
+            vol[drow + x] = u16[srow + Math.min(w - 1, x * w / X | 0)] - 1024;
+          }
+        }
+      }
+      applied[si] = k;
+    };
+    const applyPass = async () => {
+      let minZ = Z, maxZ = -1, n = 0;
+      for (let si = 0; si < nS; si++) {
+        if (arrived[si] <= applied[si]) continue;
+        decodePrefix(si);
+        const z = slices[si].z;
+        if (z < minZ) minZ = z;
+        if (z > maxZ) maxZ = z;
+        if (++n % 32 === 0) await new Promise((res) => setTimeout(res));
+      }
+      if (maxZ < 0) return;
+      sc.writeSlab("htj2k", minZ, maxZ + 1);
+      let full = R;
+      for (let si = 0; si < nS; si++) if (applied[si] < full) full = applied[si];
+      if (full >= 1 && r.tFirst == null) r.tFirst = elapsed("htj2k");
+      const shown = Math.max(1, full);
+      const px = Math.max(1, Math.ceil(X / (1 << R - shown)));
+      r.note = `round ${shown}/${R} \xB7 ${px}px${full < 1 ? " \u2026" : ""}`;
+      requestDraw();
+    };
+    const resp = await fetch(base + "slices.bin", { cache: "no-store" });
+    if (!resp.ok || !resp.body) throw new Error(`slices.bin HTTP ${resp.status}`);
+    const mSl = meters.htj2k.begin("slices.bin");
+    const rd = resp.body.getReader();
+    let received = 0, cursor = 0, nextRound = 0, lastPassAt = 0;
+    for (; ; ) {
+      const { done, value } = await rd.read();
+      if (done) break;
+      await pacers.htj2k.admit(value.byteLength);
+      mSl.add(value.byteLength);
+      buf.set(value, received);
+      received += value.byteLength;
+      r.got = received;
+      while (cursor < schedEnd.length && schedEnd[cursor] <= received) arrived[schedSlice[cursor++]]++;
+      let roundDone = false;
+      while (nextRound < R && cursor >= roundEnd[nextRound]) {
+        nextRound++;
+        roundDone = true;
+      }
+      if (roundDone || received - lastPassAt >= 2e6) {
+        lastPassAt = received;
+        await applyPass();
+      }
+    }
+    while (cursor < schedEnd.length && schedEnd[cursor] <= received) arrived[schedSlice[cursor++]]++;
+    await applyPass();
+    r.note = "lossless";
+    r.tFinal = elapsed("htj2k");
+    reportIfDone();
   };
   const runHTJ2K = async () => {
     const r = race.htj2k;
@@ -3001,17 +3723,22 @@ async function main() {
       const factory = globalThis.Module;
       if (!factory) throw new Error("openjph script did not load");
       const openjphP = factory();
-      const idxResp = await fetch(base + "index.json");
+      const idxResp = await fetch(base + "index.json", { cache: "no-store" });
       if (!idxResp.ok) throw new Error(`index.json HTTP ${idxResp.status}`);
-      const idx = await idxResp.json();
-      const total = idx.length ? idx[idx.length - 1].offset + idx[idx.length - 1].bytes : 0;
-      r.stage = "slices";
-      r.expected = total;
-      r.got = 0;
+      const rawIdx = await idxResp.json();
       const openjph = await openjphP;
       const decoder = new openjph.HTJ2KDecoder();
       const vol = sc.rows.htj2k.vol;
       const sliceSize = X * Y;
+      if (!Array.isArray(rawIdx) && rawIdx.layout === "res-progressive") {
+        await runHTJ2KProgressive(rawIdx, decoder, vol, r);
+        return;
+      }
+      const idx = rawIdx;
+      const total = idx.length ? idx[idx.length - 1].offset + idx[idx.length - 1].bytes : 0;
+      r.stage = "slices";
+      r.expected = total;
+      r.got = 0;
       const buf = new Uint8Array(total);
       let received = 0, next = 0, flushed = 0;
       const decodeSlice = (e) => {
@@ -3031,12 +3758,15 @@ async function main() {
         if (r.tFirst == null) r.tFirst = elapsed("htj2k");
         requestDraw();
       };
-      const resp = await fetch(base + "slices.bin");
+      const resp = await fetch(base + "slices.bin", { cache: "no-store" });
       if (!resp.ok || !resp.body) throw new Error(`slices.bin HTTP ${resp.status}`);
+      const mSl = meters.htj2k.begin("slices.bin");
       const rd = resp.body.getReader();
       for (; ; ) {
         const { done, value } = await rd.read();
         if (done) break;
+        await pacers.htj2k.admit(value.byteLength);
+        mSl.add(value.byteLength);
         buf.set(value, received);
         received += value.byteLength;
         r.got = received;
@@ -3054,6 +3784,7 @@ async function main() {
       flush();
       r.note = "";
       r.tFinal = elapsed("htj2k");
+      reportIfDone();
     } catch (e) {
       r.error = "htj2k: " + (e?.message ?? String(e));
       console.error(e);

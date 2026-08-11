@@ -4,9 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <!-- livecodec — download-speed race between two volume codecs on one CT scan:
-     "LiveCodec neural" (FSQ latents + 2.5 MB ONNX decoder) vs HTJ2K (OpenJPH wasm).
-     Two codec rows (linked MPR + 3D, one shared slice state) with real per-row
-     progress bars and time-to-first-image / time-to-final clocks. ?scan=<id> -->
+     "LiveCodec neural" (FSQ latents + ~0.8 MB decoder run on hand-written WebGPU
+     compute kernels, no ONNX Runtime) vs HTJ2K (OpenJPH wasm). Two codec rows
+     (linked MPR + 3D, one shared slice state) with real per-row progress bars and
+     time-to-first-image / time-to-final clocks. ?scan=<id> -->
 <title>livecodec — neural vs HTJ2K</title>
 <style>
   :root { color-scheme: dark; }
@@ -53,10 +54,9 @@
   #rows.maxmode .mrow.hasmax .cell { display: none; }
   #rows.maxmode .mrow.hasmax .cell.max { display: block; flex: 1; }
 </style>
-<!-- CDN runtimes: onnxruntime-web (global `ort`, webgpu EP + wasm fallback) and the
-     OpenJPH HTJ2K wasm codec (global `Module` factory; openjphjs.wasm resolves
-     relative to this script URL). -->
-<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.webgpu.min.js"></script>
+<!-- CDN runtime: the OpenJPH HTJ2K wasm codec (global `Module` factory;
+     openjphjs.wasm resolves relative to this script URL). The neural decoder is
+     pure WebGPU compute, bundled into livecodec.js — no ONNX Runtime. -->
 <script src="https://cdn.jsdelivr.net/npm/@cornerstonejs/codec-openjph/dist/openjphjs.js"></script>
 </head>
 <body>
@@ -65,6 +65,15 @@
       <h1>livecodec race</h1>
       <span id="info"></span>
       <button id="rand" class="chip" title="pick another scan at random">Load random scan</button>
+      <label class="chip" title="both codecs receive bytes at this simulated link speed, as if each were used alone on that network">net:
+        <select id="net">
+          <option value="3">3 Mbps (bad hospital wifi)</option>
+          <option value="10">10 Mbps (4G / VPN)</option>
+          <option value="25" selected>25 Mbps (typical wifi)</option>
+          <option value="100">100 Mbps (fast broadband)</option>
+          <option value="off">unthrottled (local)</option>
+        </select>
+      </label>
       <span id="status">loading…</span>
     </header>
     <div id="rows">
@@ -102,6 +111,6 @@
       </div>
     </div>
   </div>
-  <script type="module" src="livecodec.js?v=20260810a"></script>   <!-- bump per deploy -->
+  <script type="module" src="livecodec.js?v=20260811h"></script>   <!-- bump per deploy -->
 </body>
 </html>
