@@ -7,7 +7,8 @@
      "LiveCodec neural" (FSQ latents + ~0.8 MB decoder run on hand-written WebGPU
      compute kernels, no ONNX Runtime) vs HTJ2K (OpenJPH wasm). Two codec rows
      (linked MPR + 3D, one shared slice state) with real per-row progress bars and
-     time-to-first-image / time-to-final clocks. ?scan=<id> -->
+     time-to-first-image / time-to-final clocks. ?scan=<id> ?ver=<tag> ?net=<mbps>
+     ?bucket=<url-base> -->
 <title>livecodec — neural vs HTJ2K</title>
 <style>
   :root { color-scheme: dark; }
@@ -65,6 +66,17 @@
       <h1>livecodec race</h1>
       <span id="info"></span>
       <button id="rand" class="chip" title="pick another scan at random">Load random scan</button>
+      <!-- encoding: training-effort checkpoints from versions.json (hidden until
+           the versioned bucket layout exists); scan: the active dataset's cases
+           (legacy scans.json for the baseline, ood-scans.json for checkpoints).
+           Both are populated by livecodec.js; a change reloads with ?ver / ?scan
+           set (?net rides along). -->
+      <label class="chip" id="verwrap" style="display:none" title="compare training-effort checkpoints on the fixed out-of-distribution scan set">encoding:
+        <select id="ver"></select>
+      </label>
+      <label class="chip" title="pick a specific scan from the active dataset">scan:
+        <select id="scan"></select>
+      </label>
       <label class="chip" title="both codecs receive bytes at this simulated link speed, as if each were used alone on that network">net:
         <select id="net">
           <option value="3">3 Mbps (bad hospital wifi)</option>
@@ -111,6 +123,6 @@
       </div>
     </div>
   </div>
-  <script type="module" src="livecodec.js?v=20260811h"></script>   <!-- bump per deploy -->
+  <script type="module" src="livecodec.js?v=20260812a"></script>   <!-- bump per deploy -->
 </body>
 </html>

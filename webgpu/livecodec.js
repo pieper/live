@@ -2946,7 +2946,9 @@ fn sample_field_img${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
 };
 
 // examples/livecodec/livecodec-scene.ts
-var BUCKET = "https://js2.jetstream-cloud.org:8001/livecodec-demo/";
+var DEFAULT_BUCKET = "https://js2.jetstream-cloud.org:8001/livecodec-demo/";
+var bucketParam = typeof location !== "undefined" ? new URLSearchParams(location.search).get("bucket") : null;
+var BUCKET = bucketParam ? bucketParam.endsWith("/") ? bucketParam : bucketParam + "/" : DEFAULT_BUCKET;
 var simBps = null;
 function setSimulatedBandwidth(bitsPerSec) {
   simBps = bitsPerSec;
@@ -3222,14 +3224,29 @@ async function loadScans() {
   if (!r.ok) throw new Error(`scans.json HTTP ${r.status}`);
   return await r.json();
 }
-async function loadScanMeta(id) {
-  const r = await fetch(`${BUCKET}scans/${id}/meta.json`);
-  if (!r.ok) throw new Error(`meta.json HTTP ${r.status} for scan ${id}`);
+async function loadOodScans() {
+  const r = await fetch(BUCKET + "ood-scans.json", { cache: "no-cache" });
+  if (!r.ok) throw new Error(`ood-scans.json HTTP ${r.status}`);
   return await r.json();
 }
-async function loadDecoderMeta() {
-  const r = await fetch(BUCKET + "model/decoder.json");
-  if (!r.ok) throw new Error(`decoder.json HTTP ${r.status}`);
+async function loadVersions() {
+  try {
+    const r = await fetch(BUCKET + "versions.json", { cache: "no-cache" });
+    if (!r.ok) return [];
+    const v = await r.json();
+    return Array.isArray(v) ? v.filter((e) => e && typeof e.tag === "string") : [];
+  } catch {
+    return [];
+  }
+}
+async function loadScanMeta(neuralBase) {
+  const r = await fetch(neuralBase + "meta.json");
+  if (!r.ok) throw new Error(`meta.json HTTP ${r.status} at ${neuralBase}`);
+  return await r.json();
+}
+async function loadDecoderMeta(modelBase) {
+  const r = await fetch(modelBase + "decoder.json");
+  if (!r.ok) throw new Error(`decoder.json HTTP ${r.status} at ${modelBase}`);
   return await r.json();
 }
 
@@ -3279,15 +3296,19 @@ async function main() {
   const preferred = navigator.gpu.getPreferredCanvasFormat();
   const srgb = preferred + "-srgb";
   status("loading scan list\u2026");
-  const scans = await loadScans();
+  const versions = await loadVersions();
+  const version = versions.find((v) => v.tag === (PARAMS.get("ver") ?? "")) ?? null;
+  const scans = version ? await loadOodScans() : await loadScans();
   const wanted = PARAMS.get("scan") ?? "";
   const scan = scans.find((s) => s.id === wanted) ?? scans[Math.floor(Math.random() * scans.length)];
+  const norm2 = (u) => u.endsWith("/") ? u : u + "/";
   const dataOverride = PARAMS.get("data");
-  const base = dataOverride ? dataOverride.endsWith("/") ? dataOverride : dataOverride + "/" : `${BUCKET}scans/${scan.id}/`;
+  const neuralBase = dataOverride ? norm2(dataOverride) : version ? `${BUCKET}versions/${version.tag}/${scan.id}/` : `${BUCKET}scans/${scan.id}/`;
+  const htj2kBase = dataOverride ? norm2(dataOverride) : version ? `${BUCKET}ood/${scan.id}/` : `${BUCKET}scans/${scan.id}/`;
+  const modelOverride = PARAMS.get("model");
+  const modelBase = modelOverride ? norm2(modelOverride) : version ? `${BUCKET}versions/${version.tag}/model/` : BUCKET + "model/";
   const [Z, Y, X] = scan.shape;
-  el("info").textContent = `scan ${scan.id}${scan.heldout ? " (held-out)" : ""} \xB7 ${Z}\xD7${Y}\xD7${X} @ ${scan.spacing.map((s) => s.toFixed(2)).join("/")} mm \xB7 raw ${fmtBytes(scan.bytes.raw)}`;
-  el("name-neural").textContent = `LiveCodec neural \u2014 coarse ${fmtBytes(scan.bytes.coarse)} \u2192 fine ${fmtBytes(scan.bytes.fine + scan.bytes.dc)}` + (scan.bytes.residual ? ` \u2192 lossless ${fmtBytes(scan.bytes.residual)}` : "");
-  el("name-htj2k").textContent = `HTJ2K${scan.bytes.residual ? " lossless" : ""} \u2014 ${fmtBytes(scan.bytes.htj2k)}`;
+  el("info").textContent = `scan ${scan.id}${scan.heldout ? " (held-out)" : ""}${scan.source ? ` \xB7 ${scan.source}` : ""}${version ? ` \xB7 ${version.tag}` : ""} \xB7 ${Z}\xD7${Y}\xD7${X} @ ${scan.spacing.map((s) => s.toFixed(2)).join("/")} mm \xB7 raw ${fmtBytes(scan.bytes.raw)}`;
   el("rand").addEventListener("click", () => {
     const others = scans.filter((s) => s.id !== scan.id);
     const pick = others[Math.floor(Math.random() * others.length)] ?? scan;
@@ -3295,6 +3316,38 @@ async function main() {
     p.set("scan", pick.id);
     location.search = p.toString();
   });
+  const verSel = el("ver");
+  if (verSel && versions.length > 0) {
+    const wrap = el("verwrap");
+    if (wrap) wrap.style.display = "";
+    const fmtSteps = (s) => s >= 1e3 ? `${Math.round(s / 1e3)}k` : String(s);
+    const fmtParams = (p) => typeof p === "number" ? p >= 1e6 ? `${(p / 1e6).toFixed(1)}M` : `${Math.round(p / 1e3)}k` : p;
+    verSel.add(new Option("v3 \xB7 31 vols (baseline)", ""));
+    for (const v of versions) {
+      verSel.add(new Option(`${v.tag} \xB7 ${fmtSteps(v.steps)} steps \xB7 ${fmtParams(v.params)}`, v.tag));
+    }
+    verSel.value = version?.tag ?? "";
+    verSel.addEventListener("change", () => {
+      const p = new URLSearchParams(location.search);
+      if (verSel.value) p.set("ver", verSel.value);
+      else p.delete("ver");
+      p.set("scan", scan.id);
+      location.search = p.toString();
+    });
+  }
+  const scanSel = el("scan");
+  if (scanSel) {
+    for (const s of scans) {
+      const hint = s.heldout ? " (held-out)" : s.source ? ` (${s.source})` : "";
+      scanSel.add(new Option(`${s.id.slice(0, 8)} \xB7 ${s.shape.join("\xD7")}${hint}`, s.id));
+    }
+    scanSel.value = scan.id;
+    scanSel.addEventListener("change", () => {
+      const p = new URLSearchParams(location.search);
+      p.set("scan", scanSel.value);
+      location.search = p.toString();
+    });
+  }
   const netSel = el("net");
   const netParam = PARAMS.get("net") ?? netSel?.value ?? "25";
   if (netSel) {
@@ -3328,7 +3381,18 @@ async function main() {
     })));
   };
   status(`loading ${scan.id} meta\u2026`);
-  const [meta, dec] = await Promise.all([loadScanMeta(scan.id), loadDecoderMeta()]);
+  const [meta, dec] = await Promise.all([loadScanMeta(neuralBase), loadDecoderMeta(modelBase)]);
+  const nb = version ? meta.bytes : scan.bytes;
+  const bytes = {
+    raw: scan.bytes.raw,
+    htj2k: scan.bytes.htj2k,
+    coarse: nb.coarse ?? 0,
+    fine: nb.fine ?? 0,
+    dc: nb.dc ?? 0,
+    residual: nb.residual
+  };
+  el("name-neural").textContent = `LiveCodec neural \u2014 coarse ${fmtBytes(bytes.coarse)} \u2192 fine ${fmtBytes(bytes.fine + bytes.dc)}` + (bytes.residual ? ` \u2192 lossless ${fmtBytes(bytes.residual)}` : "");
+  el("name-htj2k").textContent = `HTJ2K${bytes.residual ? " lossless" : ""} \u2014 ${fmtBytes(bytes.htj2k)}`;
   const sc = makeLiveCodecScene(gpu, srgb, scan.shape, scan.spacing);
   const keys = ["neural", "htj2k"];
   const cellNames = [...ORIENTS, "threeD"];
@@ -3478,7 +3542,6 @@ async function main() {
   const runNeural = async () => {
     const r = race.neural;
     try {
-      const modelBase = PARAMS.get("model") ?? BUCKET + "model/";
       const dtype = gpu.features.has("shader-f16") ? "f16" : "f32";
       const tNet = performance.now();
       const netP = new Net(gpu.device, makeRunner(gpu.device, dtype), dtype).load(modelBase + "decoder25.graph.json", modelBase + "decoder25.weights.bin").then((n) => {
@@ -3488,10 +3551,10 @@ async function main() {
       netP.catch(() => {
       });
       r.stage = "coarse";
-      r.expected = scan.bytes.coarse;
+      r.expected = bytes.coarse;
       r.got = 0;
       const mCoarse = meters.neural.begin("coarse.gz");
-      const coarseGz = await streamFetch(base + "coarse.gz", (n) => {
+      const coarseGz = await streamFetch(neuralBase + "coarse.gz", (n) => {
         r.got = n;
         mCoarse.at(n);
       }, pacers.neural);
@@ -3521,16 +3584,16 @@ async function main() {
       r.note = "";
       requestDraw();
       r.stage = "fine+dc";
-      r.expected = scan.bytes.fine + scan.bytes.dc;
+      r.expected = bytes.fine + bytes.dc;
       r.got = 0;
       let fGot = 0, dGot = 0;
       const [fineGz, dcGz] = await Promise.all([
-        streamFetch(base + "fine.gz", /* @__PURE__ */ ((m) => (n) => {
+        streamFetch(neuralBase + "fine.gz", /* @__PURE__ */ ((m) => (n) => {
           fGot = n;
           r.got = fGot + dGot;
           m.at(n);
         })(meters.neural.begin("fine.gz")), pacers.neural),
-        streamFetch(base + "dc.gz", /* @__PURE__ */ ((m) => (n) => {
+        streamFetch(neuralBase + "dc.gz", /* @__PURE__ */ ((m) => (n) => {
           dGot = n;
           r.got = fGot + dGot;
           m.at(n);
@@ -3550,15 +3613,15 @@ async function main() {
       }
       sc.writeSlab("neural", 0, Z);
       requestDraw();
-      if (scan.bytes.residual) {
+      if (bytes.residual) {
         r.stage = "residual";
-        r.expected = scan.bytes.residual;
+        r.expected = bytes.residual;
         r.got = 0;
         r.note = "";
         const factory = globalThis.Module;
         if (!factory) throw new Error("openjph script did not load");
         const rDecoder = new (await factory()).HTJ2KDecoder();
-        const idxResp = await fetch(base + "residual-index.json", { cache: "no-store" });
+        const idxResp = await fetch(neuralBase + "residual-index.json", { cache: "no-store" });
         if (!idxResp.ok) throw new Error(`residual-index.json HTTP ${idxResp.status}`);
         const ridx = await idxResp.json();
         const total = ridx.length ? ridx[ridx.length - 1].offset + ridx[ridx.length - 1].bytes : 0;
@@ -3574,7 +3637,7 @@ async function main() {
           const b = e.z * sliceSize;
           for (let i = 0; i < sliceSize; i++) vol[b + i] += u16[i] - 4096;
         };
-        const resp = await fetch(base + "residual.bin", { cache: "no-store" });
+        const resp = await fetch(neuralBase + "residual.bin", { cache: "no-store" });
         if (!resp.ok || !resp.body) throw new Error(`residual.bin HTTP ${resp.status}`);
         const mRes = meters.neural.begin("residual.bin");
         const rrd = resp.body.getReader();
@@ -3687,7 +3750,7 @@ async function main() {
       r.note = `round ${shown}/${R} \xB7 ${px}px${full < 1 ? " \u2026" : ""}`;
       requestDraw();
     };
-    const resp = await fetch(base + "slices.bin", { cache: "no-store" });
+    const resp = await fetch(htj2kBase + "slices.bin", { cache: "no-store" });
     if (!resp.ok || !resp.body) throw new Error(`slices.bin HTTP ${resp.status}`);
     const mSl = meters.htj2k.begin("slices.bin");
     const rd = resp.body.getReader();
@@ -3723,7 +3786,7 @@ async function main() {
       const factory = globalThis.Module;
       if (!factory) throw new Error("openjph script did not load");
       const openjphP = factory();
-      const idxResp = await fetch(base + "index.json", { cache: "no-store" });
+      const idxResp = await fetch(htj2kBase + "index.json", { cache: "no-store" });
       if (!idxResp.ok) throw new Error(`index.json HTTP ${idxResp.status}`);
       const rawIdx = await idxResp.json();
       const openjph = await openjphP;
@@ -3758,7 +3821,7 @@ async function main() {
         if (r.tFirst == null) r.tFirst = elapsed("htj2k");
         requestDraw();
       };
-      const resp = await fetch(base + "slices.bin", { cache: "no-store" });
+      const resp = await fetch(htj2kBase + "slices.bin", { cache: "no-store" });
       if (!resp.ok || !resp.body) throw new Error(`slices.bin HTTP ${resp.status}`);
       const mSl = meters.htj2k.begin("slices.bin");
       const rd = resp.body.getReader();
@@ -3793,6 +3856,8 @@ async function main() {
   globalThis.__lcDbg = {
     ready: () => true,
     scan: () => scan.id,
+    ver: () => version?.tag ?? null,
+    bases: () => ({ neuralBase, htj2kBase, modelBase }),
     dims: () => sc.dims,
     offsets: () => ({ ...off }),
     race: () => JSON.parse(JSON.stringify(race)),
