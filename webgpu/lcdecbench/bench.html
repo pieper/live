@@ -1,0 +1,120 @@
+<!doctype html>
+<!-- lcdecbench — time candidate LiveCodec decoders in the hand-written WGSL
+     runtime (wgpu-net.js, same executor the race page uses) on the demo's real
+     chunk shape (1,5,8,64,64) -> (1,1,32,512,512), and check numerical parity
+     against a torch golden vector.
+
+     ?nets=A,B,C     configs to run (nets/dec<TAG>.graph.json + .weights.bin)
+     ?dtype=f16|f32  kernel precision (f32 = the no-shader-f16 fallback path)
+     ?reps=<n>       timed repetitions after warmup
+     ?post=1         POST the JSON result table to /report (headless driving)
+     Weights here are RANDOM (untrained): timing and executor parity only. -->
+<meta charset="utf-8">
+<title>lcdecbench — WGSL decoder timing</title>
+<style>
+  body { background:#05060a; color:#d6e2f2; font:13px -apple-system,system-ui,sans-serif; margin:16px }
+  table { border-collapse:collapse; margin-top:10px }
+  th,td { border:1px solid #263a5e; padding:4px 10px; text-align:right }
+  th:first-child,td:first-child { text-align:left }
+  .ok { color:#5ad18a } .bad { color:#ff6b74 }
+  pre { color:#7d92b5 }
+</style>
+<body>
+<h3>LiveCodec decoder bench — WGSL runtime</h3>
+<pre id="log">starting…</pre>
+<div id="out"></div>
+<script type="module">
+import { Net, makeRunner } from "./wgpu-net.js";
+
+const P = new URLSearchParams(location.search);
+const TAGS = (P.get("nets") || "A,B,C").split(",").filter(Boolean);
+const DTYPE = P.get("dtype") || "f16";
+const REPS = Number(P.get("reps") || 20);
+const logEl = document.getElementById("log");
+const log = (m) => { logEl.textContent += "\n" + m; console.log(m); };
+
+const f32bin = async (u) => new Float32Array(await (await fetch(u)).arrayBuffer());
+
+const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+const hasF16 = adapter.features.has("shader-f16");
+if (DTYPE === "f16" && !hasF16) throw new Error("adapter lacks shader-f16");
+const device = await adapter.requestDevice({
+  requiredFeatures: DTYPE === "f16" ? ["shader-f16"] : [],
+  requiredLimits: {
+    maxBufferSize: adapter.limits.maxBufferSize,
+    maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+  },
+});
+log(`adapter ${JSON.stringify(adapter.info ?? {})} · dtype ${DTYPE} · shader-f16 ${hasF16}`);
+
+const rows = [];
+for (const tag of TAGS) {
+  try {
+    const base = `nets/dec${tag}`;
+    const wBytes = Number((await fetch(base + ".weights.bin", { method: "HEAD" })).headers.get("content-length"));
+    const t0 = performance.now();
+    const net = await new Net(device, makeRunner(device, DTYPE), DTYPE)
+      .load(base + ".graph.json", base + ".weights.bin");
+    const loadMs = performance.now() - t0;
+    const [zf, zc, exp] = await Promise.all([
+      f32bin(base + "-zf.bin"), f32bin(base + "-zc_up.bin"), f32bin(base + "-expected.bin"),
+    ]);
+    net.setInputData("zf", zf);
+    net.setInputData("zc_up", zc);
+
+    // ---- parity vs the torch golden ----
+    net.run();
+    const got = await net.read("volume");
+    let sum = 0, max = 0, sq = 0;
+    for (let i = 0; i < exp.length; i++) {
+      const d = Math.abs(got[i] - exp[i]);
+      sum += d; if (d > max) max = d; sq += exp[i] * exp[i];
+    }
+    const meanAbs = sum / exp.length, rms = Math.sqrt(sq / exp.length);
+
+    // ---- timing: warm up (pipeline compile), then per-chunk latency with a
+    // queue sync per chunk (what the demo sees: it reads back each chunk), and
+    // pipelined throughput (all reps submitted, one wait at the end) ----
+    for (let i = 0; i < 3; i++) { net.run(); await device.queue.onSubmittedWorkDone(); }
+    let tSync = 0;
+    for (let i = 0; i < REPS; i++) {
+      const t = performance.now();
+      net.run();
+      await device.queue.onSubmittedWorkDone();
+      tSync += performance.now() - t;
+    }
+    const tp0 = performance.now();
+    for (let i = 0; i < REPS; i++) net.run();
+    await device.queue.onSubmittedWorkDone();
+    const pipeMs = (performance.now() - tp0) / REPS;
+
+    const row = {
+      tag, dtype: DTYPE, weightsMB: +(wBytes / 1e6).toFixed(2),
+      loadMs: Math.round(loadMs),
+      msPerChunk: +(tSync / REPS).toFixed(1),
+      msPerChunkPipelined: +pipeMs.toFixed(1),
+      parityMeanAbs: +meanAbs.toPrecision(3), parityMaxAbs: +max.toPrecision(3),
+      goldenRMS: +rms.toPrecision(3), parityPass: meanAbs < 0.004,
+    };
+    rows.push(row);
+    log(JSON.stringify(row));
+  } catch (e) {
+    rows.push({ tag, dtype: DTYPE, error: String(e?.message ?? e) });
+    log(`${tag}: ERROR ${e?.message ?? e}`);
+  }
+}
+
+const cols = ["tag", "dtype", "weightsMB", "msPerChunk", "msPerChunkPipelined", "loadMs",
+  "parityMeanAbs", "parityMaxAbs", "goldenRMS", "parityPass", "error"];
+document.getElementById("out").innerHTML =
+  "<table><tr>" + cols.map((c) => `<th>${c}</th>`).join("") + "</tr>" +
+  rows.map((r) => "<tr>" + cols.map((c) => {
+    const v = r[c];
+    const cls = c === "parityPass" ? (v ? "ok" : "bad") : "";
+    return `<td class="${cls}">${v === undefined ? "" : v}</td>`;
+  }).join("") + "</tr>").join("") + "</table>";
+document.title = "BENCH-DONE";
+if (P.get("post")) {
+  await fetch("/report", { method: "POST", body: JSON.stringify({ bench: rows, dtype: DTYPE }) });
+}
+</script>

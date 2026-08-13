@@ -1,0 +1,85 @@
+<!doctype html>
+<!-- Automated verification harness for the livecodec race page: iframes
+     /livecodec.html (same origin), waits for both rows to finish, then compares
+     the neural row's final CPU volume against the HTJ2K row's (bit-exact) one
+     over random in-body voxels via __lcDbg.volSample, POSTing the stats to
+     /report on the local bench server.  ?scan=<id> ?net=<mbps|off> ?tag=<label> -->
+<meta charset="utf-8">
+<title>livecodec race probe</title>
+<body>
+<pre id="log">starting…</pre>
+<script>
+const P = new URLSearchParams(location.search);
+const scan = P.get("scan") || "";
+const net = P.get("net") || "off";
+const tag = P.get("tag") || "untagged";
+const log = (m) => { document.getElementById("log").textContent += "\n" + m; };
+
+const page = P.get("page") || "/livecodec.html";
+const bucket = P.get("bucket") || "";
+const fr = document.createElement("iframe");
+fr.style.cssText = "width:1200px;height:800px;border:0";
+fr.src = `${page}?scan=${encodeURIComponent(scan)}&net=${net}`
+  + (bucket ? `&bucket=${encodeURIComponent(bucket)}` : "");
+document.body.appendChild(fr);
+
+const post = (obj) => fetch("/report", { method: "POST", body: JSON.stringify(obj) });
+
+const t0 = performance.now();
+const timer = setInterval(async () => {
+  const w = fr.contentWindow;
+  const dbg = w && w.__lcDbg;
+  const mins = (performance.now() - t0) / 60000;
+  if (!dbg) { if (mins > 2) { clearInterval(timer); await post({ tag, error: "no __lcDbg after 2 min" }); } return; }
+  const race = dbg.race();
+  document.title = `${race.neural.stage}/${race.neural.note} vs ${race.htj2k.stage}/${race.htj2k.note}`;
+  if (race.neural.error || race.htj2k.error) {
+    clearInterval(timer);
+    await post({ tag, scan: dbg.scan(), error: race.neural.error || race.htj2k.error });
+    return;
+  }
+  if (mins > 15) { clearInterval(timer); await post({ tag, error: "timeout 15 min", race }); return; }
+  if (race.neural.tFinal == null || race.htj2k.tFinal == null) return;
+  clearInterval(timer);
+  // both rows final: sample ~1000 random in-body voxels (HTJ2K row is the
+  // bit-exact ground truth; "in body" = htj2k HU > -500)
+  const [X, Y, Z] = dbg.dims();
+  let rng = 123456789 >>> 0;
+  const rand = () => { rng ^= rng << 13; rng ^= rng >>> 17; rng ^= rng << 5; rng >>>= 0; return rng / 4294967296; };
+  // two populations: ~1000 in-body voxels (htj2k HU > -500) and ~1000 uniform
+  // voxels anywhere in the volume (catches clipped air / dense-bone extremes)
+  const stats = (arr) => {
+    const s = arr.slice().sort((a, b) => a - b);
+    let sum = 0, exact = 0;
+    for (const d of arr) { sum += d; if (d < 1e-6) exact++; }
+    return {
+      n: arr.length, max: s[s.length - 1] ?? 0, mean: sum / (arr.length || 1),
+      p50: s[(arr.length * 0.5) | 0] ?? 0, p99: s[(arr.length * 0.99) | 0] ?? 0,
+      fracExact: exact / (arr.length || 1),
+      fracOver5HU: arr.filter((d) => d > 5).length / (arr.length || 1),
+    };
+  };
+  const inBody = [], all = [];
+  let worst = { d: -1 };
+  let attempts = 0;
+  while ((inBody.length < 1000 || all.length < 1000) && attempts < 2000000) {
+    attempts++;
+    const z = (rand() * Z) | 0, y = (rand() * Y) | 0, x = (rand() * X) | 0;
+    const h = dbg.volSample("htj2k", z, y, x);
+    const n = dbg.volSample("neural", z, y, x);
+    const d = Math.abs(n - h);
+    if (all.length < 1000) all.push(d);
+    if (h > -500 && inBody.length < 1000) inBody.push(d);
+    if (d > worst.d) worst = { d, z, y, x, htj2k: h, neural: n };
+  }
+  const report = {
+    tag, scan: dbg.scan(), dims: [X, Y, Z], net,
+    neuralNote: race.neural.note, htj2kNote: race.htj2k.note,
+    tFinalNeural: race.neural.tFinal, tFinalHtj2k: race.htj2k.tFinal,
+    inBody: stats(inBody), anywhere: stats(all), worst,
+  };
+  log(JSON.stringify(report, null, 1));
+  await post(report);
+  document.title = "PROBE-DONE";
+}, 1000);
+</script>

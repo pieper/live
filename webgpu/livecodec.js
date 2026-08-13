@@ -3391,7 +3391,7 @@ async function main() {
     dc: nb.dc ?? 0,
     residual: nb.residual
   };
-  el("name-neural").textContent = `LiveCodec neural \u2014 coarse ${fmtBytes(bytes.coarse)} \u2192 fine ${fmtBytes(bytes.fine + bytes.dc)}` + (bytes.residual ? ` \u2192 lossless ${fmtBytes(bytes.residual)}` : "");
+  el("name-neural").textContent = `LiveCodec neural \u2014 coarse ${fmtBytes(bytes.coarse)} \u2192 fine ${fmtBytes(bytes.fine + bytes.dc)}` + (bytes.residual ? ` \u2192 near-lossless ${fmtBytes(bytes.residual)}` : "");
   el("name-htj2k").textContent = `HTJ2K${bytes.residual ? " lossless" : ""} \u2014 ${fmtBytes(bytes.htj2k)}`;
   const sc = makeLiveCodecScene(gpu, srgb, scan.shape, scan.spacing);
   const keys = ["neural", "htj2k"];
@@ -3624,49 +3624,72 @@ async function main() {
         const idxResp = await fetch(neuralBase + "residual-index.json", { cache: "no-store" });
         if (!idxResp.ok) throw new Error(`residual-index.json HTTP ${idxResp.status}`);
         const ridx = await idxResp.json();
-        const total = ridx.length ? ridx[ridx.length - 1].offset + ridx[ridx.length - 1].bytes : 0;
-        const sliceSize = X * Y;
-        const rbuf = new Uint8Array(total);
-        let received = 0, next = 0, flushed = 0;
-        const applySlice = (e) => {
-          const enc = rDecoder.getEncodedBuffer(e.bytes);
-          enc.set(rbuf.subarray(e.offset, e.offset + e.bytes));
-          rDecoder.decode();
-          const out = rDecoder.getDecodedBuffer();
-          const u16 = new Uint16Array(out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength));
-          const b = e.z * sliceSize;
-          for (let i = 0; i < sliceSize; i++) vol[b + i] += u16[i] - 4096;
-        };
-        const resp = await fetch(neuralBase + "residual.bin", { cache: "no-store" });
-        if (!resp.ok || !resp.body) throw new Error(`residual.bin HTTP ${resp.status}`);
-        const mRes = meters.neural.begin("residual.bin");
-        const rrd = resp.body.getReader();
-        for (; ; ) {
-          const { done, value } = await rrd.read();
-          if (done) break;
-          await pacers.neural.admit(value.byteLength);
-          mRes.add(value.byteLength);
-          rbuf.set(value, received);
-          received += value.byteLength;
-          r.got = received;
+        const base = new Float32Array(vol.length);
+        for (let i = 0; i < vol.length; i++) {
+          base[i] = Math.trunc(Math.min(3071, Math.max(-1024, vol[i])));
+        }
+        const writeResidualPlane = makePlaneWriter(vol, 4096, base);
+        if (!Array.isArray(ridx)) {
+          await runResProgressive({
+            idx: ridx,
+            decoder: rDecoder,
+            r,
+            row: "neural",
+            stage: "residual",
+            url: neuralBase + "residual.bin",
+            pacer: pacers.neural,
+            meter: meters.neural,
+            streamName: "residual.bin",
+            writePlane: writeResidualPlane
+          });
+        } else {
+          const total = ridx.length ? ridx[ridx.length - 1].offset + ridx[ridx.length - 1].bytes : 0;
+          r.expected = total || r.expected;
+          const rbuf = new Uint8Array(total);
+          let received = 0, next = 0, flushed = 0;
+          const applySlice = (e) => {
+            const enc = rDecoder.getEncodedBuffer(e.bytes);
+            enc.set(rbuf.subarray(e.offset, e.offset + e.bytes));
+            rDecoder.decode();
+            const out = rDecoder.getDecodedBuffer();
+            const u16 = new Uint16Array(out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength));
+            writeResidualPlane(e.z, 0, u16);
+          };
+          const resp = await fetch(neuralBase + "residual.bin", { cache: "no-store" });
+          if (!resp.ok || !resp.body) throw new Error(`residual.bin HTTP ${resp.status}`);
+          const mRes = meters.neural.begin("residual.bin");
+          const rrd = resp.body.getReader();
+          for (; ; ) {
+            const { done, value } = await rrd.read();
+            if (done) break;
+            await pacers.neural.admit(value.byteLength);
+            mRes.add(value.byteLength);
+            rbuf.set(value, received);
+            received += value.byteLength;
+            r.got = received;
+            while (next < ridx.length && ridx[next].offset + ridx[next].bytes <= received) {
+              applySlice(ridx[next]);
+              next++;
+              r.note = `${next}/${ridx.length} slices`;
+              if (next - flushed >= 32) {
+                sc.writeSlab("neural", flushed, next);
+                flushed = next;
+                requestDraw();
+              }
+            }
+          }
           while (next < ridx.length && ridx[next].offset + ridx[next].bytes <= received) {
             applySlice(ridx[next]);
             next++;
-            r.note = `${next}/${ridx.length} slices`;
-            if (next - flushed >= 32) {
-              sc.writeSlab("neural", flushed, next);
-              flushed = next;
-              requestDraw();
-            }
           }
+          sc.writeSlab("neural", flushed, Z);
+          requestDraw();
         }
-        while (next < ridx.length && ridx[next].offset + ridx[next].bytes <= received) {
-          applySlice(ridx[next]);
-          next++;
+        r.note = "near-lossless";
+        const pt = el("ptext-neural");
+        if (pt) {
+          pt.title = "residual is applied against the browser's float recon (clipped/truncated to match the server's int16); browser-vs-server f16/f32 decoder drift leaves \u2264 ~\xB12 HU \u2014 bit-exact would require an integer-deterministic decoder";
         }
-        sc.writeSlab("neural", flushed, Z);
-        requestDraw();
-        r.note = "lossless";
       }
       r.tFinal = elapsed("neural");
       reportIfDone();
@@ -3675,8 +3698,31 @@ async function main() {
       console.error(e);
     }
   };
-  const runHTJ2KProgressive = async (idx, decoder, vol, r) => {
+  const makePlaneWriter = (vol, bias, base) => (z, level, u16) => {
     const sliceSize = X * Y;
+    const b = z * sliceSize;
+    if (level === 0) {
+      const n = Math.min(sliceSize, u16.length);
+      if (base) {
+        for (let i = 0; i < n; i++) vol[b + i] = base[b + i] + u16[i] - bias;
+      } else {
+        for (let i = 0; i < n; i++) vol[b + i] = u16[i] - bias;
+      }
+    } else {
+      const w = Math.max(1, Math.ceil(X / (1 << level)));
+      const h = Math.max(1, Math.ceil(Y / (1 << level)));
+      for (let y = 0; y < Y; y++) {
+        const srow = Math.min(h - 1, y * h / Y | 0) * w;
+        const drow = b + y * X;
+        for (let x = 0; x < X; x++) {
+          const v = u16[srow + Math.min(w - 1, x * w / X | 0)] - bias;
+          vol[drow + x] = base ? base[drow + x] + v : v;
+        }
+      }
+    }
+  };
+  const runResProgressive = async (opts) => {
+    const { idx, decoder, r, row } = opts;
     const slices = idx.slices, nS = slices.length, R = idx.rounds;
     const schedSlice = [];
     const schedEnd = [];
@@ -3692,7 +3738,7 @@ async function main() {
       roundEnd.push(schedSlice.length);
     }
     const total = schedEnd.length ? schedEnd[schedEnd.length - 1] : 0;
-    r.stage = "slices";
+    r.stage = opts.stage;
     r.expected = total;
     r.got = 0;
     const buf = new Uint8Array(total);
@@ -3713,21 +3759,7 @@ async function main() {
       decoder.decodeSubResolution(level);
       const out = decoder.getDecodedBuffer();
       const u16 = new Uint16Array(out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength));
-      const b = s.z * sliceSize;
-      if (level === 0) {
-        const n = Math.min(sliceSize, u16.length);
-        for (let i = 0; i < n; i++) vol[b + i] = u16[i] - 1024;
-      } else {
-        const w = Math.max(1, Math.ceil(X / (1 << level)));
-        const h = Math.max(1, Math.ceil(Y / (1 << level)));
-        for (let y = 0; y < Y; y++) {
-          const srow = Math.min(h - 1, y * h / Y | 0) * w;
-          const drow = b + y * X;
-          for (let x = 0; x < X; x++) {
-            vol[drow + x] = u16[srow + Math.min(w - 1, x * w / X | 0)] - 1024;
-          }
-        }
-      }
+      opts.writePlane(s.z, level, u16);
       applied[si] = k;
     };
     const applyPass = async () => {
@@ -3741,24 +3773,24 @@ async function main() {
         if (++n % 32 === 0) await new Promise((res) => setTimeout(res));
       }
       if (maxZ < 0) return;
-      sc.writeSlab("htj2k", minZ, maxZ + 1);
+      sc.writeSlab(row, minZ, maxZ + 1);
       let full = R;
       for (let si = 0; si < nS; si++) if (applied[si] < full) full = applied[si];
-      if (full >= 1 && r.tFirst == null) r.tFirst = elapsed("htj2k");
+      if (full >= 1 && r.tFirst == null) r.tFirst = elapsed(row);
       const shown = Math.max(1, full);
       const px = Math.max(1, Math.ceil(X / (1 << R - shown)));
       r.note = `round ${shown}/${R} \xB7 ${px}px${full < 1 ? " \u2026" : ""}`;
       requestDraw();
     };
-    const resp = await fetch(htj2kBase + "slices.bin", { cache: "no-store" });
-    if (!resp.ok || !resp.body) throw new Error(`slices.bin HTTP ${resp.status}`);
-    const mSl = meters.htj2k.begin("slices.bin");
+    const resp = await fetch(opts.url, { cache: "no-store" });
+    if (!resp.ok || !resp.body) throw new Error(`${opts.streamName} HTTP ${resp.status}`);
+    const mSl = opts.meter.begin(opts.streamName);
     const rd = resp.body.getReader();
     let received = 0, cursor = 0, nextRound = 0, lastPassAt = 0;
     for (; ; ) {
       const { done, value } = await rd.read();
       if (done) break;
-      await pacers.htj2k.admit(value.byteLength);
+      await opts.pacer.admit(value.byteLength);
       mSl.add(value.byteLength);
       buf.set(value, received);
       received += value.byteLength;
@@ -3776,9 +3808,6 @@ async function main() {
     }
     while (cursor < schedEnd.length && schedEnd[cursor] <= received) arrived[schedSlice[cursor++]]++;
     await applyPass();
-    r.note = "lossless";
-    r.tFinal = elapsed("htj2k");
-    reportIfDone();
   };
   const runHTJ2K = async () => {
     const r = race.htj2k;
@@ -3794,7 +3823,22 @@ async function main() {
       const vol = sc.rows.htj2k.vol;
       const sliceSize = X * Y;
       if (!Array.isArray(rawIdx) && rawIdx.layout === "res-progressive") {
-        await runHTJ2KProgressive(rawIdx, decoder, vol, r);
+        await runResProgressive({
+          idx: rawIdx,
+          decoder,
+          r,
+          row: "htj2k",
+          stage: "slices",
+          url: htj2kBase + "slices.bin",
+          pacer: pacers.htj2k,
+          meter: meters.htj2k,
+          streamName: "slices.bin",
+          writePlane: makePlaneWriter(vol, 1024)
+          // uint16 = HU + 1024
+        });
+        r.note = "lossless";
+        r.tFinal = elapsed("htj2k");
+        reportIfDone();
         return;
       }
       const idx = rawIdx;
