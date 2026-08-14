@@ -1,3 +1,4 @@
 [
- {"tag": "big-025k", "steps": 25000, "params": 28600000, "note": "mock: copies of the legacy baseline files for local wiring tests"}
+ {"tag": "big-025k", "steps": 25000, "params": 28600000, "note": "mock: copies of the legacy baseline files for local wiring tests"},
+ {"tag": "v3-mock", "steps": 26000, "params": 28684382, "note": "mock: throwaway v3 decoder (both heads) over the same latents — plumbing/timing only, image is garbage"}
 ]

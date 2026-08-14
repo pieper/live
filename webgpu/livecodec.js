@@ -162,6 +162,17 @@ fn main(@builtin(workgroup_id) wid:vec3<u32>,@builtin(local_invocation_id) lid:v
   let OHW=d.OH*d.OW; let c=idx/(d.OD*OHW); let r=idx%(d.OD*OHW); let oz=r/OHW; let rr=r%OHW; let oy=rr/d.OW; let ox=rr%d.OW;
   let iz=(oz*d.ID)/d.OD; let iy=(oy*d.IH)/d.OH; let ix=(ox*d.IW)/d.OW;   // nearest/floor asymmetric
   y[idx]=x[((c*d.ID+iz)*d.IH+iy)*d.IW+ix]; }`;
+var D2S = `struct P{C:u32,D:u32,OH:u32,OW:u32,IH:u32,IW:u32,B:u32,gx:u32};
+@group(0)@binding(0) var<storage,read> x:array<f16>; @group(0)@binding(1) var<storage,read_write> y:array<f16>;
+@group(0)@binding(2) var<uniform> p:P;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid:vec3<u32>,@builtin(local_invocation_id) lid:vec3<u32>){
+  let idx=(wid.y*p.gx+wid.x)*256u+lid.x; let OHW=p.OH*p.OW; if(idx>=p.C*p.D*OHW){return;}
+  let c=idx/(p.D*OHW); let r=idx%(p.D*OHW); let z=r/OHW; let rr=r%OHW; let oy=rr/p.OW; let ox=rr%p.OW;
+  let ci=c*p.B*p.B+(oy%p.B)*p.B+(ox%p.B);
+  let v=x[((ci*p.D+z)*p.IH+oy/p.B)*p.IW+ox/p.B];
+  y[idx]=v; }`;
+var D2S_SILU = D2S.replace("y[idx]=v; }", "let f=f32(v); y[idx]=f16(f/(1.0+exp(-f))); }");
 var SWAPAB = `struct P{A:u32,B:u32,S:u32,gx:u32};
 @group(0)@binding(0) var<storage,read> x:array<f16>; @group(0)@binding(1) var<storage,read_write> y:array<f16>;
 @group(0)@binding(2) var<uniform> p:P;
@@ -205,8 +216,9 @@ var Net = class {
     const inSet = new Set(g.inputs.map((i) => i.name));
     const cons = {};
     for (const nd of g.nodes) for (const i of nd.in) (cons[i] = cons[i] || []).push(nd);
+    const FUSABLE = /* @__PURE__ */ new Set(["Conv", "GroupNorm", "DepthToSpace"]);
     const skip = /* @__PURE__ */ new Set(), fuseOut = {};
-    for (const nd of g.nodes) if (nd.op === "Conv" || nd.op === "GroupNorm") {
+    for (const nd of g.nodes) if (FUSABLE.has(nd.op)) {
       const c = cons[nd.out[0]];
       if (c && c.length === 1 && c[0].op === "Silu") {
         skip.add(c[0]);
@@ -216,7 +228,7 @@ var Net = class {
     const ops = [];
     for (const nd of g.nodes) {
       if (skip.has(nd)) continue;
-      const fo = nd.op === "Conv" || nd.op === "GroupNorm" ? fuseOut[nd.out[0]] : void 0;
+      const fo = FUSABLE.has(nd.op) ? fuseOut[nd.out[0]] : void 0;
       ops.push({ nd, out: fo || nd.out[0], fused: !!fo });
     }
     const lastUse = {};
@@ -270,6 +282,13 @@ var Net = class {
         const gd = R.grid(Nout);
         r.u = R.uni([os[1], os[2], os[3], os[4], is[2], is[3], is[4], gd.gx]);
         r.wg = gd.wg;
+      } else if (nd.op === "DepthToSpace") {
+        const os = tsr[o.out], is = tsr[nd.in[0]], bs = nd.blocksize;
+        if (nd.mode !== "CRD") throw new Error("DepthToSpace mode " + nd.mode + " unsupported (CRD only)");
+        const gd = R.grid(os[1] * os[2] * os[3] * os[4]);
+        r.u = R.uni([os[1], os[2], os[3], os[4], is[3], is[4], bs, gd.gx]);
+        r.wg = gd.wg;
+        r.k = o.fused ? R.D2S_SILU : R.D2S;
       } else if (nd.op === "SwapAB") {
         const S = this.prod(tsr[o.out]) / (nd.A * nd.B);
         const gd = R.grid(nd.A * nd.B * S);
@@ -322,6 +341,7 @@ var Net = class {
           off += r.parts[k];
         });
       } else if (r.op === "Resize") R.pass(enc, R.RESIZE, [B(i[0]), out, r.u], r.wg);
+      else if (r.op === "DepthToSpace") R.pass(enc, r.k, [B(i[0]), out, r.u], r.wg);
       else if (r.op === "SwapAB") R.pass(enc, R.SWAPAB, [B(i[0]), out, r.u], r.wg);
     }
     this.dev.queue.submit([enc.finish()]);
@@ -405,7 +425,7 @@ var Net = class {
     return ok.length ? ok : [[4, 4]];
   }
   // pick the fastest verified conv tiling for THIS gpu by timing the real forward. Inputs must be set.
-  async autotuneConv(candidates = [[4, 4], [2, 8], [8, 2], [2, 4], [4, 2]], reps = 3) {
+  async autotuneConv(candidates = [[4, 4], [2, 8], [8, 2], [2, 4], [4, 2], [4, 8], [8, 4]], reps = 3) {
     const verified = await this._verifyConfigs(candidates);
     let best = [4, 4], bestMs = Infinity;
     for (const [TM, TN] of verified) {
@@ -423,6 +443,59 @@ var Net = class {
     }
     this.setConvConfig(best[0], best[1]);
     return { TM: best[0], TN: best[1], ms: Math.round(bestMs), verified: verified.length, tried: candidates.length };
+  }
+  // FNV-1a over the graph's structure (nodes + tensor shapes, NOT the weights):
+  // the conv tiling depends on the shapes being dispatched, so two checkpoints of
+  // the same architecture legitimately share a tuning result.
+  graphHash() {
+    const s = JSON.stringify([this.graph.nodes, this.graph.tensors]);
+    let h = 2166136261 >>> 0;
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619) >>> 0;
+    }
+    return h.toString(36);
+  }
+  // autotuneConv + a localStorage memo keyed on (adapter, dtype, graph shape).
+  // Tuning times the REAL forward, so it costs a few SECONDS — hence the memo:
+  // once per browser per (GPU, graph). Inputs must already be set (zeros are
+  // fine: the timing depends on shapes, not values).
+  //   cachedOnly: apply a memoized tiling if there is one, but never pay to
+  //     measure — for callers on a latency-critical path (the race page reads
+  //     the cache before decoding and warms it afterwards, on an idle GPU, so
+  //     tuning never lands on time-to-first-image).
+  // Never throws: a failed tune, a blocked localStorage (private mode, no
+  // origin) or a corrupt entry all leave the default tiling in place.
+  async autotune(gpuKey = "", { candidates, reps, force = false, cachedOnly = false } = {}) {
+    const key = `lcnet.conv:${gpuKey}:${this.dtype}:${this.graphHash()}`;
+    let ls = null;
+    try {
+      ls = globalThis.localStorage;
+    } catch {
+    }
+    if (!force) {
+      try {
+        const c = JSON.parse(ls?.getItem(key) ?? "null");
+        if (c && c.TM > 0 && c.TN > 0) {
+          this.setConvConfig(c.TM, c.TN);
+          return { ...c, cached: true, key };
+        }
+      } catch {
+      }
+      if (cachedOnly) return { TM: this.convTM, TN: this.convTN, cached: false, skipped: true, key };
+    }
+    let res;
+    try {
+      res = await this.autotuneConv(candidates, reps);
+    } catch (e) {
+      this.setConvConfig(4, 4);
+      return { TM: 4, TN: 4, cached: false, key, error: String(e?.message ?? e) };
+    }
+    try {
+      ls?.setItem(key, JSON.stringify({ TM: res.TM, TN: res.TN, ms: res.ms }));
+    } catch {
+    }
+    return { ...res, cached: false, key };
   }
 };
 function makeRunner(dev, dtype = "f16") {
@@ -453,7 +526,7 @@ function makeRunner(dev, dtype = "f16") {
     const nWG = Math.ceil(n / 256), gx = Math.min(65535, nWG);
     return { gx, wg: [gx, Math.ceil(nWG / gx), 1] };
   };
-  return { pipe, uni, pass, grid, GN_STATS, GN_APPLY, GN_APPLY_SILU, SILU, ADD, RESIZE, SWAPAB };
+  return { pipe, uni, pass, grid, GN_STATS, GN_APPLY, GN_APPLY_SILU, SILU, ADD, RESIZE, D2S, D2S_SILU, SWAPAB };
 }
 
 // render/mat4.ts
@@ -3077,12 +3150,26 @@ function dequantFine(codes, chunk, s, dec) {
   }
   return out;
 }
-function mapOutputToHU(out, vol, z0, Z, s, dec) {
-  const sliceSize = s.H * s.W;
+function mapOutputToHU(out, vol, z0, Z, s, dec, scale2 = 1) {
   const zw = Math.min(s.chunkZ, Z - z0);
-  const scale2 = (dec.hu_max - dec.hu_min) / 2;
-  const n = zw * sliceSize, base = z0 * sliceSize;
-  for (let i = 0; i < n; i++) vol[base + i] = (out[i] + 1) * scale2 + dec.hu_min;
+  const hu = (dec.hu_max - dec.hu_min) / 2;
+  if (scale2 === 1) {
+    const n = zw * s.H * s.W, base = z0 * s.H * s.W;
+    for (let i = 0; i < n; i++) vol[base + i] = (out[i] + 1) * hu + dec.hu_min;
+    return;
+  }
+  const w = Math.floor(s.W / scale2), h = Math.floor(s.H / scale2);
+  for (let z = 0; z < zw; z++) {
+    const sb = z * h * w, zb = (z0 + z) * s.H * s.W;
+    for (let sy = 0; sy < h; sy++) {
+      const srow = sb + sy * w, drow = zb + sy * scale2 * s.W;
+      for (let sx = 0; sx < w; sx++) {
+        const v = (out[srow + sx] + 1) * hu + dec.hu_min, x0 = drow + sx * scale2;
+        for (let k = 0; k < scale2; k++) vol[x0 + k] = v;
+      }
+      for (let k = 1; k < scale2; k++) vol.copyWithin(drow + k * s.W, drow, drow + s.W);
+    }
+  }
 }
 function dcGridDims(shape) {
   const [Z, Y, X] = shape;
@@ -3544,11 +3631,25 @@ async function main() {
     try {
       const dtype = gpu.features.has("shader-f16") ? "f16" : "f32";
       const tNet = performance.now();
-      const netP = new Net(gpu.device, makeRunner(gpu.device, dtype), dtype).load(modelBase + "decoder25.graph.json", modelBase + "decoder25.weights.bin").then((n) => {
-        console.log(`livecodec: wgsl decoder (${dtype}) ready in ${((performance.now() - tNet) / 1e3).toFixed(1)} s`);
+      const sh = latentShapes(meta);
+      const zfZero = new Float32Array(sh.C * sh.Df * sh.Hf * sh.Wf);
+      const info = gpu.adapter.info ?? {};
+      const gpuKey = [info.vendor, info.architecture, info.device].filter(Boolean).join("/") || "gpu";
+      const untuned = [];
+      const loadNet = async (name) => {
+        const n = await new Net(gpu.device, makeRunner(gpu.device, dtype), dtype).load(`${modelBase}${name}.graph.json`, `${modelBase}${name}.weights.bin`);
+        n.setInputData("zf", zfZero);
+        n.setInputData("zc_up", zfZero);
+        const t = await n.autotune(gpuKey, { cachedOnly: true });
+        if (t.skipped) untuned.push([name, n]);
+        console.log(`livecodec: ${name} (${dtype}) ready in ${((performance.now() - tNet) / 1e3).toFixed(1)} s \xB7 conv tiling ${t.TM}x${t.TN}${t.cached ? " (cached)" : " (default, tuning deferred)"}`);
         return n;
-      });
+      };
+      const previewP = fetch(modelBase + "decoder25-preview.graph.json", { method: "HEAD" }).then((resp) => resp.ok ? loadNet("decoder25-preview") : null).catch(() => null);
+      const netP = loadNet("decoder25");
       netP.catch(() => {
+      });
+      previewP.catch(() => {
       });
       r.stage = "coarse";
       r.expected = bytes.coarse;
@@ -3560,27 +3661,30 @@ async function main() {
       }, pacers.neural);
       const coarseCodes = await gunzip(coarseGz);
       r.note = "loading decoder";
-      const net = await netP;
-      const sh = latentShapes(meta);
+      const [net, previewNet] = await Promise.all([netP, previewP]);
       const vol = sc.rows.neural.vol;
-      const zfZero = new Float32Array(sh.C * sh.Df * sh.Hf * sh.Wf);
-      const decodeChunk = async (zf, ch) => {
-        net.setInputData("zf", zf);
-        net.setInputData("zc_up", dequantCoarseUp(coarseCodes, ch, sh, dec));
-        net.run();
-        const out = await net.read("volume");
+      const pOut = previewNet?.graph.outputs[0].shape ?? null;
+      const pscale = pOut && pOut[2] === sh.chunkZ && pOut[3] > 0 && pOut[4] > 0 && sh.H % pOut[3] === 0 && sh.W % pOut[4] === 0 && sh.H / pOut[3] === sh.W / pOut[4] ? sh.W / pOut[4] : 1;
+      const coarseNet = pscale > 1 && previewNet ? previewNet : net;
+      const pxNote = pscale > 1 ? ` \xB7 ${sh.W / pscale}px` : "";
+      if (previewNet && pscale === 1) console.warn("livecodec: preview graph shape unusable \u2014 full net for both tiers");
+      const decodeChunk = async (useNet, scale2, zf, ch) => {
+        useNet.setInputData("zf", zf);
+        useNet.setInputData("zc_up", dequantCoarseUp(coarseCodes, ch, sh, dec));
+        useNet.run();
+        const out = await useNet.read("volume");
         const z0 = ch * sh.chunkZ;
-        mapOutputToHU(out, vol, z0, Z, sh, dec);
+        mapOutputToHU(out, vol, z0, Z, sh, dec, scale2);
         sc.writeSlab("neural", z0, Math.min(Z, z0 + sh.chunkZ));
       };
       const tDec = performance.now();
       for (let ch = 0; ch < sh.chunks; ch++) {
-        r.note = `decode ${ch + 1}/${sh.chunks}`;
-        await decodeChunk(zfZero, ch);
+        r.note = `decode ${ch + 1}/${sh.chunks}${pxNote}`;
+        await decodeChunk(coarseNet, pscale, zfZero, ch);
         if (ch === 0) r.tFirst = elapsed("neural");
         requestDraw();
       }
-      console.log(`livecodec: coarse decode ${sh.chunks} chunks in ${((performance.now() - tDec) / 1e3).toFixed(1)} s`);
+      console.log(`livecodec: coarse decode ${sh.chunks} chunks in ${((performance.now() - tDec) / 1e3).toFixed(1)} s (${pscale > 1 ? `preview head, ${sh.W / pscale}px` : "full head"})`);
       r.note = "";
       requestDraw();
       r.stage = "fine+dc";
@@ -3604,7 +3708,7 @@ async function main() {
       const dcGrid = new Int8Array(dcBytes.buffer, dcBytes.byteOffset, dcBytes.byteLength);
       for (let ch = 0; ch < sh.chunks; ch++) {
         r.note = `refine ${ch + 1}/${sh.chunks}`;
-        await decodeChunk(dequantFine(fineCodes, ch, sh, dec), ch);
+        await decodeChunk(net, 1, dequantFine(fineCodes, ch, sh, dec), ch);
         requestDraw();
       }
       r.note = "dc correction";
@@ -3693,6 +3797,10 @@ async function main() {
       }
       r.tFinal = elapsed("neural");
       reportIfDone();
+      for (const [nm, n] of untuned) {
+        const t = await n.autotune(gpuKey, { force: true });
+        console.log(`livecodec: ${nm} conv tiling ${t.TM}x${t.TN} @ ${t.ms} ms/chunk (${t.verified}/${t.tried} candidates verified) \u2014 cached for the next load`);
+      }
     } catch (e) {
       r.error = "neural: " + (e?.message ?? String(e));
       console.error(e);

@@ -75,6 +75,28 @@ for (const tag of TAGS) {
     // ---- timing: warm up (pipeline compile), then per-chunk latency with a
     // queue sync per chunk (what the demo sees: it reads back each chunk), and
     // pipelined throughput (all reps submitted, one wait at the end) ----
+    const timeSync = async (n) => {
+      for (let i = 0; i < 3; i++) { net.run(); await device.queue.onSubmittedWorkDone(); }
+      let t = 0;
+      for (let i = 0; i < n; i++) {
+        const t0 = performance.now();
+        net.run();
+        await device.queue.onSubmittedWorkDone();
+        t += performance.now() - t0;
+      }
+      return t / n;
+    };
+    // ?tune=1: measure the DEFAULT tiling, then autotune and measure again, so the
+    // row carries the before/after the autotuner actually buys on this adapter.
+    let msBefore, tune;
+    if (P.get("tune")) {
+      msBefore = +(await timeSync(Math.max(5, REPS >> 1))).toFixed(1);
+      const cands = P.get("cands")
+        ? P.get("cands").split(",").map((s) => s.split("x").map(Number))
+        : undefined;
+      tune = await net.autotune(adapter.info?.description || adapter.info?.vendor || "gpu", { force: true, candidates: cands });
+      log(`${tag}: tuned TM=${tune.TM} TN=${tune.TN} (verified ${tune.verified}/${tune.tried}) from ${msBefore} ms`);
+    }
     for (let i = 0; i < 3; i++) { net.run(); await device.queue.onSubmittedWorkDone(); }
     let tSync = 0;
     for (let i = 0; i < REPS; i++) {
@@ -93,6 +115,7 @@ for (const tag of TAGS) {
       loadMs: Math.round(loadMs),
       msPerChunk: +(tSync / REPS).toFixed(1),
       msPerChunkPipelined: +pipeMs.toFixed(1),
+      msBefore, tiling: tune ? `${tune.TM}x${tune.TN}` : undefined,
       parityMeanAbs: +meanAbs.toPrecision(3), parityMaxAbs: +max.toPrecision(3),
       goldenRMS: +rms.toPrecision(3), parityPass: meanAbs < 0.004,
     };
@@ -104,7 +127,7 @@ for (const tag of TAGS) {
   }
 }
 
-const cols = ["tag", "dtype", "weightsMB", "msPerChunk", "msPerChunkPipelined", "loadMs",
+const cols = ["tag", "dtype", "weightsMB", "msBefore", "tiling", "msPerChunk", "msPerChunkPipelined", "loadMs",
   "parityMeanAbs", "parityMaxAbs", "goldenRMS", "parityPass", "error"];
 document.getElementById("out").innerHTML =
   "<table><tr>" + cols.map((c) => `<th>${c}</th>`).join("") + "</tr>" +
@@ -113,6 +136,7 @@ document.getElementById("out").innerHTML =
     const cls = c === "parityPass" ? (v ? "ok" : "bad") : "";
     return `<td class="${cls}">${v === undefined ? "" : v}</td>`;
   }).join("") + "</tr>").join("") + "</table>";
+globalThis.__benchRows = rows;          // CDP drivers read the table without scraping the DOM
 document.title = "BENCH-DONE";
 if (P.get("post")) {
   await fetch("/report", { method: "POST", body: JSON.stringify({ bench: rows, dtype: DTYPE }) });

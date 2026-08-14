@@ -153,6 +153,29 @@ fn main(@builtin(workgroup_id) wid:vec3<u32>,@builtin(local_invocation_id) lid:v
   let OHW=d.OH*d.OW; let c=idx/(d.OD*OHW); let r=idx%(d.OD*OHW); let oz=r/OHW; let rr=r%OHW; let oy=rr/d.OW; let ox=rr%d.OW;
   let iz=(oz*d.ID)/d.OD; let iy=(oy*d.IH)/d.OH; let ix=(ox*d.IW)/d.OW;   // nearest/floor asymmetric
   y[idx]=x[((c*d.ID+iz)*d.IH+iy)*d.IW+ix]; }`;
+// DepthToSpace, mode=CRD — nn.PixelShuffle(B) as ONE node (the v3 decoder's
+// upsample: convolve at the LOWER resolution emitting B*B x channels, then
+// scatter each channel group into a BxB pixel block, so no wide feature map is
+// ever materialized at the higher resolution).
+//   out[c, z, B*y+i, B*x+j] = in[c*B*B + i*B + j, z, y, x]
+// CRD = channels-rightmost: output channel c's B*B sub-pixels come from
+// CONSECUTIVE input channels (verified against torch, not assumed — the DCR
+// ordering interleaves the other way and silently produces a scrambled image).
+// A pure gather, one dispatch, elementwise over the OUTPUT.
+const D2S = `struct P{C:u32,D:u32,OH:u32,OW:u32,IH:u32,IW:u32,B:u32,gx:u32};
+@group(0)@binding(0) var<storage,read> x:array<f16>; @group(0)@binding(1) var<storage,read_write> y:array<f16>;
+@group(0)@binding(2) var<uniform> p:P;
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid:vec3<u32>,@builtin(local_invocation_id) lid:vec3<u32>){
+  let idx=(wid.y*p.gx+wid.x)*256u+lid.x; let OHW=p.OH*p.OW; if(idx>=p.C*p.D*OHW){return;}
+  let c=idx/(p.D*OHW); let r=idx%(p.D*OHW); let z=r/OHW; let rr=r%OHW; let oy=rr/p.OW; let ox=rr%p.OW;
+  let ci=c*p.B*p.B+(oy%p.B)*p.B+(ox%p.B);
+  let v=x[((ci*p.D+z)*p.IH+oy/p.B)*p.IW+ox/p.B];
+  y[idx]=v; }`;
+// SiLU fused into the gather's write-out: v3 follows every upsample with one, and
+// the tensor is at the HIGHER resolution, so a separate pass would cost a whole
+// extra round trip through the widest activation in the plane stage.
+const D2S_SILU = D2S.replace('y[idx]=v; }', 'let f=f32(v); y[idx]=f16(f/(1.0+exp(-f))); }');
 // swap the two leading dims of an (A,B,S) tensor: y[(b*A+a)*S+s] = x[(a*B+b)*S+s]
 const SWAPAB = `struct P{A:u32,B:u32,S:u32,gx:u32};
 @group(0)@binding(0) var<storage,read> x:array<f16>; @group(0)@binding(1) var<storage,read_write> y:array<f16>;
@@ -191,16 +214,17 @@ export class Net {
     const g = this.graph, R = this.R;
     const inSet = new Set(g.inputs.map(i => i.name));
     const cons = {}; for (const nd of g.nodes) for (const i of nd.in) (cons[i] = cons[i] || []).push(nd);
-    // fuse a single-consumer Silu into its Conv or GroupNorm producer
+    // fuse a single-consumer Silu into its Conv / GroupNorm / DepthToSpace producer
+    const FUSABLE = new Set(['Conv', 'GroupNorm', 'DepthToSpace']);
     const skip = new Set(), fuseOut = {};
-    for (const nd of g.nodes) if (nd.op === 'Conv' || nd.op === 'GroupNorm') {
+    for (const nd of g.nodes) if (FUSABLE.has(nd.op)) {
       const c = cons[nd.out[0]];
       if (c && c.length === 1 && c[0].op === 'Silu') { skip.add(c[0]); fuseOut[nd.out[0]] = c[0].out[0]; }
     }
     const ops = [];
     for (const nd of g.nodes) {
       if (skip.has(nd)) continue;
-      const fo = (nd.op === 'Conv' || nd.op === 'GroupNorm') ? fuseOut[nd.out[0]] : undefined;
+      const fo = FUSABLE.has(nd.op) ? fuseOut[nd.out[0]] : undefined;
       ops.push({ nd, out: fo || nd.out[0], fused: !!fo });
     }
     const lastUse = {}; ops.forEach((o, i) => { for (const t of o.nd.in) lastUse[t] = i; });
@@ -231,6 +255,12 @@ export class Net {
       else if (nd.op === 'Resize') {
         const os = tsr[o.out], is = tsr[nd.in[0]]; const Nout = os[1] * os[2] * os[3] * os[4];
         const gd = R.grid(Nout); r.u = R.uni([os[1], os[2], os[3], os[4], is[2], is[3], is[4], gd.gx]); r.wg = gd.wg;
+      } else if (nd.op === 'DepthToSpace') {
+        const os = tsr[o.out], is = tsr[nd.in[0]], bs = nd.blocksize;
+        if (nd.mode !== 'CRD') throw new Error('DepthToSpace mode ' + nd.mode + ' unsupported (CRD only)');
+        const gd = R.grid(os[1] * os[2] * os[3] * os[4]);
+        r.u = R.uni([os[1], os[2], os[3], os[4], is[3], is[4], bs, gd.gx]); r.wg = gd.wg;
+        r.k = o.fused ? R.D2S_SILU : R.D2S;
       } else if (nd.op === 'SwapAB') {
         const S = this.prod(tsr[o.out]) / (nd.A * nd.B); const gd = R.grid(nd.A * nd.B * S);
         r.u = R.uni([nd.A, nd.B, S, gd.gx]); r.wg = gd.wg;
@@ -267,6 +297,7 @@ export class Net {
       else if (r.op === 'Add') R.pass(enc, R.ADD, [B(i[0]), B(i[1]), out, r.u], r.wg);
       else if (r.op === 'Concat') { let off = 0; i.forEach((x, k) => { enc.copyBufferToBuffer(B(x), 0, out, off, r.parts[k]); off += r.parts[k]; }); }
       else if (r.op === 'Resize') R.pass(enc, R.RESIZE, [B(i[0]), out, r.u], r.wg);
+      else if (r.op === 'DepthToSpace') R.pass(enc, r.k, [B(i[0]), out, r.u], r.wg);
       else if (r.op === 'SwapAB') R.pass(enc, R.SWAPAB, [B(i[0]), out, r.u], r.wg);
     }
     this.dev.queue.submit([enc.finish()]);
@@ -308,7 +339,7 @@ export class Net {
     return ok.length ? ok : [[4, 4]];
   }
   // pick the fastest verified conv tiling for THIS gpu by timing the real forward. Inputs must be set.
-  async autotuneConv(candidates = [[4, 4], [2, 8], [8, 2], [2, 4], [4, 2]], reps = 3) {
+  async autotuneConv(candidates = [[4, 4], [2, 8], [8, 2], [2, 4], [4, 2], [4, 8], [8, 4]], reps = 3) {
     const verified = await this._verifyConfigs(candidates);
     let best = [4, 4], bestMs = Infinity;
     for (const [TM, TN] of verified) {
@@ -320,6 +351,42 @@ export class Net {
     }
     this.setConvConfig(best[0], best[1]);
     return { TM: best[0], TN: best[1], ms: Math.round(bestMs), verified: verified.length, tried: candidates.length };
+  }
+  // FNV-1a over the graph's structure (nodes + tensor shapes, NOT the weights):
+  // the conv tiling depends on the shapes being dispatched, so two checkpoints of
+  // the same architecture legitimately share a tuning result.
+  graphHash() {
+    const s = JSON.stringify([this.graph.nodes, this.graph.tensors]);
+    let h = 2166136261 >>> 0;
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
+    return h.toString(36);
+  }
+  // autotuneConv + a localStorage memo keyed on (adapter, dtype, graph shape).
+  // Tuning times the REAL forward, so it costs a few SECONDS — hence the memo:
+  // once per browser per (GPU, graph). Inputs must already be set (zeros are
+  // fine: the timing depends on shapes, not values).
+  //   cachedOnly: apply a memoized tiling if there is one, but never pay to
+  //     measure — for callers on a latency-critical path (the race page reads
+  //     the cache before decoding and warms it afterwards, on an idle GPU, so
+  //     tuning never lands on time-to-first-image).
+  // Never throws: a failed tune, a blocked localStorage (private mode, no
+  // origin) or a corrupt entry all leave the default tiling in place.
+  async autotune(gpuKey = '', { candidates, reps, force = false, cachedOnly = false } = {}) {
+    const key = `lcnet.conv:${gpuKey}:${this.dtype}:${this.graphHash()}`;
+    let ls = null;
+    try { ls = globalThis.localStorage; } catch { /* blocked (private mode / no origin) */ }
+    if (!force) {
+      try {
+        const c = JSON.parse(ls?.getItem(key) ?? 'null');
+        if (c && c.TM > 0 && c.TN > 0) { this.setConvConfig(c.TM, c.TN); return { ...c, cached: true, key }; }
+      } catch { /* corrupt entry -> retune */ }
+      if (cachedOnly) return { TM: this.convTM, TN: this.convTN, cached: false, skipped: true, key };
+    }
+    let res;
+    try { res = await this.autotuneConv(candidates, reps); }
+    catch (e) { this.setConvConfig(4, 4); return { TM: 4, TN: 4, cached: false, key, error: String(e?.message ?? e) }; }
+    try { ls?.setItem(key, JSON.stringify({ TM: res.TM, TN: res.TN, ms: res.ms })); } catch { /* full/blocked */ }
+    return { ...res, cached: false, key };
   }
 }
 
@@ -333,5 +400,5 @@ export function makeRunner(dev, dtype = 'f16') {
     const bg = dev.createBindGroup({ layout: p.getBindGroupLayout(0), entries: bufs.map((b, i) => ({ binding: i, resource: { buffer: b } })) });
     const cp = enc.beginComputePass(); cp.setPipeline(p); cp.setBindGroup(0, bg); cp.dispatchWorkgroups(wg[0], wg[1] || 1, wg[2] || 1); cp.end(); };
   const grid = n => { const nWG = Math.ceil(n / 256), gx = Math.min(65535, nWG); return { gx, wg: [gx, Math.ceil(nWG / gx), 1] }; };
-  return { pipe, uni, pass, grid, GN_STATS, GN_APPLY, GN_APPLY_SILU, SILU, ADD, RESIZE, SWAPAB };
+  return { pipe, uni, pass, grid, GN_STATS, GN_APPLY, GN_APPLY_SILU, SILU, ADD, RESIZE, D2S, D2S_SILU, SWAPAB };
 }
