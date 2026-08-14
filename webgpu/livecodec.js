@@ -3446,6 +3446,17 @@ async function main() {
       location.search = p.toString();
     });
   }
+  const raceMode = PARAMS.get("mode") ?? "fair";
+  const modeSel = el("mode");
+  if (modeSel) {
+    modeSel.value = raceMode;
+    modeSel.addEventListener("change", () => {
+      const p = new URLSearchParams(location.search);
+      p.set("mode", modeSel.value);
+      p.set("scan", scan.id);
+      location.search = p.toString();
+    });
+  }
   setSimulatedBandwidth(netParam === "off" ? null : Number(netParam) * 1e6);
   const pacers = { neural: new LinkPacer(), htj2k: new LinkPacer() };
   const meters = { neural: new BandwidthMeter(), htj2k: new BandwidthMeter() };
@@ -3729,7 +3740,7 @@ async function main() {
         const idxResp = await fetch(neuralBase + "residual-index.json", { cache: "no-store" });
         if (!idxResp.ok) throw new Error(`residual-index.json HTTP ${idxResp.status}`);
         const ridx = await idxResp.json();
-        const base = new Float32Array(vol.length);
+        const base = new Int16Array(vol.length);
         for (let i = 0; i < vol.length; i++) {
           base[i] = Math.trunc(Math.min(3071, Math.max(-1024, vol[i])));
         }
@@ -4017,10 +4028,6 @@ async function main() {
     camera: () => ({ position: [...camera.position], focalPoint: [...camera.focalPoint] }),
     volSample: (k, z, y, x) => sc.rows[k].vol[(z * Y + y) * X + x]
   };
-  const start = performance.now();
-  race.neural.t0 = start;
-  race.htj2k.t0 = start;
-  status(`racing on ${scan.id} \u2014 scroll a slice, drag a 3D to orbit (linked), double-click to maximize`);
   const barTimer = setInterval(() => {
     updateBars();
     if ((race.neural.tFinal != null || race.neural.error) && (race.htj2k.tFinal != null || race.htj2k.error)) {
@@ -4028,7 +4035,22 @@ async function main() {
       updateBars();
     }
   }, 100);
-  await Promise.all([runNeural(), runHTJ2K()]);
+  if (raceMode === "live") {
+    const start = performance.now();
+    race.neural.t0 = start;
+    race.htj2k.t0 = start;
+    status(`racing on ${scan.id} (live, simultaneous \u2014 times include contention)`);
+    await Promise.all([runNeural(), runHTJ2K()]);
+  } else {
+    status(`measuring neural on ${scan.id} (fair mode \u2014 one arm at a time)\u2026`);
+    race.neural.t0 = performance.now();
+    await runNeural();
+    updateBars();
+    status(`measuring HTJ2K on ${scan.id}\u2026`);
+    race.htj2k.t0 = performance.now();
+    await runHTJ2K();
+    status(`${scan.id} \u2014 fair mode: each arm timed alone. Scroll a slice, drag a 3D to orbit.`);
+  }
   updateBars();
   drawAll();
 }

@@ -77,6 +77,12 @@
       <label class="chip" title="pick a specific scan from the active dataset">scan:
         <select id="scan"></select>
       </label>
+      <label class="chip" title="fair: each codec is timed alone (contention-free, reproducible). live: both at once — visually dramatic, but the times include the two arms fighting for the main thread and GPU.">mode:
+        <select id="mode">
+          <option value="fair">fair (timed separately)</option>
+          <option value="live">live (simultaneous)</option>
+        </select>
+      </label>
       <label class="chip" title="both codecs receive bytes at this simulated link speed, as if each were used alone on that network">net:
         <select id="net">
           <option value="3">3 Mbps (bad hospital wifi)</option>
@@ -123,6 +129,6 @@
       </div>
     </div>
   </div>
-  <script type="module" src="livecodec.js?v=20260814c"></script>   <!-- bump per deploy -->
+  <script type="module" src="livecodec.js?v=20260814d"></script>   <!-- bump per deploy -->
 </body>
 </html>
