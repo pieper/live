@@ -3645,7 +3645,8 @@ async function main() {
         console.log(`livecodec: ${name} (${dtype}) ready in ${((performance.now() - tNet) / 1e3).toFixed(1)} s \xB7 conv tiling ${t.TM}x${t.TN}${t.cached ? " (cached)" : " (default, tuning deferred)"}`);
         return n;
       };
-      const previewP = fetch(modelBase + "decoder25-preview.graph.json", { method: "HEAD" }).then((resp) => resp.ok ? loadNet("decoder25-preview") : null).catch(() => null);
+      const declared = version?.heads;
+      const previewP = (declared ? Promise.resolve(declared.includes("preview") ? true : false) : fetch(modelBase + "decoder25-preview.graph.json", { method: "HEAD" }).then((resp) => resp.ok).catch(() => false)).then((has) => has ? loadNet("decoder25-preview") : null).catch(() => null);
       const netP = loadNet("decoder25");
       netP.catch(() => {
       });
