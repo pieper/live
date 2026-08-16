@@ -3119,11 +3119,15 @@ function latentShapes(meta) {
     Wc: c[4],
     chunks: meta.latent.chunks,
     chunkZ: meta.chunk_z,
-    H: f[3] * 8,
-    W: f[4] * 8
+    H: meta.shape[1],
+    W: meta.shape[2]
   };
   if (s.Df !== 2 * s.Dc || s.Hf !== 2 * s.Hc || s.Wf !== 2 * s.Wc) {
     throw new Error(`latent shapes not 2x: fine [${f}] vs coarse [${c}]`);
+  }
+  const up = s.H / s.Hf;
+  if (!Number.isInteger(up) || up !== s.W / s.Wf) {
+    throw new Error(`latent/scan mismatch: ${s.Hf}x${s.Wf} latent vs ${s.H}x${s.W} scan`);
   }
   return s;
 }
