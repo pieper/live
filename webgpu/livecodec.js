@@ -2902,6 +2902,14 @@ var ImageField = class {
   setLUT(lut) {
     this.dev.queue.writeTexture({ texture: this.lutTex }, lut, { bytesPerRow: 256 * 4 }, [256, 1]);
   }
+  /** The scalar range the LUT spans — window/level for the volume rendering. Re-packed into
+   *  the material uniform on the next syncUniforms()/render, so no pipeline rebuild. */
+  setClim(lo, hi) {
+    this.clim = [lo, hi];
+  }
+  getClim() {
+    return [this.clim[0], this.clim[1]];
+  }
   origP2t;
   // sampling matrix + box at identity, for setWorldTransform
   origBox;
@@ -3118,6 +3126,19 @@ function latentShapes(meta) {
     throw new Error(`latent shapes not 2x: fine [${f}] vs coarse [${c}]`);
   }
   return s;
+}
+function dequantCoarseNative(codes, chunk, s, dec) {
+  const { C, Dc, Hc, Wc } = s;
+  const per = Dc * Hc * Wc;
+  const src = chunk * C * per;
+  const out = new Float32Array(C * per);
+  let o = 0;
+  for (let c = 0; c < C; c++) {
+    const off = dec.offset[c], inv = 1 / dec.half[c];
+    const cb = src + c * per;
+    for (let i = 0; i < per; i++) out[o++] = (codes[cb + i] - off) * inv;
+  }
+  return out;
 }
 function dequantCoarseUp(codes, chunk, s, dec) {
   const { C, Dc, Hc, Wc, Df, Hf, Wf } = s;
@@ -3643,6 +3664,7 @@ async function main() {
       const dtype = gpu.features.has("shader-f16") ? "f16" : "f32";
       const tNet = performance.now();
       const sh = latentShapes(meta);
+      const coarseNative = dec.coarse_upsampled === false;
       const zfZero = new Float32Array(sh.C * sh.Df * sh.Hf * sh.Wf);
       const info = gpu.adapter.info ?? {};
       const gpuKey = [info.vendor, info.architecture, info.device].filter(Boolean).join("/") || "gpu";
@@ -3650,7 +3672,7 @@ async function main() {
       const loadNet = async (name) => {
         const n = await new Net(gpu.device, makeRunner(gpu.device, dtype), dtype).load(`${modelBase}${name}.graph.json`, `${modelBase}${name}.weights.bin`);
         n.setInputData("zf", zfZero);
-        n.setInputData("zc_up", zfZero);
+        n.setInputData("zc_up", coarseNative ? new Float32Array(sh.C * sh.Dc * sh.Hc * sh.Wc) : zfZero);
         const t = await n.autotune(gpuKey, { cachedOnly: true });
         if (t.skipped) untuned.push([name, n]);
         console.log(`livecodec: ${name} (${dtype}) ready in ${((performance.now() - tNet) / 1e3).toFixed(1)} s \xB7 conv tiling ${t.TM}x${t.TN}${t.cached ? " (cached)" : " (default, tuning deferred)"}`);
@@ -3682,7 +3704,7 @@ async function main() {
       if (previewNet && pscale === 1) console.warn("livecodec: preview graph shape unusable \u2014 full net for both tiers");
       const decodeChunk = async (useNet, scale2, zf, ch) => {
         useNet.setInputData("zf", zf);
-        useNet.setInputData("zc_up", dequantCoarseUp(coarseCodes, ch, sh, dec));
+        useNet.setInputData("zc_up", coarseNative ? dequantCoarseNative(coarseCodes, ch, sh, dec) : dequantCoarseUp(coarseCodes, ch, sh, dec));
         useNet.run();
         const out = await useNet.read("volume");
         const z0 = ch * sh.chunkZ;
