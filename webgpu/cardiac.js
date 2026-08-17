@@ -3310,8 +3310,10 @@ function attachCameraControls(canvas, camera2, opts = {}) {
     const [a, b] = [...pointers.values()];
     return { dist: Math.hypot(b.x - a.x, b.y - a.y), mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 };
   };
+  const on = () => opts.enabled?.() ?? true;
   canvas.addEventListener("contextmenu", (e) => e.preventDefault());
   canvas.addEventListener("pointerdown", (e) => {
+    if (!on()) return;
     const { x, y } = local(e);
     pointers.set(e.pointerId, { x, y });
     canvas.setPointerCapture(e.pointerId);
@@ -3325,6 +3327,11 @@ function attachCameraControls(canvas, camera2, opts = {}) {
   });
   const endPointer = (e) => {
     if (!pointers.delete(e.pointerId)) return;
+    if (!on()) {
+      interactor.end();
+      pinch = null;
+      return;
+    }
     canvas.releasePointerCapture?.(e.pointerId);
     if (pointers.size < 2) pinch = null;
     if (pointers.size === 1) {
@@ -3337,6 +3344,7 @@ function attachCameraControls(canvas, camera2, opts = {}) {
   canvas.addEventListener("pointerup", endPointer);
   canvas.addEventListener("pointercancel", endPointer);
   canvas.addEventListener("pointermove", (e) => {
+    if (!on()) return;
     if (!pointers.has(e.pointerId)) return;
     const { x, y } = local(e);
     pointers.set(e.pointerId, { x, y });
@@ -3353,6 +3361,7 @@ function attachCameraControls(canvas, camera2, opts = {}) {
     }
   });
   canvas.addEventListener("wheel", (e) => {
+    if (!on()) return;
     e.preventDefault();
     interactor.wheel(e.deltaY < 0);
     opts.onLog?.("cameraWheel", { deltaY: e.deltaY, distance: camera2.distance });
@@ -5069,8 +5078,8 @@ var chrome = installChrome({
   }
 });
 attachCameraControls(cv.threeD, camera, {
+  enabled: () => !flying,
   onChange: () => {
-    if (flying) return;
     camMoved();
     invalidateStrip();
     draw3d();
