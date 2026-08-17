@@ -4535,8 +4535,13 @@ var autoDir = null;
 var autoBusy = false;
 var autoTicks = 0;
 var autoStuck = 0;
+var LEAD_MM = 10;
+var AIM_SMOOTH = 1.6;
 var seekTarget = null;
 var seekDir = null;
+var seekDist = 0;
+var aimDir = null;
+var leadTicks = 0;
 var seekBusy = false;
 var seekTicks = 0;
 var manualLookAt = 0;
@@ -4608,7 +4613,7 @@ function setMarker(ras) {
   cross3.redraw();
 }
 function focusPoint(fallback) {
-  return autoTarget ?? seekTarget ?? fallback;
+  return seekTarget ?? fallback;
 }
 function jumpSlicesTo(cameraPos) {
   const p = focusPoint(cameraPos);
@@ -4861,13 +4866,13 @@ var tickFlight = (msNow) => {
     });
   }
   if (autoTarget) steerAutopilot();
-  else depthSeek(dt);
+  depthSeek(dt);
   endo.tick(dt);
 };
 function depthSeek(dt) {
   if (!endo || !flying) return;
   const moving = endo.cruise() === "forward" || keysDown.has("ArrowUp");
-  const steer = moving && performance.now() - manualLookAt >= 600;
+  const steer = moving && !autoTarget && performance.now() - manualLookAt >= 600;
   if (!seekBusy && ++seekTicks % 8 === 0) {
     seekBusy = true;
     const eye = [...camera.position];
@@ -4884,22 +4889,32 @@ function depthSeek(dt) {
         }
       });
       if (bestHit && bestD > 4) {
-        seekTarget = bestHit;
+        seekDist = bestD;
         const v = [bestHit[0] - eye[0], bestHit[1] - eye[1], bestHit[2] - eye[2]];
         const l = Math.hypot(v[0], v[1], v[2]) || 1;
         seekDir = [v[0] / l, v[1] / l, v[2] / l];
-        if (!autoTarget) {
-          scrollSlicesTo(seekTarget);
-          setMarker(seekTarget);
-        }
       }
       seekBusy = false;
     }).catch(() => {
       seekBusy = false;
     });
   }
-  if (seekDir && steer) {
-    endo.lookAlong(slerpDir(forwardDir(), seekDir, 0.9 * dt));
+  const want = autoDir ?? seekDir;
+  if (want) aimDir = aimDir ? slerpDir(aimDir, want, AIM_SMOOTH * dt) : want;
+  if (aimDir) {
+    const lead = Math.max(2, Math.min(LEAD_MM, seekDist - 2));
+    const p = [
+      camera.position[0] + aimDir[0] * lead,
+      camera.position[1] + aimDir[1] * lead,
+      camera.position[2] + aimDir[2] * lead
+    ];
+    const moved = !seekTarget || Math.hypot(p[0] - seekTarget[0], p[1] - seekTarget[1], p[2] - seekTarget[2]) > 0.2;
+    seekTarget = p;
+    if (moved && ++leadTicks % 3 === 0) {
+      scrollSlicesTo(p);
+      setMarker(p);
+    }
+    if (steer) endo.lookAlong(slerpDir(forwardDir(), aimDir, 0.9 * dt));
   }
 }
 function slerpDir(from, to, maxRad) {
@@ -4985,8 +5000,6 @@ var setAutoTarget = (ras) => {
   autoTarget = [...ras];
   autoDir = null;
   autoStuck = 0;
-  scrollSlicesTo(autoTarget);
-  setMarker(autoTarget);
   status("autopilot: steering toward the picked target\u2026");
 };
 var tickCine = (msNow) => {
@@ -5150,7 +5163,9 @@ globalThis.cardiac = {
     cruise: endo ? endo.cruise() : "stopped",
     autoTarget: autoTarget ? [...autoTarget] : null,
     seekTarget: seekTarget ? [...seekTarget] : null,
-    // the depth-maximum we are flying toward
+    // the lead point: LEAD_MM ahead along aimDir
+    aimDir: aimDir ? [...aimDir] : null,
+    seekDist,
     clearanceAhead: Number.isFinite(clearanceAhead) ? +clearanceAhead.toFixed(2) : null,
     cameraPos: [...camera.position],
     cameraFocal: [...camera.focalPoint],
@@ -5160,6 +5175,8 @@ globalThis.cardiac = {
   draw3dNow,
   converge,
   resize,
+  /** Explicit-ray depth probe — lets a driver assert the crosshair lead point sits in the lumen. */
+  probe: (o, d) => sc.scene.probe(o, d),
   device: () => gpu.device,
   cineAccum: () => accN,
   setOffset: (o, v) => {
