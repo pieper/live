@@ -6,6 +6,12 @@
   "desc": "Volume rendering of a beating heart, reproducing the rendering options of two papers from the CHOP/SlicerHeart group (github.com/SlicerHeart/SlicerHeart) on public 3D Slicer sample data. Links to SlicerHeart and both papers are in the demo's footer. Opens on the 4D cine: ten cardiac phases from a 4D cardiac CT, playing at 10 fps with the CT-Coronary-Arteries-3 preset \u2014 and you can rotate WHILE it plays, because each phase is accumulated live rather than precomputed, so nothing stalls. Switch to the static 512\u00d7512\u00d7321 CTA and press \u201cfly inside\u201d: the CT-EndoVascular transfer function (transcribed verbatim from SlicerHeart and verified against a running Slicer) drops to zero opacity at 338 HU, so contrast-filled blood becomes invisible and the camera sits inside the chamber looking at endocardium \u2014 the JACC ventricular-septal-defect technique, with no segmentation step. Preset picker, ROI crop box with draggable handles, 4-up MPR with linked shift-move crosshair. Unlike VTK\u2019s raycaster this jitters the ray and accumulates, so converged views have no banding: the contour rings visible in Slicer\u2019s own render of the same data at the same camera are absent here."
  },
  {
+  "name": "endovascular flythrough",
+  "page": "webgpu/endo.html",
+  "thumb": "endo.png",
+  "desc": "Fly a camera through the inside of a contrast CT. The CT-EndoVascular transfer function (from SlicerHeart, verified byte-for-byte against a running Slicer 5.12) drops to zero opacity at 338 HU, so contrast-filled blood becomes invisible and the camera can travel down the aorta, into side branches and on into the chambers \u2014 looking at endocardium directly, with no segmentation and no precomputed centreline. SPACE toggles forward cruise, SHIFT+SPACE reverse, left-drag or the arrow keys look around, and SHIFT+click sets a target the autopilot steers toward, or reports how close the blood pool actually allows. Collision \u201crails\u201d keep you inside the lumen: every frame the renderer casts a ray along the direction of travel and clamps the step to the distance to the wall \u2014 the same 50%-opacity GPU trace the crosshair pick uses. The MPR slices scroll to follow the camera, with the crosshair marking where you are. Streams the 512\u00d7512\u00d7321 CTA from a public JS2 bucket."
+ },
+ {
   "name": "codec race",
   "page": "webgpu/livecodec.html",
   "thumb": "livecodec.png",

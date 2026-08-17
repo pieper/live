@@ -584,8 +584,8 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
     });
     this.clipOff = uoff;
     this.pickOff = uoff + CLIP_FLOATS;
-    this.mat = new Float32Array(uoff + CLIP_FLOATS + 4);
-    this.matBuf = this.dev.createBuffer({ size: (uoff + CLIP_FLOATS + 4) * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.mat = new Float32Array(uoff + CLIP_FLOATS + 12);
+    this.matBuf = this.dev.createBuffer({ size: (uoff + CLIP_FLOATS + 12) * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     const module = this.dev.createShaderModule({ code: this.wgsl() });
     this.pipeline = this.dev.createRenderPipeline({
       layout: "auto",
@@ -694,6 +694,8 @@ ${members}
   clip_planes : array<vec4<f32>, 8>,   // (nx, ny, nz, offset) inward; tail so field offsets are stable
   clip_count : vec4<f32>,              // (count, _, _, _)
   pick_cursor : vec4<f32>,             // (ndc_x, ndc_y, _, _) \u2014 the ray for fs_pick
+  probe_origin : vec4<f32>,            // explicit-ray probe: world origin
+  probe_dir : vec4<f32>,               // (dx, dy, dz, enabled) \u2014 w>0 uses this ray instead of the cursor
 };
 @group(0) @binding(0) var<uniform> u_cam : Camera;
 @group(0) @binding(1) var<uniform> u_material : Material;
@@ -810,8 +812,16 @@ ${ghostDispatch}
 // Output: (wp.x, wp.y, wp.z, hit). hit=0 means the ray never reached 50% (empty/miss).
 @fragment
 fn fs_pick() -> @location(0) vec4<f32> {
-  let ro = ndc_to_world(vec4<f32>(u_material.pick_cursor.x, u_material.pick_cursor.y, 0.0, 1.0));
-  let rd = normalize(ndc_to_world(vec4<f32>(u_material.pick_cursor.x, u_material.pick_cursor.y, 1.0, 1.0)) - ro);
+  // Two ray sources: the screen cursor (pick) or an explicit world ray (probe). The explicit
+  // form exists because the cursor ray can only ever probe what is ON SCREEN \u2014 useless for
+  // "how much room is BEHIND me?", which endovascular navigation needs for reverse and for
+  // lateral clearance.
+  var ro = ndc_to_world(vec4<f32>(u_material.pick_cursor.x, u_material.pick_cursor.y, 0.0, 1.0));
+  var rd = normalize(ndc_to_world(vec4<f32>(u_material.pick_cursor.x, u_material.pick_cursor.y, 1.0, 1.0)) - ro);
+  if (u_material.probe_dir.w > 0.5) {
+    ro = u_material.probe_origin.xyz;
+    rd = normalize(u_material.probe_dir.xyz);
+  }
   let inv = vec3<f32>(1.0) / rd;
   let tb = (u_material.bmin.xyz - ro) * inv;
   let tt = (u_material.bmax.xyz - ro) * inv;
@@ -974,9 +984,50 @@ ${pickDispatch}
    *  Uses the camera set by the last setCamera(); returns null if the ray never reaches 50%. */
   async pick(u, v) {
     if (!this.pickPipeline || !this.pickBind || !this.placed.length) return null;
-    this.mat[this.pickOff] = u * 2 - 1;
-    this.mat[this.pickOff + 1] = 1 - v * 2;
-    this.flush();
+    return this.serialise(async () => {
+      this.mat[this.pickOff] = u * 2 - 1;
+      this.mat[this.pickOff + 1] = 1 - v * 2;
+      this.mat[this.pickOff + 11] = 0;
+      this.flush();
+      return await this.tracePick();
+    });
+  }
+  /** Trace an EXPLICIT world ray and return the distance (mm) to the first point where
+   *  front-to-back opacity reaches 50%, or Infinity if it never does. Unlike pick(), the ray
+   *  is independent of the camera, so it can look backwards and sideways — which is what makes
+   *  collision "rails" possible in a first-person flythrough. */
+  async probe(origin, dir) {
+    if (!this.pickPipeline || !this.pickBind || !this.placed.length) return Infinity;
+    const l = Math.hypot(dir[0], dir[1], dir[2]) || 1;
+    return this.serialise(async () => {
+      this.mat[this.pickOff + 4] = origin[0];
+      this.mat[this.pickOff + 5] = origin[1];
+      this.mat[this.pickOff + 6] = origin[2];
+      this.mat[this.pickOff + 8] = dir[0] / l;
+      this.mat[this.pickOff + 9] = dir[1] / l;
+      this.mat[this.pickOff + 10] = dir[2] / l;
+      this.mat[this.pickOff + 11] = 1;
+      this.flush();
+      const hit = await this.tracePick();
+      this.mat[this.pickOff + 11] = 0;
+      this.flush();
+      if (!hit) return Infinity;
+      return Math.hypot(hit[0] - origin[0], hit[1] - origin[1], hit[2] - origin[2]);
+    });
+  }
+  /** Serialises pick/probe. They share ONE uniform buffer and ONE readback buffer, so
+   *  concurrent calls would overwrite each other's ray and double-map the buffer — a
+   *  Promise.all of probes silently returns garbage. Callers may fire as many as they like;
+   *  they queue here. */
+  pickChain = Promise.resolve();
+  serialise(fn) {
+    const next = this.pickChain.then(fn, fn);
+    this.pickChain = next.catch(() => {
+    });
+    return next;
+  }
+  /** The shared 1x1 render + readback behind pick() and probe(). */
+  async tracePick() {
     if (!this.pickTarget) {
       this.pickTarget = this.dev.createTexture({ size: [1, 1], format: "rgba32float", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
       this.pickReadBuf = this.dev.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
@@ -2714,15 +2765,16 @@ function presetLUT(name) {
   const clim = presetClim(name);
   return { lut: lutFromTransferFunctions(p.color, p.scalarOpacity, clim), clim, shade: p.shade };
 }
-async function buildCardiacScene(gpu2, base, format, onProgress) {
+async function buildCardiacScene(gpu2, base, format, onProgress, buildOpts = {}) {
   const dev = gpu2.device;
-  const cineScene = await loadScene(base + "cine.json");
-  const seqNode = Object.values(cineScene.nodes).find((n) => n.class === "vtkMRMLSequenceNode");
-  const items = seqNode.attrs.items;
-  const firstVol = cineScene.nodes[items[0].node];
-  const cineIjkToRAS = firstVol.attrs.ijkToRAS;
-  const z0 = firstVol.attrs.zarr;
-  const cineDims = [z0.shape[2], z0.shape[1], z0.shape[0]];
+  const wantCine = buildOpts.only !== "cta";
+  const cineScene = wantCine ? await loadScene(base + "cine.json") : { nodes: {}, blobBase: base };
+  const seqNode = wantCine ? Object.values(cineScene.nodes).find((n) => n.class === "vtkMRMLSequenceNode") : null;
+  const items = seqNode?.attrs.items ?? [{ index: "0", node: "" }];
+  const firstVol = wantCine ? cineScene.nodes[items[0].node] : null;
+  const cineIjkToRAS = firstVol?.attrs.ijkToRAS ?? [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+  const z0 = firstVol?.attrs.zarr;
+  const cineDims = z0 ? [z0.shape[2], z0.shape[1], z0.shape[0]] : [2, 2, 2];
   const cinePreset = presetLUT("CT-Coronary-Arteries-3");
   const cine = new CineField(dev, items.length, cineDims, cinePreset.lut, {
     clim: cinePreset.clim,
@@ -2730,12 +2782,13 @@ async function buildCardiacScene(gpu2, base, format, onProgress) {
     shade: cinePreset.shade
   });
   const report = (what, bytes) => onProgress?.({ bytes, frames: cine.framesLoaded, totalFrames: items.length, what });
-  {
+  if (wantCine && z0) {
     const zv = await fetchZarrVolume(cineScene.blobBase, z0, (n) => report("cine", n));
     cine.setFrameData(0, zv.data);
     report("cine", 0);
   }
   const cineReady = (async () => {
+    if (!wantCine) return;
     for (let i = 1; i < items.length; i++) {
       const vn = cineScene.nodes[items[i].node];
       const zv = await fetchZarrVolume(cineScene.blobBase, vn.attrs.zarr, (n) => report("cine", n));
@@ -2769,12 +2822,12 @@ async function buildCardiacScene(gpu2, base, format, onProgress) {
     })();
     return ctaPending;
   };
-  const sa = seqNode.attrs;
+  const sa = seqNode?.attrs ?? {};
   const sequence = new Sequence({
-    indexName: sa.indexName,
-    indexUnit: sa.indexUnit,
-    indexType: sa.indexType,
-    numericIndexValueTolerance: sa.numericIndexValueTolerance
+    indexName: sa.indexName ?? "frame",
+    indexUnit: sa.indexUnit ?? "",
+    indexType: sa.indexType ?? "numeric",
+    numericIndexValueTolerance: sa.numericIndexValueTolerance ?? 1e-3
   });
   items.forEach((it, i) => sequence.setDataNodeAtValue(i, it.index));
   const browser = new SequenceBrowser();
@@ -2784,10 +2837,11 @@ async function buildCardiacScene(gpu2, base, format, onProgress) {
   browser.addSynchronizedSequence(sequence, () => {
     cine.setFrame(browser.continuousItem, browser.playbackLooped);
   });
+  if (buildOpts.only === "cta") await ensureCta((p) => onProgress?.(p));
   const scene = new SceneRenderer(gpu2, format);
-  let mode = "cine";
-  let preset = "CT-Coronary-Arteries-3";
-  let roi = createRoiWidget(...cine.aabb(), { coverage: 0.3 });
+  let mode = buildOpts.only === "cta" ? "cta" : "cine";
+  let preset = buildOpts.only === "cta" ? "CT-EndoVascular" : "CT-Coronary-Arteries-3";
+  let roi = createRoiWidget(...(mode === "cta" && cta ? cta : cine).aabb(), { coverage: 0.3 });
   let cropOn = false, roiOn = false;
   const rebuild = () => {
     const vol = mode === "cta" && cta ? cta : cine;
@@ -3306,6 +3360,177 @@ function attachCameraControls(canvas, camera2, opts = {}) {
   return interactor;
 }
 
+// render/endoscopy-control.ts
+var norm2 = (v) => {
+  const l = Math.hypot(v[0], v[1], v[2]) || 1;
+  return [v[0] / l, v[1] / l, v[2] / l];
+};
+var cross2 = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+var dot2 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+function rotate(v, k, ang) {
+  const c = Math.cos(ang), s = Math.sin(ang), d = dot2(k, v);
+  const kv = cross2(k, v);
+  return [
+    v[0] * c + kv[0] * s + k[0] * d * (1 - c),
+    v[1] * c + kv[1] * s + k[1] * d * (1 - c),
+    v[2] * c + kv[2] * s + k[2] * d * (1 - c)
+  ];
+}
+function attachEndoscopyControls(canvas, camera2, opts = {}) {
+  const speed = opts.speedMmPerSec ?? 40;
+  const turn = (opts.turnDegPerSec ?? 60) * Math.PI / 180;
+  const lookRad = opts.lookRadPerPx ?? 5e-3;
+  const refUp = opts.referenceUp ?? [0, 0, 1];
+  const focalDist = opts.focalDistanceMm ?? 30;
+  const margin = opts.marginMm ?? 6;
+  let cruise = "stopped";
+  const keys = /* @__PURE__ */ new Set();
+  const forward = () => norm2([
+    camera2.focalPoint[0] - camera2.position[0],
+    camera2.focalPoint[1] - camera2.position[1],
+    camera2.focalPoint[2] - camera2.position[2]
+  ]);
+  const setDirection = (dir) => {
+    const f = norm2(dir);
+    let up = refUp;
+    if (Math.abs(dot2(f, refUp)) > 0.999) up = camera2.viewUp;
+    const left = norm2(cross2(up, f));
+    const trueUp = cross2(f, left);
+    camera2.focalPoint = [
+      camera2.position[0] + f[0] * focalDist,
+      camera2.position[1] + f[1] * focalDist,
+      camera2.position[2] + f[2] * focalDist
+    ];
+    camera2.viewUp = norm2(trueUp);
+  };
+  const yaw = (ang) => setDirection(rotate(forward(), refUp, ang));
+  const pitch = (ang) => {
+    const f = forward();
+    const left = norm2(cross2(camera2.viewUp, f));
+    const next = rotate(f, left, ang);
+    if (Math.abs(dot2(norm2(next), refUp)) < 0.995) setDirection(next);
+  };
+  const setCruise = (c) => {
+    if (c === cruise) return;
+    cruise = c;
+    opts.onState?.(cruise);
+  };
+  let dragging = false, lastX = 0, lastY = 0;
+  const onDown = (e) => {
+    if (e.button !== 0) return;
+    if (e.shiftKey) return;
+    dragging = true;
+    lastX = e.clientX;
+    lastY = e.clientY;
+    canvas.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  };
+  const onMove = (e) => {
+    if (!dragging) return;
+    const dx = e.clientX - lastX, dy = e.clientY - lastY;
+    lastX = e.clientX;
+    lastY = e.clientY;
+    if (dx) yaw(-dx * lookRad);
+    if (dy) pitch(-dy * lookRad);
+    opts.onChange?.();
+    e.preventDefault();
+  };
+  const onUp = (e) => {
+    if (!dragging) return;
+    dragging = false;
+    try {
+      canvas.releasePointerCapture(e.pointerId);
+    } catch {
+    }
+  };
+  const NAV_KEYS = /* @__PURE__ */ new Set(["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", " ", "Escape"]);
+  const onKeyDown = (e) => {
+    if (!NAV_KEYS.has(e.key)) return;
+    if (e.key === " ") {
+      const want = e.shiftKey ? "back" : "forward";
+      setCruise(cruise === want ? "stopped" : want);
+      e.preventDefault();
+      return;
+    }
+    if (e.key === "Escape") {
+      setCruise("stopped");
+      e.preventDefault();
+      return;
+    }
+    keys.add(e.key);
+    e.preventDefault();
+  };
+  const onKeyUp = (e) => {
+    keys.delete(e.key);
+  };
+  const onBlur = () => keys.clear();
+  canvas.style.touchAction = "none";
+  canvas.addEventListener("pointerdown", onDown);
+  canvas.addEventListener("pointermove", onMove);
+  canvas.addEventListener("pointerup", onUp);
+  canvas.addEventListener("pointercancel", onUp);
+  globalThis.addEventListener("keydown", onKeyDown);
+  globalThis.addEventListener("keyup", onKeyUp);
+  globalThis.addEventListener("blur", onBlur);
+  return {
+    cruise: () => cruise,
+    setCruise,
+    lookAlong: (dir) => {
+      setDirection(dir);
+      opts.onChange?.();
+    },
+    tick(dtSec) {
+      let moved = false;
+      const dt = Math.min(dtSec, 0.1);
+      if (keys.has("ArrowLeft")) {
+        yaw(turn * dt);
+        moved = true;
+      }
+      if (keys.has("ArrowRight")) {
+        yaw(-turn * dt);
+        moved = true;
+      }
+      if (keys.has("ArrowUp")) {
+        pitch(turn * dt);
+        moved = true;
+      }
+      if (keys.has("ArrowDown")) {
+        pitch(-turn * dt);
+        moved = true;
+      }
+      if (cruise !== "stopped") {
+        const f = forward();
+        const sign = cruise === "forward" ? 1 : -1;
+        const dir = [f[0] * sign, f[1] * sign, f[2] * sign];
+        const want = speed * dt;
+        const room = opts.clearance ? opts.clearance(dir) - margin : Infinity;
+        const step = Math.max(0, Math.min(want, room));
+        if (step > 0) {
+          camera2.position = [
+            camera2.position[0] + dir[0] * step,
+            camera2.position[1] + dir[1] * step,
+            camera2.position[2] + dir[2] * step
+          ];
+          setDirection(f);
+          moved = true;
+        }
+      }
+      if (moved) opts.onChange?.();
+      return moved;
+    },
+    detach() {
+      canvas.removeEventListener("pointerdown", onDown);
+      canvas.removeEventListener("pointermove", onMove);
+      canvas.removeEventListener("pointerup", onUp);
+      canvas.removeEventListener("pointercancel", onUp);
+      globalThis.removeEventListener("keydown", onKeyDown);
+      globalThis.removeEventListener("keyup", onKeyUp);
+      globalThis.removeEventListener("blur", onBlur);
+      keys.clear();
+    }
+  };
+}
+
 // render/demos/slice-control.ts
 function attachSliceControls(canvas, cfg) {
   const SCROLL_PX = cfg.scrollPx ?? 7;
@@ -3737,7 +3962,7 @@ function mountCrosshair(cfg) {
 
 // render/demos/widget-control.ts
 var sub2 = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
-var dot2 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+var dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 function camMatrices(cam, w, h) {
   const view = lookAt(cam.position, cam.focalPoint, cam.viewUp);
   const proj = perspectiveZO(cam.viewAngle * Math.PI / 180, w / h, 1, 1e5);
@@ -3769,9 +3994,9 @@ function attachWidgetControls(canvas, camera2, opts) {
     const far = applyMat4(invVp, [ndcx, ndcy, 1]);
     const ro = near, rd = sub2(far, near);
     const n = sub2(camera2.position, camera2.focalPoint);
-    const denom = dot2(rd, n);
+    const denom = dot3(rd, n);
     if (Math.abs(denom) < 1e-9) return [...planePt];
-    const t = dot2(sub2(planePt, ro), n) / denom;
+    const t = dot3(sub2(planePt, ro), n) / denom;
     return [ro[0] + rd[0] * t, ro[1] + rd[1] * t, ro[2] + rd[2] * t];
   };
   const pick = (e) => {
@@ -3861,6 +4086,14 @@ var DEFAULT_HELP = [
     ["Wheel / two-finger", "Zoom (dolly)"],
     ["Double-click", "Maximize / restore"],
     ["Shift + move", "Pick \u2192 jump slices to the point"]
+  ] },
+  { title: "Endovascular flight (fly-inside / endo demo)", rows: [
+    ["Space", "Toggle forward cruise"],
+    ["Shift + Space", "Toggle reverse cruise"],
+    ["Escape", "Stop"],
+    ["Left-drag", "Look around"],
+    ["Arrow keys", "Yaw / pitch"],
+    ["Shift + click", "Set an autopilot target"]
   ] },
   { title: "Slice views", rows: [
     ["Wheel / Left-drag", "Scroll through slices"],
@@ -4202,9 +4435,17 @@ var setPips = (loaded, total) => {
 var onPhaseLoaded = null;
 status("loading cardiac data\u2026");
 var DATA_BASE = new URLSearchParams(location.search).get("data") ?? "https://js2.jetstream-cloud.org:8001/swift/v1/slicerlive/cardiac/";
+var DEMO = globalThis.CARDIAC_DEMO ?? new URLSearchParams(location.search).get("demo") ?? "cine";
+var ENDO = DEMO === "endo";
+var TOTAL_BYTES = ENDO ? 57e6 : CINE_BYTES;
 var sc = await buildCardiacScene(gpu, DATA_BASE, srgb, (p) => {
-  if (p.what !== "cine") return;
   mb += p.bytes;
+  if (ENDO) {
+    setBar(mb / TOTAL_BYTES, `${(mb / 1e6).toFixed(0)} of ~57 MB`);
+    status(`loading\u2026 ${(mb / 1e6).toFixed(1)} MB`);
+    return;
+  }
+  if (p.what !== "cine") return;
   setBar(
     Math.max(mb / CINE_BYTES, p.frames / p.totalFrames),
     `${p.frames} of ${p.totalFrames} phases \xB7 ${(mb / 1e6).toFixed(1)} MB`
@@ -4212,8 +4453,9 @@ var sc = await buildCardiacScene(gpu, DATA_BASE, srgb, (p) => {
   setPips(p.frames, p.totalFrames);
   status(`loading\u2026 ${(mb / 1e6).toFixed(1)} MB`);
   if (p.bytes === 0) onPhaseLoaded?.(p.frames);
-});
+}, { only: ENDO ? "cta" : "cine" });
 var seedRAS = await (async () => {
+  if (!ENDO) return sc.center;
   const s = await (await fetch(DATA_BASE + "cta.json")).json();
   const v = Object.values(s.nodes).find((n) => n.class === "vtkMRMLScalarVolumeNode");
   return v?.attrs?.endovascularSeedRAS ?? sc.center;
@@ -4231,6 +4473,19 @@ function resetPlanes() {
 }
 resetPlanes();
 var shown = (n) => cv[n].width > 0 && cv[n].height > 0;
+var endo = null;
+var flying = false;
+var clearanceAhead = Infinity;
+var probedDir = [0, 0, 1];
+var probeInFlight = false;
+var lastGoodPos = null;
+var escapeChecks = 0;
+var MARGIN_MM = 6;
+var autoTarget = null;
+var autoDir = null;
+var autoBusy = false;
+var autoTicks = 0;
+var autoStuck = 0;
 var accN = 0;
 var invalidateStrip = () => {
   accN = 0;
@@ -4263,7 +4518,7 @@ var a3d = mountAdaptive3d({
   // render there — two consumers of SceneRenderer's single accumulator means flashing phases.
   onFrame: () => {
     if (sc.mode() === "cine") adaptiveFramesInCine++;
-    cross2.redraw();
+    cross3.redraw();
   }
 });
 var adaptiveFramesInCine = 0;
@@ -4274,22 +4529,27 @@ var draw3dNow = () => a3d.renderSettled(true);
 var converge = (n = 32) => {
   for (let i = 0; i < n; i++) a3d.renderSettled(i === 0);
 };
-var cross2 = mountCrosshair({
+var cross3 = mountCrosshair({
   cells: cv,
   getScene: () => sc.scene,
   getSlice: () => sc.slice,
   getCamera: () => camera,
   getOffset: (o) => off[o],
   onJump: (ras) => {
-    const axis = { axial: 2, coronal: 1, sagittal: 0 };
-    for (const o of SLICES) {
-      const a = axis[o];
-      off[o] = Math.max(0, Math.min(1, (ras[a] - rasLo[a]) / (rasHi[a] - rasLo[a])));
-    }
-    drawSlices();
+    jumpSlicesTo(ras);
     draw3d();
   }
 });
+var SLICE_AXIS = { axial: 2, coronal: 1, sagittal: 0 };
+function jumpSlicesTo(ras) {
+  for (const o of SLICES) {
+    const a = SLICE_AXIS[o];
+    off[o] = Math.max(0, Math.min(1, (ras[a] - rasLo[a]) / (rasHi[a] - rasLo[a])));
+  }
+  drawSlices();
+  cross3.state.set([...ras]);
+  cross3.redraw();
+}
 var resize = () => {
   const dpr = Math.min(2, globalThis.devicePixelRatio || 1);
   for (const n of NAMES) {
@@ -4312,7 +4572,7 @@ for (const o of SLICES) {
     },
     redraw: () => {
       drawPlane(o);
-      cross2.redraw();
+      cross3.redraw();
     },
     hooks: { onDoubleClick: () => {
       grid.toggleMax(o);
@@ -4356,6 +4616,12 @@ var loadCtaIfNeeded = async () => {
   return true;
 };
 var setMode = (m) => {
+  if (flying) {
+    endo?.detach();
+    endo = null;
+    flying = false;
+    $("cruise").textContent = "";
+  }
   sc.setMode(m);
   resetPlanes();
   frameCamera();
@@ -4376,18 +4642,63 @@ for (const m of ["cta", "cine"]) {
     setMode(m);
   };
 }
-$("flyBtn").onclick = async () => {
+var startFlight = async () => {
   if (!sc.ctaLoaded()) {
     await loadCtaIfNeeded();
     setMode("cta");
   }
   applyPreset("CT-EndoVascular");
   camera.position = [...seedRAS];
-  camera.focalPoint = [seedRAS[0], seedRAS[1] - 50, seedRAS[2]];
-  camera.viewUp = [0, 0, 1];
   camera.viewAngle = 80;
+  flying = true;
+  lastGoodPos = [...camera.position];
+  endo?.detach();
+  endo = attachEndoscopyControls(cv.threeD, camera, {
+    speedMmPerSec: 40,
+    marginMm: MARGIN_MM,
+    referenceUp: [0, 0, 1],
+    onChange: () => {
+      jumpSlicesTo(camera.position);
+      draw3d();
+    },
+    onState: (c) => showCruise(c),
+    // Rails, forward only for now: pick(0.5,0.5) is the ray straight ahead, so it already
+    // answers "how far to the wall?" without any renderer change. Sideways/backward
+    // clearance needs a general probe(origin, dir) and is not wired yet.
+    // Rails. The probe is fired for whatever direction we are actually travelling, so this
+    // works for reverse as well as forward — pick(u,v) could only ever see what is on screen.
+    clearance: (dir) => dot32(dir, probedDir) > 0.9 ? clearanceAhead : Infinity
+  });
+  endo.lookAlong([0, -1, 0]);
+  jumpSlicesTo(camera.position);
+  showCruise("stopped");
   draw3d();
-  status("inside the blood pool \u2014 contrast is transparent, so you are looking at endocardium. Drag to look around.");
+};
+$("flyBtn").onclick = startFlight;
+cv.threeD.addEventListener("pointerdown", (e) => {
+  if (!flying || e.button !== 0 || !e.shiftKey) return;
+  const r = cv.threeD.getBoundingClientRect();
+  const u = (e.clientX - r.left) / r.width, v = (e.clientY - r.top) / r.height;
+  e.preventDefault();
+  sc.scene.pick(u, v).then((ras) => {
+    if (ras) setAutoTarget(ras);
+  });
+});
+var forwardDir = () => {
+  const d = [
+    camera.focalPoint[0] - camera.position[0],
+    camera.focalPoint[1] - camera.position[1],
+    camera.focalPoint[2] - camera.position[2]
+  ];
+  const l = Math.hypot(d[0], d[1], d[2]) || 1;
+  return [d[0] / l, d[1] / l, d[2] / l];
+};
+var dot32 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+var showCruise = (c) => {
+  const label = c === "forward" ? "\u25B6 forward" : c === "back" ? "\u25C0 back" : "\u25A0 stopped";
+  $("cruise").textContent = label;
+  $("cruise").className = c === "stopped" ? "" : "on";
+  status(`endovascular flight \xB7 ${label} \xB7 space to toggle, shift+space to reverse, drag or arrows to look`);
 };
 var scrub = $("scrub");
 var fps = $("fps");
@@ -4435,8 +4746,137 @@ var setStep = (mm) => {
   sc.scene.setSampleStep(mm);
   accN = 0;
 };
+var flightLastT = 0;
+var tickFlight = (msNow) => {
+  if (!flying || !endo) {
+    flightLastT = msNow;
+    return;
+  }
+  const dt = flightLastT ? (msNow - flightLastT) / 1e3 : 0;
+  flightLastT = msNow;
+  if (!probeInFlight) {
+    probeInFlight = true;
+    const f = forwardDir();
+    const c = endo.cruise();
+    const dir = c === "back" ? [-f[0], -f[1], -f[2]] : f;
+    probedDir = dir;
+    const from = [...camera.position];
+    sc.scene.probe(from, dir).then((d) => {
+      clearanceAhead = d;
+      probeInFlight = false;
+    }).catch(() => {
+      probeInFlight = false;
+    });
+  }
+  if (++escapeChecks % 30 === 0 && !probeInFlight) {
+    const from = [...camera.position];
+    const axes = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+    Promise.all(axes.map((d) => sc.scene.probe(from, d))).then((ds) => {
+      const enclosed = ds.some((d) => Number.isFinite(d) && d < 200);
+      if (enclosed) lastGoodPos = from;
+      else if (lastGoodPos) {
+        camera.position = [...lastGoodPos];
+        endo?.setCruise("stopped");
+        status("left the blood pool \u2014 returned to the last enclosed position");
+        jumpSlicesTo(camera.position);
+        draw3d();
+      }
+    }).catch(() => {
+    });
+  }
+  if (autoTarget) steerAutopilot();
+  endo.tick(dt);
+};
+function slerpDir(from, to, maxRad) {
+  const d = Math.max(-1, Math.min(1, dot32(from, to)));
+  const ang = Math.acos(d);
+  if (ang < 1e-4) return to;
+  const t = Math.min(1, maxRad / ang);
+  const s1 = Math.sin((1 - t) * ang) / Math.sin(ang), s2 = Math.sin(t * ang) / Math.sin(ang);
+  const v = [from[0] * s1 + to[0] * s2, from[1] * s1 + to[1] * s2, from[2] * s1 + to[2] * s2];
+  const l = Math.hypot(v[0], v[1], v[2]) || 1;
+  return [v[0] / l, v[1] / l, v[2] / l];
+}
+function steerAutopilot() {
+  if (!autoTarget || !endo) return;
+  const pos = camera.position;
+  const toT = [autoTarget[0] - pos[0], autoTarget[1] - pos[1], autoTarget[2] - pos[2]];
+  const dist = Math.hypot(toT[0], toT[1], toT[2]);
+  if (dist < 8) {
+    endo.setCruise("stopped");
+    autoTarget = null;
+    autoDir = null;
+    status("autopilot: arrived at the target");
+    return;
+  }
+  const bearing = [toT[0] / dist, toT[1] / dist, toT[2] / dist];
+  if (!autoBusy && ++autoTicks % 6 === 0) {
+    autoBusy = true;
+    const cands = [bearing];
+    const f = forwardDir();
+    const left = normalize3(cross32([0, 0, 1], bearing));
+    const up = cross32(bearing, left);
+    for (const ang of [0.35, 0.7, 1.05]) {
+      for (let k = 0; k < 6; k++) {
+        const th = k / 6 * Math.PI * 2;
+        const off2 = [
+          left[0] * Math.cos(th) * Math.sin(ang) + up[0] * Math.sin(th) * Math.sin(ang) + bearing[0] * Math.cos(ang),
+          left[1] * Math.cos(th) * Math.sin(ang) + up[1] * Math.sin(th) * Math.sin(ang) + bearing[1] * Math.cos(ang),
+          left[2] * Math.cos(th) * Math.sin(ang) + up[2] * Math.sin(th) * Math.sin(ang) + bearing[2] * Math.cos(ang)
+        ];
+        cands.push(normalize3(off2));
+      }
+    }
+    void f;
+    const from = [...pos];
+    Promise.all(cands.map((d) => sc.scene.probe(from, d))).then((ds) => {
+      let best = -1, bestDir = null;
+      cands.forEach((d, i) => {
+        const clear = Math.min(Number.isFinite(ds[i]) ? ds[i] : 200, 60) - MARGIN_MM;
+        if (clear <= 2) return;
+        const progress = dot32(d, bearing);
+        if (progress <= 0.1) return;
+        const score = progress * clear;
+        if (score > best) {
+          best = score;
+          bestDir = d;
+        }
+      });
+      if (bestDir) {
+        autoDir = bestDir;
+        autoStuck = 0;
+      } else if (++autoStuck > 2) {
+        endo?.setCruise("stopped");
+        autoTarget = null;
+        autoDir = null;
+        status(`autopilot: blocked \u2014 this is as close as the blood pool allows (${dist.toFixed(0)} mm short)`);
+      }
+      autoBusy = false;
+    }).catch(() => {
+      autoBusy = false;
+    });
+  }
+  if (autoDir) {
+    endo.lookAlong(slerpDir(forwardDir(), autoDir, 0.06));
+    endo.setCruise("forward");
+  }
+}
+var cross32 = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+var normalize3 = (v) => {
+  const l = Math.hypot(v[0], v[1], v[2]) || 1;
+  return [v[0] / l, v[1] / l, v[2] / l];
+};
+var setAutoTarget = (ras) => {
+  autoTarget = [...ras];
+  autoDir = null;
+  autoStuck = 0;
+  cross3.state.set([...ras]);
+  cross3.redraw();
+  status("autopilot: steering toward the picked target\u2026");
+};
 var tickCine = (msNow) => {
   requestAnimationFrame(tickCine);
+  tickFlight(msNow);
   if (!shown("threeD")) {
     lastT = msNow;
     return;
@@ -4462,7 +4902,7 @@ var tickCine = (msNow) => {
     shownFrame = cur;
     accN = 0;
     showFrameSlices(cur);
-    cross2.redraw();
+    cross3.redraw();
     status(`4D cine \xB7 phase ${cur + 1}/${sc.cine.frameCount}` + (sc.browser.playbackActive ? ` \xB7 playing at ${sc.browser.playbackRateFps} fps` : " \xB7 press play"));
   }
   if (renderInFlight) return;
@@ -4471,7 +4911,7 @@ var tickCine = (msNow) => {
   sc.scene.setCamera(camera.position, camera.focalPoint, camera.viewUp, camera.viewAngle, cv.threeD.width, cv.threeD.height);
   sc.scene.renderAccum(cx.threeD.getCurrentTexture().createView({ format: srgb }), cv.threeD.width, cv.threeD.height, accN === 0);
   accN++;
-  cross2.redraw();
+  cross3.redraw();
   gpu.device.queue.onSubmittedWorkDone().then(() => {
     renderInFlight = false;
   });
@@ -4524,11 +4964,14 @@ var chrome = installChrome({
     draw3d();
   }
 });
-attachCameraControls(cv.threeD, camera, { onChange: () => {
-  camMoved();
-  invalidateStrip();
-  draw3d();
-} });
+attachCameraControls(cv.threeD, camera, {
+  onChange: () => {
+    if (flying) return;
+    camMoved();
+    invalidateStrip();
+    draw3d();
+  }
+});
 var followWs = null;
 var follow = (port = 2132) => {
   followWs?.close();
@@ -4588,6 +5031,12 @@ globalThis.cardiac = {
     // must stay 0: two accumulator owners = flashing phases
     lastCamMove,
     renderInFlight,
+    flying,
+    cruise: endo ? endo.cruise() : "stopped",
+    autoTarget: autoTarget ? [...autoTarget] : null,
+    clearanceAhead: Number.isFinite(clearanceAhead) ? +clearanceAhead.toFixed(2) : null,
+    cameraPos: [...camera.position],
+    cameraFocal: [...camera.focalPoint],
     sizes: Object.fromEntries(NAMES.map((n) => [n, [cv[n].width, cv[n].height]]))
   }),
   drawSlices,
@@ -4603,6 +5052,9 @@ globalThis.cardiac = {
   setMode,
   applyPreset,
   follow,
+  startFlight,
+  setCruise: (c) => endo?.setCruise(c),
+  setAutoTarget,
   // Drive the camera to exact values so a view can be matched 1:1 against Slicer.
   getCamera: () => ({
     position: [...camera.position],
@@ -4632,28 +5084,43 @@ globalThis.cardiac = {
     draw3dNow();
   }
 };
-setMode("cine");
-sc.browser.playbackRateFps = 10;
-fps.value = "10";
-$("fpsLbl").textContent = "10 fps";
-sc.browser.playbackActive = false;
-playBtn.textContent = "\u25B6 play";
-onPhaseLoaded = (n) => {
-  sc.browser.setSelectedItemNumber(n - 1);
-  status(`4D cine \xB7 loaded phase ${n}/${sc.cine.frameCount}`);
-};
-onPhaseLoaded(1);
-sc.cineReady.then(() => {
-  setBar(1, `all ${sc.cine.frameCount} phases loaded`);
-  setPips(sc.cine.frameCount, sc.cine.frameCount);
-  onPhaseLoaded = null;
+if (ENDO) {
+  for (const el of ["mode-cta", "mode-cine", "flyBtn", "transport"]) $(el).style.display = "none";
+  $("loadtitle").textContent = "Loading the CTA\u2026";
+  $("loadsub").textContent = "512x512x321 contrast CT streaming from a public JS2 bucket";
   loadWrap.classList.add("done");
   setTimeout(() => {
     loadWrap.style.display = "none";
   }, 600);
-  sc.browser.setSelectedItemNumber(0);
-  sc.browser.playbackActive = true;
-  playBtn.textContent = "\u275A\u275A pause";
-  status(`4D cine \xB7 ${sc.cine.frameCount} phases \xB7 playing at ${sc.browser.playbackRateFps} fps \xB7 rotate while it plays`);
-});
-requestAnimationFrame(() => resize());
+  await startFlight();
+  requestAnimationFrame(() => {
+    resize();
+    draw3dNow();
+  });
+} else {
+  setMode("cine");
+  sc.browser.playbackRateFps = 10;
+  fps.value = "10";
+  $("fpsLbl").textContent = "10 fps";
+  sc.browser.playbackActive = false;
+  playBtn.textContent = "\u25B6 play";
+  onPhaseLoaded = (n) => {
+    sc.browser.setSelectedItemNumber(n - 1);
+    status(`4D cine \xB7 loaded phase ${n}/${sc.cine.frameCount}`);
+  };
+  onPhaseLoaded(1);
+  sc.cineReady.then(() => {
+    setBar(1, `all ${sc.cine.frameCount} phases loaded`);
+    setPips(sc.cine.frameCount, sc.cine.frameCount);
+    onPhaseLoaded = null;
+    loadWrap.classList.add("done");
+    setTimeout(() => {
+      loadWrap.style.display = "none";
+    }, 600);
+    sc.browser.setSelectedItemNumber(0);
+    sc.browser.playbackActive = true;
+    playBtn.textContent = "\u275A\u275A pause";
+    status(`4D cine \xB7 ${sc.cine.frameCount} phases \xB7 playing at ${sc.browser.playbackRateFps} fps \xB7 rotate while it plays`);
+  });
+  requestAnimationFrame(() => resize());
+}
