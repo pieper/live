@@ -3377,7 +3377,7 @@ function rotate(v, k, ang) {
   ];
 }
 function attachEndoscopyControls(canvas, camera2, opts = {}) {
-  const speed = opts.speedMmPerSec ?? 40;
+  const speed = opts.speedMmPerSec ?? 4;
   const turn = (opts.turnDegPerSec ?? 60) * Math.PI / 180;
   const lookRad = opts.lookRadPerPx ?? 5e-3;
   const refUp = opts.referenceUp ?? [0, 0, 1];
@@ -3385,30 +3385,50 @@ function attachEndoscopyControls(canvas, camera2, opts = {}) {
   const margin = opts.marginMm ?? 6;
   let cruise = "stopped";
   const keys = /* @__PURE__ */ new Set();
+  const mods = { shift: false, ctrl: false };
   const forward = () => norm2([
     camera2.focalPoint[0] - camera2.position[0],
     camera2.focalPoint[1] - camera2.position[1],
     camera2.focalPoint[2] - camera2.position[2]
   ]);
+  const basis = () => {
+    const f = forward();
+    const u0 = camera2.viewUp;
+    const d = dot2(u0, f);
+    let u = norm2([u0[0] - f[0] * d, u0[1] - f[1] * d, u0[2] - f[2] * d]);
+    if (!Number.isFinite(u[0])) u = norm2(cross2(f, [0, 0, 1]));
+    return { f, u, r: cross2(f, u) };
+  };
+  const setFrame = (f, u) => {
+    const fn = norm2(f);
+    const d = dot2(u, fn);
+    const un = norm2([u[0] - fn[0] * d, u[1] - fn[1] * d, u[2] - fn[2] * d]);
+    camera2.focalPoint = [
+      camera2.position[0] + fn[0] * focalDist,
+      camera2.position[1] + fn[1] * focalDist,
+      camera2.position[2] + fn[2] * focalDist
+    ];
+    camera2.viewUp = un;
+  };
+  const yaw = (ang) => {
+    const b = basis();
+    setFrame(rotate(b.f, b.u, ang), b.u);
+  };
+  const pitch = (ang) => {
+    const b = basis();
+    setFrame(rotate(b.f, b.r, ang), rotate(b.u, b.r, ang));
+  };
+  const roll = (ang) => {
+    const b = basis();
+    setFrame(b.f, rotate(b.u, b.f, ang));
+  };
   const setDirection = (dir) => {
     const f = norm2(dir);
-    let up = refUp;
-    if (Math.abs(dot2(f, refUp)) > 0.999) up = camera2.viewUp;
-    const left = norm2(cross2(up, f));
-    const trueUp = cross2(f, left);
-    camera2.focalPoint = [
-      camera2.position[0] + f[0] * focalDist,
-      camera2.position[1] + f[1] * focalDist,
-      camera2.position[2] + f[2] * focalDist
-    ];
-    camera2.viewUp = norm2(trueUp);
-  };
-  const yaw = (ang) => setDirection(rotate(forward(), refUp, ang));
-  const pitch = (ang) => {
-    const f = forward();
-    const left = norm2(cross2(camera2.viewUp, f));
-    const next = rotate(f, left, ang);
-    if (Math.abs(dot2(norm2(next), refUp)) < 0.995) setDirection(next);
+    const u0 = camera2.viewUp;
+    const d = dot2(u0, f);
+    let u = [u0[0] - f[0] * d, u0[1] - f[1] * d, u0[2] - f[2] * d];
+    if (Math.hypot(u[0], u[1], u[2]) < 1e-4) u = cross2(f, refUp);
+    setFrame(f, u);
   };
   const setCruise = (c) => {
     if (c === cruise) return;
@@ -3432,6 +3452,7 @@ function attachEndoscopyControls(canvas, camera2, opts = {}) {
     lastY = e.clientY;
     if (dx) yaw(-dx * lookRad);
     if (dy) pitch(-dy * lookRad);
+    if (dx || dy) opts.onLook?.();
     opts.onChange?.();
     e.preventDefault();
   };
@@ -3458,12 +3479,20 @@ function attachEndoscopyControls(canvas, camera2, opts = {}) {
       return;
     }
     keys.add(e.key);
+    mods.shift = e.shiftKey;
+    mods.ctrl = e.ctrlKey || e.metaKey;
     e.preventDefault();
   };
   const onKeyUp = (e) => {
     keys.delete(e.key);
+    mods.shift = e.shiftKey;
+    mods.ctrl = e.ctrlKey || e.metaKey;
   };
-  const onBlur = () => keys.clear();
+  const onBlur = () => {
+    keys.clear();
+    mods.shift = false;
+    mods.ctrl = false;
+  };
   canvas.style.touchAction = "none";
   canvas.addEventListener("pointerdown", onDown);
   canvas.addEventListener("pointermove", onMove);
@@ -3482,21 +3511,32 @@ function attachEndoscopyControls(canvas, camera2, opts = {}) {
     tick(dtSec) {
       let moved = false;
       const dt = Math.min(dtSec, 0.1);
-      if (keys.has("ArrowLeft")) {
-        yaw(turn * dt);
+      let manualStep = 0;
+      if (keys.has("ArrowUp")) manualStep += speed * dt;
+      if (keys.has("ArrowDown")) manualStep -= speed * dt;
+      const turnAmt = turn * dt;
+      if (keys.has("ArrowLeft") || keys.has("ArrowRight")) {
+        const sign = keys.has("ArrowLeft") ? 1 : -1;
+        if (mods.ctrl) roll(turnAmt * sign);
+        else if (mods.shift) pitch(turnAmt * sign);
+        else yaw(turnAmt * sign);
+        opts.onLook?.();
         moved = true;
       }
-      if (keys.has("ArrowRight")) {
-        yaw(-turn * dt);
-        moved = true;
-      }
-      if (keys.has("ArrowUp")) {
-        pitch(turn * dt);
-        moved = true;
-      }
-      if (keys.has("ArrowDown")) {
-        pitch(-turn * dt);
-        moved = true;
+      if (manualStep !== 0) {
+        const f = forward();
+        const dir = manualStep > 0 ? f : [-f[0], -f[1], -f[2]];
+        const room = opts.clearance ? opts.clearance(dir) - margin : Infinity;
+        const step = Math.max(0, Math.min(Math.abs(manualStep), room));
+        if (step > 0) {
+          camera2.position = [
+            camera2.position[0] + dir[0] * step,
+            camera2.position[1] + dir[1] * step,
+            camera2.position[2] + dir[2] * step
+          ];
+          setDirection(f);
+          moved = true;
+        }
       }
       if (cruise !== "stopped") {
         const f = forward();
@@ -4088,12 +4128,15 @@ var DEFAULT_HELP = [
     ["Shift + move", "Pick \u2192 jump slices to the point"]
   ] },
   { title: "Endovascular flight (fly-inside / endo demo)", rows: [
+    ["Up / Down", "Move in / out along the view axis"],
+    ["Left / Right", "Yaw"],
+    ["Shift + Left/Right", "Pitch"],
+    ["Ctrl + Left/Right", "Roll"],
     ["Space", "Toggle forward cruise"],
     ["Shift + Space", "Toggle reverse cruise"],
     ["Escape", "Stop"],
     ["Left-drag", "Look around"],
-    ["Arrow keys", "Yaw / pitch"],
-    ["Shift + click", "Set an autopilot target"]
+    ["Shift + click", "Autopilot target"]
   ] },
   { title: "Slice views", rows: [
     ["Wheel / Left-drag", "Scroll through slices"],
@@ -4454,12 +4497,9 @@ var sc = await buildCardiacScene(gpu, DATA_BASE, srgb, (p) => {
   status(`loading\u2026 ${(mb / 1e6).toFixed(1)} MB`);
   if (p.bytes === 0) onPhaseLoaded?.(p.frames);
 }, { only: ENDO ? "cta" : "cine" });
-var seedRAS = await (async () => {
-  if (!ENDO) return sc.center;
-  const s = await (await fetch(DATA_BASE + "cta.json")).json();
-  const v = Object.values(s.nodes).find((n) => n.class === "vtkMRMLScalarVolumeNode");
-  return v?.attrs?.endovascularSeedRAS ?? sc.center;
-})();
+var SEED_POS = [-33.922, -4.023, -200.459];
+var SEED_DIR = [0.0376, 0.05, 0.998];
+var seedRAS = SEED_POS;
 var rasLo;
 var rasHi;
 var sliceIx;
@@ -4486,6 +4526,11 @@ var autoDir = null;
 var autoBusy = false;
 var autoTicks = 0;
 var autoStuck = 0;
+var seekTarget = null;
+var seekDir = null;
+var seekBusy = false;
+var seekTicks = 0;
+var manualLookAt = 0;
 var accN = 0;
 var invalidateStrip = () => {
   accN = 0;
@@ -4536,19 +4581,26 @@ var cross3 = mountCrosshair({
   getCamera: () => camera,
   getOffset: (o) => off[o],
   onJump: (ras) => {
-    jumpSlicesTo(ras);
+    scrollSlicesTo(ras);
+    setMarker(ras);
     draw3d();
   }
 });
 var SLICE_AXIS = { axial: 2, coronal: 1, sagittal: 0 };
-function jumpSlicesTo(ras) {
+function scrollSlicesTo(ras) {
   for (const o of SLICES) {
     const a = SLICE_AXIS[o];
     off[o] = Math.max(0, Math.min(1, (ras[a] - rasLo[a]) / (rasHi[a] - rasLo[a])));
   }
   drawSlices();
+}
+function setMarker(ras) {
   cross3.state.set([...ras]);
   cross3.redraw();
+}
+function jumpSlicesTo(ras) {
+  scrollSlicesTo(ras);
+  setMarker(autoTarget ?? seekTarget ?? ras);
 }
 var resize = () => {
   const dpr = Math.min(2, globalThis.devicePixelRatio || 1);
@@ -4649,17 +4701,22 @@ var startFlight = async () => {
   }
   applyPreset("CT-EndoVascular");
   camera.position = [...seedRAS];
+  camera.viewUp = [0, 1, 0];
   camera.viewAngle = 80;
   flying = true;
   lastGoodPos = [...camera.position];
   endo?.detach();
   endo = attachEndoscopyControls(cv.threeD, camera, {
-    speedMmPerSec: 40,
+    speedMmPerSec: 4,
+    // vessels are small; 10x slower than the first cut
     marginMm: MARGIN_MM,
     referenceUp: [0, 0, 1],
     onChange: () => {
       jumpSlicesTo(camera.position);
       draw3d();
+    },
+    onLook: () => {
+      manualLookAt = performance.now();
     },
     onState: (c) => showCruise(c),
     // Rails, forward only for now: pick(0.5,0.5) is the ray straight ahead, so it already
@@ -4669,7 +4726,7 @@ var startFlight = async () => {
     // works for reverse as well as forward — pick(u,v) could only ever see what is on screen.
     clearance: (dir) => dot32(dir, probedDir) > 0.9 ? clearanceAhead : Infinity
   });
-  endo.lookAlong([0, -1, 0]);
+  endo.lookAlong(SEED_DIR);
   jumpSlicesTo(camera.position);
   showCruise("stopped");
   draw3d();
@@ -4684,6 +4741,12 @@ cv.threeD.addEventListener("pointerdown", (e) => {
     if (ras) setAutoTarget(ras);
   });
 });
+var keysDown = /* @__PURE__ */ new Set();
+globalThis.addEventListener("keydown", (e) => {
+  keysDown.add(e.key);
+  if (["ArrowLeft", "ArrowRight"].includes(e.key)) manualLookAt = performance.now();
+});
+globalThis.addEventListener("keyup", (e) => keysDown.delete(e.key));
 var forwardDir = () => {
   const d = [
     camera.focalPoint[0] - camera.position[0],
@@ -4698,7 +4761,7 @@ var showCruise = (c) => {
   const label = c === "forward" ? "\u25B6 forward" : c === "back" ? "\u25C0 back" : "\u25A0 stopped";
   $("cruise").textContent = label;
   $("cruise").className = c === "stopped" ? "" : "on";
-  status(`endovascular flight \xB7 ${label} \xB7 space to toggle, shift+space to reverse, drag or arrows to look`);
+  status(`endovascular flight \xB7 ${label} \xB7 \u2191\u2193 in/out \xB7 \u2190\u2192 yaw \xB7 shift \u2190\u2192 pitch \xB7 ctrl \u2190\u2192 roll \xB7 space cruise`);
 };
 var scrub = $("scrub");
 var fps = $("fps");
@@ -4785,8 +4848,50 @@ var tickFlight = (msNow) => {
     });
   }
   if (autoTarget) steerAutopilot();
+  else depthSeek(dt);
   endo.tick(dt);
 };
+function depthSeek(dt) {
+  if (!endo || !flying) return;
+  const cruising = endo.cruise() === "forward";
+  const arrowing = keysDown.has("ArrowUp");
+  if (!cruising && !arrowing) {
+    seekTarget = null;
+    seekDir = null;
+    return;
+  }
+  if (performance.now() - manualLookAt < 600) return;
+  if (!seekBusy && ++seekTicks % 8 === 0) {
+    seekBusy = true;
+    const eye = [...camera.position];
+    const uv = [];
+    for (const v of [0.32, 0.5, 0.68]) for (const u of [0.32, 0.5, 0.68]) uv.push([u, v]);
+    Promise.all(uv.map(([u, v]) => sc.scene.pick(u, v))).then((hits) => {
+      let bestD = -1, bestHit = null;
+      hits.forEach((h) => {
+        if (!h) return;
+        const d = Math.hypot(h[0] - eye[0], h[1] - eye[1], h[2] - eye[2]);
+        if (d > bestD) {
+          bestD = d;
+          bestHit = h;
+        }
+      });
+      if (bestHit && bestD > 4) {
+        seekTarget = bestHit;
+        const v = [bestHit[0] - eye[0], bestHit[1] - eye[1], bestHit[2] - eye[2]];
+        const l = Math.hypot(v[0], v[1], v[2]) || 1;
+        seekDir = [v[0] / l, v[1] / l, v[2] / l];
+      }
+      seekBusy = false;
+    }).catch(() => {
+      seekBusy = false;
+    });
+  }
+  if (seekDir) {
+    endo.lookAlong(slerpDir(forwardDir(), seekDir, 0.9 * dt));
+    if (seekTarget) setMarker(seekTarget);
+  }
+}
 function slerpDir(from, to, maxRad) {
   const d = Math.max(-1, Math.min(1, dot32(from, to)));
   const ang = Math.acos(d);
@@ -4870,8 +4975,7 @@ var setAutoTarget = (ras) => {
   autoTarget = [...ras];
   autoDir = null;
   autoStuck = 0;
-  cross3.state.set([...ras]);
-  cross3.redraw();
+  setMarker(autoTarget);
   status("autopilot: steering toward the picked target\u2026");
 };
 var tickCine = (msNow) => {
@@ -5034,6 +5138,8 @@ globalThis.cardiac = {
     flying,
     cruise: endo ? endo.cruise() : "stopped",
     autoTarget: autoTarget ? [...autoTarget] : null,
+    seekTarget: seekTarget ? [...seekTarget] : null,
+    // the depth-maximum we are flying toward
     clearanceAhead: Number.isFinite(clearanceAhead) ? +clearanceAhead.toFixed(2) : null,
     cameraPos: [...camera.position],
     cameraFocal: [...camera.focalPoint],
