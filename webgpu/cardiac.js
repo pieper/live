@@ -5213,6 +5213,9 @@ if (ENDO) {
   requestAnimationFrame(() => {
     resize();
     draw3dNow();
+    setTimeout(() => {
+      if (flying) endo?.setCruise("forward");
+    }, 900);
   });
 } else {
   setMode("cine");
