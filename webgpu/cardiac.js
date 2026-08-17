@@ -4571,8 +4571,11 @@ var a3d = mountAdaptive3d({
   size: () => ({ w: shown("threeD") ? cv.threeD.width : 0, h: cv.threeD.height }),
   setCamera: (s, w, h) => s.setCamera(camera.position, camera.focalPoint, camera.viewUp, camera.viewAngle, w, h),
   gpu,
-  movingScaleCap: 0.75,
-  // 512^3 DVR: interactive from the first drag frame
+  // Exterior DVR of a 512^3 volume needs the resolution cut to stay interactive while dragging.
+  // The endovascular view does not: rays terminate at the vessel wall within a few cm, so a
+  // full-resolution pass costs ~6 ms even at a very fine step (measured — see setStepForView).
+  // Upscaling there would only blur a frame we can afford to trace properly.
+  movingScaleCap: ENDO ? 1 : 0.75,
   // In cine mode tickCine owns the canvas and the accumulator; the adaptive loop must never
   // render there — two consumers of SceneRenderer's single accumulator means flashing phases.
   onFrame: () => {
@@ -4712,12 +4715,27 @@ for (const m of ["cta", "cine"]) {
     setMode(m);
   };
 }
+function seatFlight(p) {
+  camera.position = [...p.pos];
+  camera.viewUp = [...p.up];
+  const v = [p.fp[0] - p.pos[0], p.fp[1] - p.pos[1], p.fp[2] - p.pos[2]];
+  const l = Math.hypot(v[0], v[1], v[2]);
+  lastGoodPos = [...p.pos];
+  aimDir = null;
+  seekDir = null;
+  seekTarget = null;
+  if (l > 1e-6) endo?.lookAlong([v[0] / l, v[1] / l, v[2] / l]);
+  jumpSlicesTo(camera.position);
+  draw3d();
+}
 var startFlight = async () => {
   if (!sc.ctaLoaded()) {
     await loadCtaIfNeeded();
     setMode("cta");
   }
   applyPreset("CT-EndoVascular");
+  const fromSlicer = followedPose;
+  flightFromSlicer = !!fromSlicer;
   camera.position = [...seedRAS];
   camera.viewUp = [0, 1, 0];
   camera.viewAngle = 80;
@@ -4745,6 +4763,8 @@ var startFlight = async () => {
     clearance: (dir) => dot32(dir, probedDir) > 0.9 ? clearanceAhead : Infinity
   });
   endo.lookAlong(SEED_DIR);
+  if (fromSlicer) seatFlight(fromSlicer);
+  status(fromSlicer ? "flight started from Slicer's camera" : "flight started from the aortic seed");
   jumpSlicesTo(camera.position);
   showCruise("stopped");
   draw3d();
@@ -4826,6 +4846,16 @@ var setStep = (mm) => {
   stepMmNow = mm;
   sc.scene.setSampleStep(mm);
   accN = 0;
+};
+var ENDO_STEP_MULT = 0.125;
+var CTA_STEP_MULT = 0.5;
+var setStepForView = () => {
+  if (sc.mode() === "cine") {
+    setStep(sc.cine.sampleStep() * 0.5);
+    return;
+  }
+  const sp = sc.cta?.sampleStep();
+  if (sp) setStep(sp * (flying ? ENDO_STEP_MULT : CTA_STEP_MULT));
 };
 var flightLastT = 0;
 var tickFlight = (msNow) => {
@@ -5009,11 +5039,11 @@ var tickCine = (msNow) => {
     lastT = msNow;
     return;
   }
+  setStepForView();
   if (sc.mode() !== "cine") {
     lastT = msNow;
     return;
   }
-  setStep(sc.cine.sampleStep() * 0.5);
   if (sc.browser.playbackActive) {
     const dt = lastT ? (msNow - lastT) / 1e3 : 0;
     acc += dt * sc.browser.playbackRateFps;
@@ -5101,6 +5131,9 @@ attachCameraControls(cv.threeD, camera, {
   }
 });
 var followWs = null;
+var followedPose = null;
+var resyncOnce = false;
+var flightFromSlicer = false;
 var follow = (port = 2132) => {
   followWs?.close();
   const ws = new WebSocket(`ws://localhost:${port}`);
@@ -5128,6 +5161,15 @@ var follow = (port = 2132) => {
     const up = c.viewUp;
     const va = c.viewAngle;
     if (!pos || !fp || !up) return;
+    followedPose = { pos: [...pos], fp: [...fp], up: [...up], va };
+    if (flying) {
+      if (!flightFromSlicer || resyncOnce) {
+        resyncOnce = false;
+        flightFromSlicer = true;
+        seatFlight({ pos: [...pos], fp: [...fp], up: [...up], va });
+      }
+      return;
+    }
     camera.position = [...pos];
     camera.focalPoint = [...fp];
     camera.viewUp = [...up];
@@ -5155,6 +5197,8 @@ globalThis.cardiac = {
     roiVisible: sc.roiVisible(),
     boundFrame: sc.cine.frame,
     accN,
+    accumN: sc.scene.accumCount(),
+    // the renderer's real accumulation depth (accN is cine-only)
     adaptiveFramesInCine,
     // must stay 0: two accumulator owners = flashing phases
     lastCamMove,
@@ -5187,6 +5231,11 @@ globalThis.cardiac = {
   applyPreset,
   follow,
   startFlight,
+  /** Re-adopt Slicer's current pose once, mid-flight. */
+  resync: () => {
+    resyncOnce = true;
+  },
+  followedPose: () => followedPose,
   setCruise: (c) => endo?.setCruise(c),
   setAutoTarget,
   // Drive the camera to exact values so a view can be matched 1:1 against Slicer.
