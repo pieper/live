@@ -34,8 +34,36 @@
          letter-spacing: .3px; opacity: .8; pointer-events: none; text-shadow: 0 1px 3px #000; }
   .lab.axial { color: #f2726f; } .lab.coronal { color: #7fd67f; }
   .lab.sagittal { color: #f0d264; } .lab.threeD { color: #9db4e8; }
-  #status { padding: 5px 12px; border-top: 1px solid #1e2434; background: #0e1119;
-            font-size: 12px; opacity: .75; }
+  #statusbar { display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+               padding: 5px 12px; border-top: 1px solid #1e2434; background: #0e1119; font-size: 12px; }
+  #status { opacity: .75; flex: 1 1 auto; min-width: 0; }
+  /* Download progress: a real bar, not just a number buried in the status line. */
+  /* Deliberately NOT a full-screen wash: each cardiac phase is rendered as it arrives, so the
+     dialog floats over a view that is visibly filling in. */
+  #loadwrap { position: fixed; left: 50%; transform: translateX(-50%); bottom: 46px; z-index: 90;
+              pointer-events: none; }
+  #loadbox { width: min(520px, 86vw); text-align: center; padding: 14px 20px 16px; border-radius: 14px;
+             background: linear-gradient(135deg, rgba(58,64,88,.72), rgba(20,24,38,.82));
+             backdrop-filter: blur(18px) saturate(1.5); -webkit-backdrop-filter: blur(18px) saturate(1.5);
+             border: 1px solid rgba(255,255,255,.18); box-shadow: 0 18px 50px rgba(0,0,0,.55); }
+  #loadtitle { font-size: 15px; font-weight: 700; margin-bottom: 4px; }
+  #loadsub { font-size: 12px; opacity: .6; margin-bottom: 14px; }
+  #bar { height: 12px; border-radius: 7px; background: #1a2030; border: 1px solid #2b3346; overflow: hidden; }
+  #barfill { height: 100%; width: 0%; border-radius: 6px; background: linear-gradient(90deg,#3f74d8,#7fd0ff);
+             transition: width .18s ease-out; }
+  #loadpct { margin-top: 8px; font-size: 12px; opacity: .75; font-variant-numeric: tabular-nums; }
+  #loadwrap.done { opacity: 0; pointer-events: none; transition: opacity .5s ease-out; }
+  #pips { display: flex; gap: 4px; justify-content: center; margin-top: 10px; }
+  #pips span { width: 15px; height: 4px; border-radius: 2px; background: #2b3346; }
+  #pips span.on { background: #7fd0ff; }
+  /* inline bar for the lazy CTA load, shown in the status bar */
+  #ctabar { display: none; align-items: center; gap: 8px; flex: 0 0 auto; font-size: 12px; }
+  #ctabar .mini { width: 130px; height: 7px; border-radius: 4px; background: #1a2030;
+                  border: 1px solid #2b3346; overflow: hidden; }
+  #ctabar .mini > i { display: block; height: 100%; width: 0%; background: #3f74d8; }
+  #credits { opacity: .55; display: flex; gap: 12px; flex: 0 0 auto; }
+  #credits a { color: #9db4e8; text-decoration: none; }
+  #credits a:hover { color: #cfe0ff; text-decoration: underline; }
 </style>
 
 <header>
@@ -68,6 +96,25 @@
   </div>
 </main>
 
-<div id="status">loading…</div>
+<div id="loadwrap">
+  <div id="loadbox">
+    <div id="loadtitle">Loading the beating heart…</div>
+    <div id="loadsub">10 cardiac phases streaming from a public JS2 bucket · each one is rendered as it arrives</div>
+    <div id="bar"><div id="barfill"></div></div>
+    <div id="loadpct">connecting…</div>
+    <div id="pips"></div>
+  </div>
+</div>
 
-<script type="module" src="cardiac.js?v=20260817d"></script>
+<div id="statusbar">
+  <div id="status">loading…</div>
+  <div id="ctabar"><span id="ctatext">loading CTA…</span><span class="mini"><i id="ctafill"></i></span></div>
+  <div id="credits">
+    <a href="https://github.com/SlicerHeart/SlicerHeart" target="_blank" rel="noopener">SlicerHeart</a>
+    <a href="https://doi.org/10.1016/j.jaccas.2024.102827" target="_blank" rel="noopener">JACC 2025 (CT/VSD)</a>
+    <a href="https://doi.org/10.1148/ryct.250129" target="_blank" rel="noopener">Radiol CT Imaging 2026 (4D)</a>
+    <a href="https://github.com/pieper/SlicerLive" target="_blank" rel="noopener">source</a>
+  </div>
+</div>
+
+<script type="module" src="cardiac.js?v=20260817g"></script>

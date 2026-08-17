@@ -1676,6 +1676,8 @@ var CineField = class {
   bindingCount = 3;
   // volA (3d) + volB (3d) + lut (2d)
   texes = [];
+  filled = [];
+  dims = [0, 0, 0];
   lutTex;
   dev;
   p2t;
@@ -1690,20 +1692,26 @@ var CineField = class {
   // index of frame B
   blend = 0;
   // 0 => pure A
-  /** `frames` are scalar volumes in C-order (z,y,x), all sharing `dims` and `ijkToRAS`. */
+  /** Allocates `frameCount` empty frame textures; fill them with setFrameData(i, data) as
+   *  they arrive. Progressive loading matters: the first phase can be shown (and the scene
+   *  built) after ~1 MB instead of waiting for the whole sequence. Frames not yet supplied
+   *  read as zero, so always show a frame you have actually filled. */
   constructor(dev, frames, dims, lut, opts) {
-    if (!frames.length) throw new Error("CineField needs at least one frame");
+    const count = typeof frames === "number" ? frames : frames.length;
+    if (!count) throw new Error("CineField needs at least one frame");
     const size = dims;
-    for (const f of frames) {
-      const t = dev.createTexture({
+    this.dims = dims;
+    for (let i = 0; i < count; i++) {
+      this.texes.push(dev.createTexture({
         size,
         dimension: "3d",
         format: "r16float",
         usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
-      });
-      dev.queue.writeTexture({ texture: t }, toF16Array(f), { bytesPerRow: dims[0] * 2, rowsPerImage: dims[1] }, size);
-      this.texes.push(t);
+      }));
     }
+    this.filled = new Array(count).fill(false);
+    this.dev = dev;
+    if (typeof frames !== "number") frames.forEach((f, i) => this.setFrameData(i, f));
     this.lutTex = dev.createTexture({ size: [256, 1], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
     dev.queue.writeTexture({ texture: this.lutTex }, lut, { bytesPerRow: 256 * 4 }, [256, 1]);
     this.p2t = patientToTextureFromIjkToRAS(opts.ijkToRAS, dims);
@@ -1712,7 +1720,24 @@ var CineField = class {
     this.clim = opts.clim;
     this.shade = opts.shade ?? [0.25, 0.75, 0.5, 24];
     this.unit = opts.opacityUnitDistance ?? this.stepMm;
-    this.dev = dev;
+  }
+  /** Upload one phase's voxels (C-order z,y,x) into its preallocated texture. */
+  setFrameData(i, data) {
+    const [nx, ny, nz] = this.dims;
+    this.dev.queue.writeTexture(
+      { texture: this.texes[i] },
+      toF16Array(data),
+      { bytesPerRow: nx * 2, rowsPerImage: ny },
+      [nx, ny, nz]
+    );
+    this.filled[i] = true;
+  }
+  /** True once setFrameData has been called for this phase. */
+  hasFrame(i) {
+    return !!this.filled[i];
+  }
+  get framesLoaded() {
+    return this.filled.reduce((n, f) => n + (f ? 1 : 0), 0);
   }
   get frameCount() {
     return this.texes.length;
@@ -2689,38 +2714,61 @@ function presetLUT(name) {
   const clim = presetClim(name);
   return { lut: lutFromTransferFunctions(p.color, p.scalarOpacity, clim), clim, shade: p.shade };
 }
-async function buildCardiacScene(gpu2, base, format, onBytes) {
+async function buildCardiacScene(gpu2, base, format, onProgress) {
   const dev = gpu2.device;
-  const ctaScene = await loadScene(base + "cta.json");
-  const ctaVol = Object.values(ctaScene.nodes).find((n) => n.class === "vtkMRMLScalarVolumeNode");
-  const ctaIjkToRAS = ctaVol.attrs.ijkToRAS;
-  const ctaZ = await fetchZarrVolume(ctaScene.blobBase, ctaVol.attrs.zarr, onBytes);
-  const p0 = "CT-EndoVascular";
-  const { lut, clim, shade } = presetLUT(p0);
-  const cta = new ImageField(dev, ctaZ.data, ctaZ.dims, [1, 1, 1], lut, {
-    clim,
-    ijkToRAS: ctaIjkToRAS,
-    shade
-  });
   const cineScene = await loadScene(base + "cine.json");
   const seqNode = Object.values(cineScene.nodes).find((n) => n.class === "vtkMRMLSequenceNode");
   const items = seqNode.attrs.items;
-  const frames = [];
-  let cineDims = [0, 0, 0];
-  let cineIjkToRAS = [];
-  for (const it of items) {
-    const vn = cineScene.nodes[it.node];
-    const zv = await fetchZarrVolume(cineScene.blobBase, vn.attrs.zarr, onBytes);
-    frames.push(zv.data);
-    cineDims = zv.dims;
-    cineIjkToRAS = vn.attrs.ijkToRAS;
-  }
-  const cinePreset = presetLUT("CT-Cardiac3");
-  const cine = new CineField(dev, frames, cineDims, cinePreset.lut, {
+  const firstVol = cineScene.nodes[items[0].node];
+  const cineIjkToRAS = firstVol.attrs.ijkToRAS;
+  const z0 = firstVol.attrs.zarr;
+  const cineDims = [z0.shape[2], z0.shape[1], z0.shape[0]];
+  const cinePreset = presetLUT("CT-Coronary-Arteries-3");
+  const cine = new CineField(dev, items.length, cineDims, cinePreset.lut, {
     clim: cinePreset.clim,
     ijkToRAS: cineIjkToRAS,
     shade: cinePreset.shade
   });
+  const report = (what, bytes) => onProgress?.({ bytes, frames: cine.framesLoaded, totalFrames: items.length, what });
+  {
+    const zv = await fetchZarrVolume(cineScene.blobBase, z0, (n) => report("cine", n));
+    cine.setFrameData(0, zv.data);
+    report("cine", 0);
+  }
+  const cineReady = (async () => {
+    for (let i = 1; i < items.length; i++) {
+      const vn = cineScene.nodes[items[i].node];
+      const zv = await fetchZarrVolume(cineScene.blobBase, vn.attrs.zarr, (n) => report("cine", n));
+      cine.setFrameData(i, zv.data);
+      report("cine", 0);
+    }
+  })();
+  let cta = null;
+  let ctaIjkToRAS = [];
+  let ctaDims = [0, 0, 0];
+  let ctaPending = null;
+  const ensureCta = (onP) => {
+    if (cta) return Promise.resolve();
+    if (ctaPending) return ctaPending;
+    ctaPending = (async () => {
+      const ctaScene = await loadScene(base + "cta.json");
+      const ctaVol = Object.values(ctaScene.nodes).find((n) => n.class === "vtkMRMLScalarVolumeNode");
+      ctaIjkToRAS = ctaVol.attrs.ijkToRAS;
+      const zv = await fetchZarrVolume(
+        ctaScene.blobBase,
+        ctaVol.attrs.zarr,
+        (n) => onP?.({ bytes: n, frames: 0, totalFrames: 0, what: "cta" })
+      );
+      ctaDims = zv.dims;
+      const p = presetLUT("CT-EndoVascular");
+      cta = new ImageField(dev, zv.data, zv.dims, [1, 1, 1], p.lut, {
+        clim: p.clim,
+        ijkToRAS: ctaIjkToRAS,
+        shade: p.shade
+      });
+    })();
+    return ctaPending;
+  };
   const sa = seqNode.attrs;
   const sequence = new Sequence({
     indexName: sa.indexName,
@@ -2737,12 +2785,12 @@ async function buildCardiacScene(gpu2, base, format, onBytes) {
     cine.setFrame(browser.continuousItem, browser.playbackLooped);
   });
   const scene = new SceneRenderer(gpu2, format);
-  let mode = "cta";
-  let preset = p0;
-  let roi = createRoiWidget(...cta.aabb(), { coverage: 0.3 });
+  let mode = "cine";
+  let preset = "CT-Coronary-Arteries-3";
+  let roi = createRoiWidget(...cine.aabb(), { coverage: 0.3 });
   let cropOn = false, roiOn = false;
   const rebuild = () => {
-    const vol = mode === "cta" ? cta : cine;
+    const vol = mode === "cta" && cta ? cta : cine;
     scene.build(roiOn ? [vol, roi.box, roi.handles] : [vol]);
     scene.setBackground(0.05, 0.06, 0.09);
     if (cropOn) scene.setClipBox(roi.lo(), roi.hi());
@@ -2751,7 +2799,7 @@ async function buildCardiacScene(gpu2, base, format, onBytes) {
   rebuild();
   const slice = new SliceRenderer(gpu2, format);
   const applySliceVolume = () => {
-    const f = mode === "cta" ? cta : cine;
+    const f = mode === "cta" && cta ? cta : cine;
     const [lo, hi] = f.aabb();
     slice.setVolume(f.patientToTexture(), lo, hi);
     slice.setTextures(f.volumeTexture());
@@ -2761,7 +2809,7 @@ async function buildCardiacScene(gpu2, base, format, onBytes) {
   };
   applySliceVolume();
   const bounds = () => {
-    const [lo, hi] = (mode === "cta" ? cta : cine).aabb();
+    const [lo, hi] = (mode === "cta" && cta ? cta : cine).aabb();
     return {
       center: [(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2],
       radius: Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) / 2
@@ -2771,15 +2819,24 @@ async function buildCardiacScene(gpu2, base, format, onBytes) {
   const out = {
     scene,
     slice,
-    cta,
     cine,
     browser,
+    get cta() {
+      return cta;
+    },
+    cineReady,
+    ensureCta,
+    ctaLoaded: () => !!cta,
     center: b0.center,
     radius: b0.radius,
-    ctaIjkToRAS,
     cineIjkToRAS,
-    ctaDims: ctaZ.dims,
+    get ctaDims() {
+      return ctaDims;
+    },
     cineDims,
+    get ctaIjkToRAS() {
+      return ctaIjkToRAS;
+    },
     mode: () => mode,
     presetName: () => preset,
     roi,
@@ -2797,18 +2854,18 @@ async function buildCardiacScene(gpu2, base, format, onBytes) {
     setPreset(name) {
       if (!CARDIAC_PRESETS[name]) return;
       preset = name;
-      const { lut: lut2, clim: clim2, shade: shade2 } = presetLUT(name);
-      const f = mode === "cta" ? cta : cine;
-      f.setLUT(lut2);
-      f.clim = clim2;
-      f.shade = shade2;
+      const { lut, clim, shade } = presetLUT(name);
+      const f = mode === "cta" && cta ? cta : cine;
+      f.setLUT(lut);
+      f.clim = clim;
+      f.shade = shade;
       scene.syncUniforms();
       applySliceVolume();
     },
     setMode(m) {
       if (m === mode) return;
       mode = m;
-      const [lo, hi] = (m === "cta" ? cta : cine).aabb();
+      const [lo, hi] = (m === "cta" && cta ? cta : cine).aabb();
       roi = createRoiWidget(lo, hi, { coverage: 0.3 });
       out.roi = roi;
       rebuild();
@@ -4125,12 +4182,36 @@ for (const n of NAMES) {
     usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST
   });
 }
+var CINE_BYTES = 132e5;
 var mb = 0;
+var barFill = $("barfill");
+var loadPct = $("loadpct");
+var loadWrap = $("loadwrap");
+var pips = $("pips");
+var setBar = (frac, label) => {
+  barFill.style.width = `${Math.max(2, Math.min(100, frac * 100)).toFixed(1)}%`;
+  loadPct.textContent = label;
+};
+var setPips = (loaded, total) => {
+  if (pips.childElementCount !== total) {
+    pips.innerHTML = "";
+    for (let i = 0; i < total; i++) pips.appendChild(document.createElement("span"));
+  }
+  [...pips.children].forEach((el, i) => el.classList.toggle("on", i < loaded));
+};
+var onPhaseLoaded = null;
 status("loading cardiac data\u2026");
 var DATA_BASE = new URLSearchParams(location.search).get("data") ?? "https://js2.jetstream-cloud.org:8001/swift/v1/slicerlive/cardiac/";
-var sc = await buildCardiacScene(gpu, DATA_BASE, srgb, (n) => {
-  mb += n;
+var sc = await buildCardiacScene(gpu, DATA_BASE, srgb, (p) => {
+  if (p.what !== "cine") return;
+  mb += p.bytes;
+  setBar(
+    Math.max(mb / CINE_BYTES, p.frames / p.totalFrames),
+    `${p.frames} of ${p.totalFrames} phases \xB7 ${(mb / 1e6).toFixed(1)} MB`
+  );
+  setPips(p.frames, p.totalFrames);
   status(`loading\u2026 ${(mb / 1e6).toFixed(1)} MB`);
+  if (p.bytes === 0) onPhaseLoaded?.(p.frames);
 });
 var seedRAS = await (async () => {
   const s = await (await fetch(DATA_BASE + "cta.json")).json();
@@ -4256,6 +4337,24 @@ var applyPreset = (name) => {
   draw3d();
 };
 presetSel.onchange = () => applyPreset(presetSel.value);
+var ctaBar = $("ctabar");
+var ctaFill = $("ctafill");
+var ctaText = $("ctatext");
+var ctaMb = 0;
+var CTA_BYTES = 57e6;
+var loadCtaIfNeeded = async () => {
+  if (sc.ctaLoaded()) return true;
+  ctaBar.style.display = "flex";
+  ctaMb = 0;
+  ctaText.textContent = "loading CTA\u2026";
+  await sc.ensureCta((p) => {
+    ctaMb += p.bytes;
+    ctaFill.style.width = `${Math.min(100, ctaMb / CTA_BYTES * 100).toFixed(1)}%`;
+    ctaText.textContent = `loading CTA\u2026 ${(ctaMb / 1e6).toFixed(0)} MB`;
+  });
+  ctaBar.style.display = "none";
+  return true;
+};
 var setMode = (m) => {
   sc.setMode(m);
   resetPlanes();
@@ -4267,8 +4366,21 @@ var setMode = (m) => {
   applyPreset(m === "cine" ? "CT-Coronary-Arteries-3" : "CT-EndoVascular");
   status(m === "cine" ? "4D cine \xB7 10 cardiac phases \xB7 press play" : "static CTA 512\xD7512\xD7321 \xB7 try \u201Cfly inside\u201D");
 };
-for (const m of ["cta", "cine"]) $(`mode-${m}`).onclick = () => setMode(m);
-$("flyBtn").onclick = () => {
+for (const m of ["cta", "cine"]) {
+  $(`mode-${m}`).onclick = async () => {
+    if (m === "cta") {
+      sc.browser.playbackActive = false;
+      playBtn.textContent = "\u25B6 play";
+      await loadCtaIfNeeded();
+    }
+    setMode(m);
+  };
+}
+$("flyBtn").onclick = async () => {
+  if (!sc.ctaLoaded()) {
+    await loadCtaIfNeeded();
+    setMode("cta");
+  }
   applyPreset("CT-EndoVascular");
   camera.position = [...seedRAS];
   camera.focalPoint = [seedRAS[0], seedRAS[1] - 50, seedRAS[2]];
@@ -4524,6 +4636,24 @@ setMode("cine");
 sc.browser.playbackRateFps = 10;
 fps.value = "10";
 $("fpsLbl").textContent = "10 fps";
-sc.browser.playbackActive = true;
-playBtn.textContent = "\u275A\u275A pause";
+sc.browser.playbackActive = false;
+playBtn.textContent = "\u25B6 play";
+onPhaseLoaded = (n) => {
+  sc.browser.setSelectedItemNumber(n - 1);
+  status(`4D cine \xB7 loaded phase ${n}/${sc.cine.frameCount}`);
+};
+onPhaseLoaded(1);
+sc.cineReady.then(() => {
+  setBar(1, `all ${sc.cine.frameCount} phases loaded`);
+  setPips(sc.cine.frameCount, sc.cine.frameCount);
+  onPhaseLoaded = null;
+  loadWrap.classList.add("done");
+  setTimeout(() => {
+    loadWrap.style.display = "none";
+  }, 600);
+  sc.browser.setSelectedItemNumber(0);
+  sc.browser.playbackActive = true;
+  playBtn.textContent = "\u275A\u275A pause";
+  status(`4D cine \xB7 ${sc.cine.frameCount} phases \xB7 playing at ${sc.browser.playbackRateFps} fps \xB7 rotate while it plays`);
+});
 requestAnimationFrame(() => resize());
