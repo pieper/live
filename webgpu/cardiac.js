@@ -4607,9 +4607,13 @@ function setMarker(ras) {
   cross3.state.set([...ras]);
   cross3.redraw();
 }
-function jumpSlicesTo(ras) {
-  scrollSlicesTo(ras);
-  setMarker(autoTarget ?? seekTarget ?? ras);
+function focusPoint(fallback) {
+  return autoTarget ?? seekTarget ?? fallback;
+}
+function jumpSlicesTo(cameraPos) {
+  const p = focusPoint(cameraPos);
+  scrollSlicesTo(p);
+  setMarker(p);
 }
 var resize = () => {
   const dpr = Math.min(2, globalThis.devicePixelRatio || 1);
@@ -4862,14 +4866,8 @@ var tickFlight = (msNow) => {
 };
 function depthSeek(dt) {
   if (!endo || !flying) return;
-  const cruising = endo.cruise() === "forward";
-  const arrowing = keysDown.has("ArrowUp");
-  if (!cruising && !arrowing) {
-    seekTarget = null;
-    seekDir = null;
-    return;
-  }
-  if (performance.now() - manualLookAt < 600) return;
+  const moving = endo.cruise() === "forward" || keysDown.has("ArrowUp");
+  const steer = moving && performance.now() - manualLookAt >= 600;
   if (!seekBusy && ++seekTicks % 8 === 0) {
     seekBusy = true;
     const eye = [...camera.position];
@@ -4890,15 +4888,18 @@ function depthSeek(dt) {
         const v = [bestHit[0] - eye[0], bestHit[1] - eye[1], bestHit[2] - eye[2]];
         const l = Math.hypot(v[0], v[1], v[2]) || 1;
         seekDir = [v[0] / l, v[1] / l, v[2] / l];
+        if (!autoTarget) {
+          scrollSlicesTo(seekTarget);
+          setMarker(seekTarget);
+        }
       }
       seekBusy = false;
     }).catch(() => {
       seekBusy = false;
     });
   }
-  if (seekDir) {
+  if (seekDir && steer) {
     endo.lookAlong(slerpDir(forwardDir(), seekDir, 0.9 * dt));
-    if (seekTarget) setMarker(seekTarget);
   }
 }
 function slerpDir(from, to, maxRad) {
@@ -4984,6 +4985,7 @@ var setAutoTarget = (ras) => {
   autoTarget = [...ras];
   autoDir = null;
   autoStuck = 0;
+  scrollSlicesTo(autoTarget);
   setMarker(autoTarget);
   status("autopilot: steering toward the picked target\u2026");
 };
