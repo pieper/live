@@ -1,5 +1,11 @@
 [
  {
+  "name": "cardiac \u2014 4D volume rendering",
+  "page": "webgpu/cardiac.html",
+  "thumb": "cardiac.png",
+  "desc": "Volume rendering of a beating heart, reproducing the rendering options of two CHOP/SlicerHeart papers on public 3D Slicer sample data. Opens on the 4D cine: ten cardiac phases from a 4D cardiac CT, playing at 10 fps with the CT-Coronary-Arteries-3 preset \u2014 and you can rotate WHILE it plays, because each phase is accumulated live rather than precomputed, so nothing stalls. Switch to the static 512\u00d7512\u00d7321 CTA and press \u201cfly inside\u201d: the CT-EndoVascular transfer function (transcribed verbatim from SlicerHeart and verified against a running Slicer) drops to zero opacity at 338 HU, so contrast-filled blood becomes invisible and the camera sits inside the chamber looking at endocardium \u2014 the JACC ventricular-septal-defect technique, with no segmentation step. Preset picker, ROI crop box with draggable handles, 4-up MPR with linked shift-move crosshair. Unlike VTK\u2019s raycaster this jitters the ray and accumulates, so converged views have no banding: the contour rings visible in Slicer\u2019s own render of the same data at the same camera are absent here."
+ },
+ {
   "name": "codec race",
   "page": "webgpu/livecodec.html",
   "thumb": "livecodec.png",
