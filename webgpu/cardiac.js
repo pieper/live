@@ -3441,7 +3441,7 @@ function rotate(v, k, ang) {
   ];
 }
 function attachEndoscopyControls(canvas, camera2, opts = {}) {
-  const speed = opts.speedMmPerSec ?? 4;
+  let speed = opts.speedMmPerSec ?? 8;
   const turn = (opts.turnDegPerSec ?? 60) * Math.PI / 180;
   const lookRad = opts.lookRadPerPx ?? 5e-3;
   const refUp = opts.referenceUp ?? [0, 0, 1];
@@ -3571,6 +3571,10 @@ function attachEndoscopyControls(canvas, camera2, opts = {}) {
     lookAlong: (dir) => {
       setDirection(dir);
       opts.onChange?.();
+    },
+    speed: () => speed,
+    setSpeed: (mmPerSec) => {
+      speed = Math.max(0.1, mmPerSec);
     },
     tick(dtSec) {
       let moved = false;
@@ -4200,7 +4204,8 @@ var DEFAULT_HELP = [
     ["Shift + Space", "Toggle reverse cruise"],
     ["Escape", "Stop"],
     ["Left-drag", "Look around"],
-    ["Shift + click", "Autopilot target"]
+    ["Shift + click", "Autopilot target"],
+    ["Speed slider", "Travel speed in mm/s (live, applies mid-flight)"]
   ] },
   { title: "Slice views", rows: [
     ["Wheel / Left-drag", "Scroll through slices"],
@@ -4831,6 +4836,21 @@ function seatFlight(p) {
   jumpSlicesTo(camera.position);
   draw3d();
 }
+var speedEl = document.getElementById("speed");
+var speedLbl = document.getElementById("speedLbl");
+var DEFAULT_SPEED = 8;
+var flightSpeed = () => speedEl ? Number(speedEl.value) : DEFAULT_SPEED;
+var showSpeed = () => {
+  if (speedLbl) speedLbl.textContent = `${flightSpeed()} mm/s`;
+};
+if (speedEl) {
+  speedEl.value = String(DEFAULT_SPEED);
+  showSpeed();
+  speedEl.oninput = () => {
+    showSpeed();
+    endo?.setSpeed(flightSpeed());
+  };
+}
 var startFlight = async () => {
   if (!sc.ctaLoaded()) {
     await loadCtaIfNeeded();
@@ -4846,8 +4866,7 @@ var startFlight = async () => {
   lastGoodPos = [...camera.position];
   endo?.detach();
   endo = attachEndoscopyControls(cv.threeD, camera, {
-    speedMmPerSec: 4,
-    // vessels are small; 10x slower than the first cut
+    speedMmPerSec: flightSpeed(),
     marginMm: MARGIN_MM,
     referenceUp: [0, 0, 1],
     onChange: () => {
@@ -4865,6 +4884,7 @@ var startFlight = async () => {
     // works for reverse as well as forward — pick(u,v) could only ever see what is on screen.
     clearance: (dir) => dot32(dir, probedDir) > 0.9 ? clearanceAhead : Infinity
   });
+  endo.setSpeed(flightSpeed());
   endo.lookAlong(SEED_DIR);
   if (fromSlicer) seatFlight(fromSlicer);
   status(fromSlicer ? "flight started from Slicer's camera" : "flight started from the aortic seed");
@@ -4902,7 +4922,7 @@ var showCruise = (c) => {
   const label = c === "forward" ? "\u25B6 forward" : c === "back" ? "\u25C0 back" : "\u25A0 stopped";
   $("cruise").textContent = label;
   $("cruise").className = c === "stopped" ? "" : "on";
-  status(`endovascular flight \xB7 ${label} \xB7 \u2191\u2193 in/out \xB7 \u2190\u2192 yaw \xB7 shift \u2190\u2192 pitch \xB7 ctrl \u2190\u2192 roll \xB7 space cruise`);
+  status(`endovascular flight \xB7 ${label} \xB7 ${flightSpeed()} mm/s \xB7 \u2191\u2193 in/out \xB7 \u2190\u2192 yaw \xB7 shift \u2190\u2192 pitch \xB7 ctrl \u2190\u2192 roll \xB7 space cruise`);
 };
 var scrub = $("scrub");
 var fps = $("fps");
@@ -5308,6 +5328,7 @@ globalThis.cardiac = {
     renderInFlight,
     flying,
     cruise: endo ? endo.cruise() : "stopped",
+    speedMmPerSec: endo ? endo.speed() : flightSpeed(),
     autoTarget: autoTarget ? [...autoTarget] : null,
     seekTarget: seekTarget ? [...seekTarget] : null,
     // the lead point: LEAD_MM ahead along aimDir
@@ -5340,6 +5361,13 @@ globalThis.cardiac = {
   },
   followedPose: () => followedPose,
   setCruise: (c) => endo?.setCruise(c),
+  setSpeed: (mmPerSec) => {
+    if (speedEl) {
+      speedEl.value = String(mmPerSec);
+      showSpeed();
+    }
+    endo?.setSpeed(mmPerSec);
+  },
   setAutoTarget,
   // Drive the camera to exact values so a view can be matched 1:1 against Slicer.
   getCamera: () => ({
