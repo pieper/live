@@ -12,6 +12,12 @@
   "desc": "Fly a camera through the inside of a contrast CT. The CT-EndoVascular transfer function (from SlicerHeart, verified byte-for-byte against a running Slicer 5.12) drops to zero opacity at 338 HU, so contrast-filled blood becomes invisible and the camera can travel down the aorta, into side branches and on into the chambers \u2014 looking at endocardium directly, with no segmentation and no precomputed centreline. SPACE toggles forward cruise, SHIFT+SPACE reverse, left-drag or the arrow keys look around, and SHIFT+click sets a target the autopilot steers toward, or reports how close the blood pool actually allows. Collision \u201crails\u201d keep you inside the lumen: every frame the renderer casts a ray along the direction of travel and clamps the step to the distance to the wall \u2014 the same 50%-opacity GPU trace the crosshair pick uses. The MPR slices scroll to follow the camera, with the crosshair marking where you are. Streams the 512\u00d7512\u00d7321 CTA from a public JS2 bucket."
  },
  {
+  "name": "colorize volume \u2014 86 structures",
+  "page": "webgpu/colorize.html",
+  "thumb": "colorize.png",
+  "desc": "Slicer's Colorize Volume, in WebGPU: a chest/abdomen CT tinted by 86 TotalSegmentator structures \u2014 every rib and vertebra individually, five lung lobes, the heart chambers, the great vessels and the abdominal organs. The RGBA is composed per ray sample in the shader rather than baked into a texture, so every segment's opacity stays a live uniform: the SlicerLive badge opens grouped sliders (organs, heart, vessels, lungs, intestines, vertebrae, ribs, other bone, muscle) that fade a whole system in and out of a 55-million-voxel volume by rewriting a 1 kB palette. The same palette colours the segmentation overlaid on the CT in the three MPR slices, so one slider moves all four views together. A combobox picks any of twelve CT transfer functions transcribed from Slicer's presets.xml, which draw the unlabelled body and modulate each segment's brightness; the crop box and ROI are Slicer's own two switches. The label volume compresses to under a megabyte and loads first, so the segmentation is on screen as surfaces in under a second while the 61 MB CT streams in behind it from a public JS2 bucket. Data: NLST case 218750 from the NCI Imaging Data Commons (509\u00d7365\u00d7299 at 0.57\u00d70.57\u00d71.25 mm) with the CC BY 4.0 TotalSegmentator segmentations (doi 10.5281/zenodo.8347011)."
+ },
+ {
   "name": "codec race",
   "page": "webgpu/livecodec.html",
   "thumb": "livecodec.png",
