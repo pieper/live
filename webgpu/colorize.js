@@ -1575,10 +1575,11 @@ var SliceRenderer = class {
 };
 
 // render/cine-field.ts
+var _f32 = new Float32Array(1);
+var _u32 = new Uint32Array(_f32.buffer);
 function f32tof16(v) {
-  const f = new Float32Array(1);
-  f[0] = v;
-  const u = new Uint32Array(f.buffer)[0];
+  _f32[0] = v;
+  const u = _u32[0];
   const sign = u >>> 16 & 32768;
   let exp = (u >>> 23 & 255) - 127 + 15;
   const man = u & 8388607;
@@ -1631,7 +1632,13 @@ var ColorizeField = class {
       format: "r8uint",
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
     });
-    const lab8 = labels instanceof Uint8Array ? labels : Uint8Array.from(labels, (v) => v & 255);
+    let lab8;
+    if (labels instanceof Uint8Array) {
+      lab8 = labels;
+    } else {
+      lab8 = new Uint8Array(labels.length);
+      for (let i = 0; i < labels.length; i++) lab8[i] = labels[i];
+    }
     dev.queue.writeTexture(
       { texture: this.labTex },
       lab8,
