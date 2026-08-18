@@ -685,13 +685,19 @@ struct U {
   uvec : vec4<f32>,      // RAS vector spanning the view width  (isotropic mm)
   vvec : vec4<f32>,      // RAS vector spanning the view height (isotropic mm)
   params : vec4<f32>,    // win, lev, fillOpacity, outlineOpacity
-  size : vec4<f32>,      // sizeX, sizeY, _, _
+  size : vec4<f32>,      // sizeX, sizeY, labelOverlayMode, _
 };
 @group(0) @binding(0) var<uniform> u : U;
 @group(0) @binding(1) var s_lin : sampler;
 @group(0) @binding(2) var t_scalar : texture_3d<f32>;
 @group(0) @binding(3) var t_overlay : texture_3d<f32>;
 @group(0) @binding(4) var s_nn : sampler;   // NEAREST \u2014 labelmap overlay is per-voxel crisp (matches Slicer)
+// Label-overlay mode (size.z > 0.5): instead of a pre-coloured rgba volume, take the segment
+// number from a u8 label volume and its colour+opacity from the same 256x2 palette the
+// ColorizeField uses. A coloured overlay of a 509x365x299 CT would be 222 MB; label + palette
+// is 55 MB and, because it shares the palette, hiding an organ group in 3D hides it here too.
+@group(0) @binding(5) var t_labels : texture_3d<u32>;
+@group(0) @binding(6) var t_palette : texture_2d<f32>;
 
 struct V { @builtin(position) position : vec4<f32> };
 @vertex
@@ -704,10 +710,21 @@ fn srgb2physical(c : vec3<f32>) -> vec3<f32> {
   let lo = c / 12.92; let hi = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
   return select(lo, hi, c > vec3<f32>(0.04045));
 }
+/** The overlay colour at a texture coordinate, from whichever source is configured. */
+fn ov_tex(t : vec3<f32>) -> vec4<f32> {
+  if (u.size.z > 0.5) {
+    let d = vec3<f32>(textureDimensions(t_labels));
+    let vi = vec3<i32>(clamp(floor(t * d), vec3<f32>(0.0), d - vec3<f32>(1.0)));
+    let lab = i32(textureLoad(t_labels, vi, 0).r);
+    if (lab == 0) { return vec4<f32>(0.0); }
+    return textureLoad(t_palette, vec2<i32>(lab, 1), 0);
+  }
+  return textureSampleLevel(t_overlay, s_nn, t, 0.0);
+}
 fn ov_at(ras : vec3<f32>) -> vec4<f32> {   // overlay at a RAS point (0 outside the volume)
   let t = (u.p2t * vec4<f32>(ras, 1.0)).xyz;
   if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { return vec4<f32>(0.0); }
-  return textureSampleLevel(t_overlay, s_nn, t, 0.0);
+  return ov_tex(t);
 }
 @fragment
 fn fs_main(v : V) -> @location(0) vec4<f32> {
@@ -720,7 +737,7 @@ fn fs_main(v : V) -> @location(0) vec4<f32> {
   let win = max(u.params.x, 1e-6);
   let g = clamp((val - (u.params.y - win * 0.5)) / win, 0.0, 1.0);
   var col = vec3<f32>(g);
-  let ov = textureSampleLevel(t_overlay, s_nn, tex, 0.0);
+  let ov = ov_tex(tex);
   // Slicer-style 2D segmentation: a semi-transparent per-voxel FILL plus a brighter boundary
   // OUTLINE, with independent opacities (params.z = fill, params.w = outline). The outline is
   // screen-space (constant pixel width under zoom), drawn in the segment's own colour along its
@@ -779,6 +796,9 @@ var SliceRenderer = class {
   // p2t(16) + origin(4) + uvec(4) + vvec(4) + params(4) + size(4)
   bind;
   overlay;
+  labels;
+  palette;
+  scalarTex;
   // actual in-plane extents (mm) spanned by the LAST rendered viewport, aspect-corrected so
   // pixels stay isotropic on a non-square view (0 until first render → fall back to the square span).
   uSpanMm = 0;
@@ -814,6 +834,24 @@ var SliceRenderer = class {
     this.setWindowLevel(255, 127);
     this.setOverlayOpacity(0.55);
   }
+  /** 1x1x1 stand-ins so the label-overlay bindings always exist. The pipeline layout is fixed,
+   *  so every caller must bind them even when it only wants a plain MPR. */
+  emptyLabels;
+  emptyPalette;
+  noLabels() {
+    if (!this.emptyLabels) {
+      this.emptyLabels = this.dev.createTexture({ size: [1, 1, 1], dimension: "3d", format: "r8uint", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+      this.dev.queue.writeTexture({ texture: this.emptyLabels }, new Uint8Array(1), { bytesPerRow: 1, rowsPerImage: 1 }, [1, 1, 1]);
+    }
+    return this.emptyLabels;
+  }
+  noPalette() {
+    if (!this.emptyPalette) {
+      this.emptyPalette = this.dev.createTexture({ size: [256, 2], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+      this.dev.queue.writeTexture({ texture: this.emptyPalette }, new Uint8Array(256 * 2 * 4), { bytesPerRow: 256 * 4 }, [256, 2]);
+    }
+    return this.emptyPalette;
+  }
   emptyOverlay;
   transparentOverlay() {
     if (!this.emptyOverlay) {
@@ -835,14 +873,30 @@ var SliceRenderer = class {
    *  same RAS->tex mapping addresses both. Omit overlay for a plain MPR. */
   setTextures(scalar, overlay) {
     this.overlay = overlay ?? this.transparentOverlay();
+    this.scalarTex = scalar;
+    this.rebind();
+  }
+  /** Colour the overlay from a u8 label volume + the 256x2 palette (row 1 = colour/opacity),
+   *  instead of a pre-coloured rgba volume. Same geometry requirement as setTextures. Pass
+   *  nulls to go back to the rgba overlay. */
+  setLabelOverlay(labels, palette) {
+    this.labels = labels ?? void 0;
+    this.palette = palette ?? void 0;
+    this.u[34] = labels && palette ? 1 : 0;
+    if (this.scalarTex) this.rebind();
+  }
+  rebind() {
+    if (!this.scalarTex) return;
     this.bind = this.dev.createBindGroup({
       layout: this.pipeline.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: this.ubuf } },
         { binding: 1, resource: this.sampler },
-        { binding: 2, resource: scalar.createView() },
-        { binding: 3, resource: this.overlay.createView() },
-        { binding: 4, resource: this.nnSampler }
+        { binding: 2, resource: this.scalarTex.createView() },
+        { binding: 3, resource: (this.overlay ?? this.transparentOverlay()).createView() },
+        { binding: 4, resource: this.nnSampler },
+        { binding: 5, resource: (this.labels ?? this.noLabels()).createView() },
+        { binding: 6, resource: (this.palette ?? this.noPalette()).createView() }
       ]
     });
   }
@@ -1096,7 +1150,6 @@ var SliceInteractor = class {
   constructor(geom) {
     this.geom = geom;
   }
-  geom;
   setGeometry(g) {
     this.geom = g;
   }
@@ -1560,8 +1613,10 @@ function attachCameraControls(canvas, camera, opts = {}) {
     const [a, b] = [...pointers.values()];
     return { dist: Math.hypot(b.x - a.x, b.y - a.y), mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 };
   };
+  const on = () => opts.enabled?.() ?? true;
   canvas.addEventListener("contextmenu", (e) => e.preventDefault());
   canvas.addEventListener("pointerdown", (e) => {
+    if (!on()) return;
     const { x, y } = local(e);
     pointers.set(e.pointerId, { x, y });
     canvas.setPointerCapture(e.pointerId);
@@ -1575,6 +1630,11 @@ function attachCameraControls(canvas, camera, opts = {}) {
   });
   const endPointer = (e) => {
     if (!pointers.delete(e.pointerId)) return;
+    if (!on()) {
+      interactor.end();
+      pinch = null;
+      return;
+    }
     canvas.releasePointerCapture?.(e.pointerId);
     if (pointers.size < 2) pinch = null;
     if (pointers.size === 1) {
@@ -1587,6 +1647,7 @@ function attachCameraControls(canvas, camera, opts = {}) {
   canvas.addEventListener("pointerup", endPointer);
   canvas.addEventListener("pointercancel", endPointer);
   canvas.addEventListener("pointermove", (e) => {
+    if (!on()) return;
     if (!pointers.has(e.pointerId)) return;
     const { x, y } = local(e);
     pointers.set(e.pointerId, { x, y });
@@ -1603,6 +1664,7 @@ function attachCameraControls(canvas, camera, opts = {}) {
     }
   });
   canvas.addEventListener("wheel", (e) => {
+    if (!on()) return;
     e.preventDefault();
     interactor.wheel(e.deltaY < 0);
     opts.onLog?.("cameraWheel", { deltaY: e.deltaY, distance: camera.distance });
@@ -1616,6 +1678,166 @@ function framedCamera(center, radius, distMul = 2.6) {
     [0, 0, 1],
     30
   );
+}
+
+// examples/livecodec/livecodec-compare.ts
+var STEPS = 600;
+function makeSnapshotViewer(cfg) {
+  const { shape: sc_shape, spacing, win, lev, frames, keys } = cfg;
+  const grids = {
+    neural: cfg.el("cmp-neural"),
+    htj2k: cfg.el("cmp-htj2k")
+  };
+  const [Z, Y, X] = sc_shape;
+  const [sz, sy, sx] = spacing;
+  const planes = [
+    { name: "axial", w: X, h: Y, mmW: X * sx, mmH: Y * sy },
+    { name: "coronal", w: X, h: Z, mmW: X * sx, mmH: Z * sz },
+    { name: "sagittal", w: Y, h: Z, mmW: Y * sy, mmH: Z * sz }
+  ];
+  const canvases = { neural: [], htj2k: [] };
+  const cells = [];
+  for (const k of keys) {
+    grids[k].replaceChildren();
+    for (const pl of planes) {
+      const cell = document.createElement("div");
+      cell.className = "cmpcell";
+      const cv = document.createElement("canvas");
+      cv.width = pl.w;
+      cv.height = pl.h;
+      cv.style.width = `${pl.mmW}px`;
+      cv.style.height = `${pl.mmH}px`;
+      const tag = document.createElement("span");
+      tag.textContent = pl.name;
+      cell.append(cv, tag);
+      grids[k].append(cell);
+      canvases[k].push(cv);
+      cells.push(cell);
+    }
+  }
+  let zoom = 1, panX = 0, panY = 0;
+  const applyView = () => {
+    for (const k of keys) {
+      canvases[k].forEach((cv, pi) => {
+        const cell = cv.parentElement;
+        const pl = planes[pi];
+        const fit = Math.min((cell.clientWidth || 1) / pl.mmW, (cell.clientHeight || 1) / pl.mmH);
+        const s = fit * zoom;
+        const offX = (cell.clientWidth - pl.mmW * s) / 2 + panX * fit;
+        const offY = (cell.clientHeight - pl.mmH * s) / 2 + panY * fit;
+        cv.style.transform = `translate(${offX}px, ${offY}px) scale(${s})`;
+      });
+    }
+  };
+  const atBytes = (key, target) => {
+    const f = frames[key];
+    if (!f.length) return void 0;
+    let lo = 0, hi = f.length - 1, best = 0;
+    while (lo <= hi) {
+      const mid = lo + hi >> 1;
+      if (f[mid].bytes <= target) {
+        best = mid;
+        lo = mid + 1;
+      } else hi = mid - 1;
+    }
+    return f[best];
+  };
+  const maxBytes = Math.max(
+    frames.neural[frames.neural.length - 1]?.bytes ?? 0,
+    frames.htj2k[frames.htj2k.length - 1]?.bytes ?? 0
+  );
+  const draw = (i) => {
+    const lo = lev - win / 2, span = Math.max(1, win);
+    const target = maxBytes * (i / Math.max(1, STEPS));
+    for (const k of keys) {
+      const s = atBytes(k, target)?.p;
+      canvases[k].forEach((cv, pi) => {
+        const ctx = cv.getContext("2d");
+        if (!s) {
+          ctx.clearRect(0, 0, cv.width, cv.height);
+          return;
+        }
+        const src = pi === 0 ? s.ax : pi === 1 ? s.co : s.sa;
+        const img = ctx.createImageData(cv.width, cv.height);
+        const d = img.data;
+        for (let j = 0; j < src.length; j++) {
+          const g = Math.max(0, Math.min(255, (src[j] - lo) / span * 255)) | 0;
+          const o = j * 4;
+          d[o] = d[o + 1] = d[o + 2] = g;
+          d[o + 3] = 255;
+        }
+        ctx.putImageData(img, 0, 0);
+      });
+    }
+    const n = atBytes("neural", target), hj = atBytes("htj2k", target);
+    const kb = (b) => b == null ? "\u2014" : b < 1e6 ? `${(b / 1024).toFixed(0)} KB` : `${(b / 1e6).toFixed(1)} MB`;
+    cfg.el("cmplabel").textContent = `at ${kb(target)}  \xB7  neural ${kb(n?.bytes)} @ ${n ? (n.ms / 1e3).toFixed(1) : "\u2014"} s  \xB7  HTJ2K ${kb(hj?.bytes)} @ ${hj ? (hj.ms / 1e3).toFixed(1) : "\u2014"} s`;
+    applyView();
+  };
+  const slider = cfg.el("cmpslider");
+  slider.max = String(STEPS);
+  slider.value = String(STEPS);
+  slider.oninput = () => draw(+slider.value);
+  const grid = cfg.el("cmpgrid");
+  grid.onwheel = (e) => {
+    e.preventDefault();
+    const cell = e.target.closest(".cmpcell");
+    const f = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+    const next = Math.max(1, Math.min(40, zoom * f));
+    if (cell) {
+      const r = cell.getBoundingClientRect();
+      const cx = e.clientX - r.left - r.width / 2;
+      const cy = e.clientY - r.top - r.height / 2;
+      const pi = [...cell.parentElement.children].indexOf(cell);
+      const pl = planes[pi] ?? planes[0];
+      const fit = Math.min(r.width / pl.mmW, r.height / pl.mmH) || 1;
+      panX += cx / fit * (1 - next / zoom);
+      panY += cy / fit * (1 - next / zoom);
+    }
+    zoom = next;
+    applyView();
+  };
+  let drag = null;
+  grid.onpointerdown = (e) => {
+    const cell = e.target.closest(".cmpcell");
+    const pi = cell ? [...cell.parentElement.children].indexOf(cell) : 0;
+    const pl = planes[pi] ?? planes[0];
+    const r = cell?.getBoundingClientRect();
+    const fit = r ? Math.min(r.width / pl.mmW, r.height / pl.mmH) || 1 : 1;
+    drag = { x: e.clientX, y: e.clientY, px: panX, py: panY, fit };
+    e.target.setPointerCapture?.(e.pointerId);
+  };
+  grid.onpointermove = (e) => {
+    if (!drag) return;
+    panX = drag.px + (e.clientX - drag.x) / drag.fit;
+    panY = drag.py + (e.clientY - drag.y) / drag.fit;
+    applyView();
+  };
+  grid.onpointerup = () => {
+    drag = null;
+  };
+  grid.oncontextmenu = (e) => {
+    e.preventDefault();
+  };
+  grid.onpointercancel = () => {
+    drag = null;
+  };
+  addEventListener("keydown", (e) => {
+    if (!cfg.el("cmp").classList.contains("on")) return;
+    if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+      slider.value = String(Math.max(0, Math.min(
+        +slider.max,
+        +slider.value + (e.key === "ArrowRight" ? 1 : -1)
+      )));
+      draw(+slider.value);
+    } else if (e.key === "0") {
+      zoom = 1;
+      panX = panY = 0;
+      applyView();
+    } else if (e.key === "Escape") cfg.el("cmp").classList.remove("on");
+  });
+  addEventListener("resize", applyView);
+  draw(+slider.value);
 }
 
 // render/demos/view-grid.ts
@@ -1645,6 +1867,17 @@ var DEFAULT_HELP = [
     ["Wheel / two-finger", "Zoom (dolly)"],
     ["Double-click", "Maximize / restore"],
     ["Shift + move", "Pick \u2192 jump slices to the point"]
+  ] },
+  { title: "Endovascular flight (fly-inside / endo demo)", rows: [
+    ["Up / Down", "Move in / out along the view axis"],
+    ["Left / Right", "Yaw"],
+    ["Shift + Left/Right", "Pitch"],
+    ["Ctrl + Left/Right", "Roll"],
+    ["Space", "Toggle forward cruise"],
+    ["Shift + Space", "Toggle reverse cruise"],
+    ["Escape", "Stop"],
+    ["Left-drag", "Look around"],
+    ["Shift + click", "Autopilot target"]
   ] },
   { title: "Slice views", rows: [
     ["Wheel / Left-drag", "Scroll through slices"],
@@ -1789,13 +2022,57 @@ function installChrome(opts) {
     return paint;
   };
   const OPBOX_CSS = "width:44px;height:18px;border-radius:6px;position:relative;overflow:hidden;flex:0 0 auto;background:rgba(255,255,255,.14);box-shadow:inset 0 0 0 1px rgba(255,255,255,.18);touch-action:none;";
+  const heading = (text, first) => {
+    const h = document.createElement("div");
+    h.textContent = text;
+    h.style.cssText = "font:700 10px -apple-system,system-ui,sans-serif;letter-spacing:1.1px;text-transform:uppercase;color:#9fe9ff;margin:" + (first ? "0 0 8px" : "12px 0 6px") + ";" + (first ? "" : "border-top:1px solid rgba(255,255,255,.12);padding-top:10px;");
+    pop.appendChild(h);
+  };
+  const selects = opts.selects ?? [];
+  const selEls = [];
+  let sectionSeen = null;
+  let firstHead = true;
+  for (const c of selects) {
+    const sec = c.section ?? "Visualization";
+    if (sec !== sectionSeen) {
+      heading(sec, firstHead);
+      sectionSeen = sec;
+      firstHead = false;
+    }
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:12px;padding:5px 0;";
+    const lab = document.createElement("span");
+    lab.textContent = c.label;
+    const sel = document.createElement("select");
+    sel.style.cssText = "flex:1 1 auto;max-width:60%;border-radius:7px;padding:4px 6px;cursor:pointer;font:500 12px -apple-system,system-ui,sans-serif;color:#e8eeff;background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.20);";
+    for (const o of c.options) {
+      const op = document.createElement("option");
+      op.value = o.value;
+      op.textContent = o.label;
+      op.style.cssText = "background:#1b2030;color:#e8eeff;";
+      sel.appendChild(op);
+    }
+    sel.value = c.get();
+    sel.onclick = (e) => e.stopPropagation();
+    sel.onchange = () => {
+      c.set(sel.value);
+      opts.onChange?.();
+      refresh();
+    };
+    row.appendChild(lab);
+    row.appendChild(sel);
+    pop.appendChild(row);
+    selEls.push({ c, el: sel });
+  }
   const rows = [];
   if (controls.length) {
-    const head = document.createElement("div");
-    head.textContent = "Visualization";
-    head.style.cssText = "font:700 10px -apple-system,system-ui,sans-serif;letter-spacing:1.1px;text-transform:uppercase;color:#9fe9ff;margin:0 0 8px;";
-    pop.appendChild(head);
     for (const c of controls) {
+      const sec = c.section ?? "Visualization";
+      if (sec !== sectionSeen) {
+        heading(sec, firstHead);
+        sectionSeen = sec;
+        firstHead = false;
+      }
       const row = document.createElement("div");
       row.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:14px;padding:5px 0;";
       const lab = document.createElement("span");
@@ -1826,7 +2103,7 @@ function installChrome(opts) {
       }
       pop.appendChild(row);
     }
-  } else if (opts.about === false && !opts.segments) {
+  } else if (opts.about === false && !opts.segments && !selects.length) {
     pop.textContent = "SlicerLive \u2014 WebGPU renderer";
   }
   const segHost = document.createElement("div");
@@ -1892,6 +2169,10 @@ function installChrome(opts) {
     pop.appendChild(about);
   }
   function refresh() {
+    for (const { c, el: el2 } of selEls) {
+      const v = c.get();
+      if (el2.value !== v) el2.value = v;
+    }
     for (const { c, row, sw, repaint } of rows) {
       const dis = c.disabled?.() ?? false;
       row.style.opacity = dis ? "0.4" : "1";
@@ -2329,6 +2610,7 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
     } else {
       this.dev.queue.writeBuffer(this.camBuf, 0, this.baseInvVP);
     }
+    this.dev.queue.writeBuffer(this.camBuf, 76, new Float32Array([n - 1]));
     this.flush();
     this.dev.queue.writeBuffer(this.accumUniformBuf, 0, new Float32Array([this.mat[12], this.mat[13], this.mat[14], 1 / n]));
     const prev = this.accumPing, next = 1 - this.accumPing;
@@ -2363,8 +2645,8 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
     });
     this.clipOff = uoff;
     this.pickOff = uoff + CLIP_FLOATS;
-    this.mat = new Float32Array(uoff + CLIP_FLOATS + 4);
-    this.matBuf = this.dev.createBuffer({ size: (uoff + CLIP_FLOATS + 4) * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.mat = new Float32Array(uoff + CLIP_FLOATS + 12);
+    this.matBuf = this.dev.createBuffer({ size: (uoff + CLIP_FLOATS + 12) * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     const module = this.dev.createShaderModule({ code: this.wgsl() });
     this.pipeline = this.dev.createRenderPipeline({
       layout: "auto",
@@ -2473,6 +2755,8 @@ ${members}
   clip_planes : array<vec4<f32>, 8>,   // (nx, ny, nz, offset) inward; tail so field offsets are stable
   clip_count : vec4<f32>,              // (count, _, _, _)
   pick_cursor : vec4<f32>,             // (ndc_x, ndc_y, _, _) \u2014 the ray for fs_pick
+  probe_origin : vec4<f32>,            // explicit-ray probe: world origin
+  probe_dir : vec4<f32>,               // (dx, dy, dz, enabled) \u2014 w>0 uses this ray instead of the cursor
 };
 @group(0) @binding(0) var<uniform> u_cam : Camera;
 @group(0) @binding(1) var<uniform> u_material : Material;
@@ -2533,7 +2817,23 @@ fn fs_trace(v : Varyings) -> @location(0) vec4<f32> {
 ${skipInit}
   loop {
     if (t >= t_far || safety >= 5000${hasGhost ? "" : " || integrated.a >= 0.99"}) { break; }
-    let js = fract(sin(dot(v.position.xy + vec2<f32>(f32(safety) * 0.7548, f32(safety) * 0.5698), vec2<f32>(12.9898, 78.233))) * 43758.5453) - 0.5; // per-(pixel,sample) jitter \u2014 frame-invariant; temporal AA rides on the sub-pixel NDC jitter (frame.xy), which is exact identity at 0
+    // Per-(pixel, step, ACCUM FRAME) ray-offset jitter. The frame term (u_cam.size.w, the
+    // accumulation index) is what makes temporal AA actually converge: with a frame-invariant
+    // offset the jitter turns banding into FIXED-PATTERN noise that averaging can never remove
+    // (measured: 32 samples was as grainy as 1). Varying it per frame decorrelates the samples
+    // so the mean approaches the true integral \u2014 no banding AND no noise. size.w is 0 for every
+    // non-accumulating path, so frame 1 stays byte-identical to a plain renderToView.
+    // Base offset: decorrelated per (pixel, step) so a single frame shows noise, not banding.
+    let jbase = fract(sin(dot(v.position.xy + vec2<f32>(f32(safety) * 0.7548, f32(safety) * 0.5698), vec2<f32>(12.9898, 78.233))) * 43758.5453);
+    // Advance it across accumulation frames by the golden-ratio additive recurrence
+    // (Cranley-Patterson rotation). MEASURED: this converges at the same 1/sqrt(n) rate as an
+    // independent random offset per frame (high-freq energy 1.36 vs 1.31 at n=64) \u2014 the low-
+    // discrepancy walk is NOT faster here, because the variance is dominated by the step size
+    // against a sharp transfer function, not by the sequence. Kept because it is deterministic
+    // and costs nothing; reduce sampleStep if you need less residual speckle.
+    // At size.w = 0 this is exactly jbase, so the first accumulated frame stays byte-identical
+    // to a plain renderToView \u2014 the property render/test baselines depend on.
+    let js = fract(jbase + u_cam.size.w * 0.6180339887) - 0.5;
     let wp = ro + rd * (t + js * step);
     var sum = vec4<f32>(0.0);
     var all_defer = true;        // every field guarantees emptiness here -> we may leap
@@ -2573,8 +2873,16 @@ ${ghostDispatch}
 // Output: (wp.x, wp.y, wp.z, hit). hit=0 means the ray never reached 50% (empty/miss).
 @fragment
 fn fs_pick() -> @location(0) vec4<f32> {
-  let ro = ndc_to_world(vec4<f32>(u_material.pick_cursor.x, u_material.pick_cursor.y, 0.0, 1.0));
-  let rd = normalize(ndc_to_world(vec4<f32>(u_material.pick_cursor.x, u_material.pick_cursor.y, 1.0, 1.0)) - ro);
+  // Two ray sources: the screen cursor (pick) or an explicit world ray (probe). The explicit
+  // form exists because the cursor ray can only ever probe what is ON SCREEN \u2014 useless for
+  // "how much room is BEHIND me?", which endovascular navigation needs for reverse and for
+  // lateral clearance.
+  var ro = ndc_to_world(vec4<f32>(u_material.pick_cursor.x, u_material.pick_cursor.y, 0.0, 1.0));
+  var rd = normalize(ndc_to_world(vec4<f32>(u_material.pick_cursor.x, u_material.pick_cursor.y, 1.0, 1.0)) - ro);
+  if (u_material.probe_dir.w > 0.5) {
+    ro = u_material.probe_origin.xyz;
+    rd = normalize(u_material.probe_dir.xyz);
+  }
   let inv = vec3<f32>(1.0) / rd;
   let tb = (u_material.bmin.xyz - ro) * inv;
   let tt = (u_material.bmax.xyz - ro) * inv;
@@ -2722,6 +3030,7 @@ ${pickDispatch}
     cam[16] = width;
     cam[17] = height;
     cam[18] = height / 2 / Math.tan(fovyDeg * Math.PI / 360);
+    cam[19] = 0;
     cam[20] = eye[0];
     cam[21] = eye[1];
     cam[22] = eye[2];
@@ -2736,9 +3045,50 @@ ${pickDispatch}
    *  Uses the camera set by the last setCamera(); returns null if the ray never reaches 50%. */
   async pick(u, v) {
     if (!this.pickPipeline || !this.pickBind || !this.placed.length) return null;
-    this.mat[this.pickOff] = u * 2 - 1;
-    this.mat[this.pickOff + 1] = 1 - v * 2;
-    this.flush();
+    return this.serialise(async () => {
+      this.mat[this.pickOff] = u * 2 - 1;
+      this.mat[this.pickOff + 1] = 1 - v * 2;
+      this.mat[this.pickOff + 11] = 0;
+      this.flush();
+      return await this.tracePick();
+    });
+  }
+  /** Trace an EXPLICIT world ray and return the distance (mm) to the first point where
+   *  front-to-back opacity reaches 50%, or Infinity if it never does. Unlike pick(), the ray
+   *  is independent of the camera, so it can look backwards and sideways — which is what makes
+   *  collision "rails" possible in a first-person flythrough. */
+  async probe(origin, dir) {
+    if (!this.pickPipeline || !this.pickBind || !this.placed.length) return Infinity;
+    const l = Math.hypot(dir[0], dir[1], dir[2]) || 1;
+    return this.serialise(async () => {
+      this.mat[this.pickOff + 4] = origin[0];
+      this.mat[this.pickOff + 5] = origin[1];
+      this.mat[this.pickOff + 6] = origin[2];
+      this.mat[this.pickOff + 8] = dir[0] / l;
+      this.mat[this.pickOff + 9] = dir[1] / l;
+      this.mat[this.pickOff + 10] = dir[2] / l;
+      this.mat[this.pickOff + 11] = 1;
+      this.flush();
+      const hit = await this.tracePick();
+      this.mat[this.pickOff + 11] = 0;
+      this.flush();
+      if (!hit) return Infinity;
+      return Math.hypot(hit[0] - origin[0], hit[1] - origin[1], hit[2] - origin[2]);
+    });
+  }
+  /** Serialises pick/probe. They share ONE uniform buffer and ONE readback buffer, so
+   *  concurrent calls would overwrite each other's ray and double-map the buffer — a
+   *  Promise.all of probes silently returns garbage. Callers may fire as many as they like;
+   *  they queue here. */
+  pickChain = Promise.resolve();
+  serialise(fn) {
+    const next = this.pickChain.then(fn, fn);
+    this.pickChain = next.catch(() => {
+    });
+    return next;
+  }
+  /** The shared 1x1 render + readback behind pick() and probe(). */
+  async tracePick() {
     if (!this.pickTarget) {
       this.pickTarget = this.dev.createTexture({ size: [1, 1], format: "rgba32float", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
       this.pickReadBuf = this.dev.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
@@ -3026,10 +3376,7 @@ fn sample_field_img${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
   }
 };
 
-// examples/livecodec/livecodec-scene.ts
-var DEFAULT_BUCKET = "https://js2.jetstream-cloud.org:8001/livecodec-demo/";
-var bucketParam = typeof location !== "undefined" ? new URLSearchParams(location.search).get("bucket") : null;
-var BUCKET = bucketParam ? bucketParam.endsWith("/") ? bucketParam : bucketParam + "/" : DEFAULT_BUCKET;
+// examples/livecodec/livecodec-net.ts
 var simBps = null;
 function setSimulatedBandwidth(bitsPerSec) {
   simBps = bitsPerSec;
@@ -3074,12 +3421,28 @@ var BandwidthMeter = class {
     return { bytes, seconds, mbps: seconds > 0 ? bytes * 8 / seconds / 1e6 : 0, streams: this.stats };
   }
 };
-async function streamFetch(url, onBytes, pacer) {
+var byteCache = /* @__PURE__ */ new Map();
+var REPLAY_CHUNK = 64 * 1024;
+function cacheSize() {
+  let n = 0;
+  for (const v of byteCache.values()) n += v.byteLength;
+  return n;
+}
+async function prefetch(url, onBytes) {
+  const hit = byteCache.get(url);
+  if (hit) {
+    onBytes?.(hit.byteLength);
+    return hit.byteLength;
+  }
+  const buf = await rawFetch(url, onBytes);
+  byteCache.set(url, buf);
+  return buf.byteLength;
+}
+async function rawFetch(url, onBytes) {
   const resp = await fetch(url, { cache: "no-store" });
   if (!resp.ok) throw new Error(`HTTP ${resp.status} for ${url}`);
   if (!resp.body) {
     const buf = new Uint8Array(await resp.arrayBuffer());
-    await pacer?.admit(buf.byteLength);
     onBytes?.(buf.byteLength);
     return buf;
   }
@@ -3089,9 +3452,50 @@ async function streamFetch(url, onBytes, pacer) {
   for (; ; ) {
     const { done, value } = await rd.read();
     if (done) break;
-    await pacer?.admit(value.byteLength);
     parts.push(value);
     total += value.byteLength;
+    onBytes?.(total);
+  }
+  const all = new Uint8Array(total);
+  let o = 0;
+  for (const p of parts) {
+    all.set(p, o);
+    o += p.byteLength;
+  }
+  return all;
+}
+async function* byteChunks(url, pacer) {
+  const hit = byteCache.get(url);
+  if (hit) {
+    for (let o = 0; o < hit.byteLength; o += REPLAY_CHUNK) {
+      const c = hit.subarray(o, Math.min(o + REPLAY_CHUNK, hit.byteLength));
+      await pacer?.admit(c.byteLength);
+      yield c;
+    }
+    return;
+  }
+  const resp = await fetch(url, { cache: "no-store" });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status} for ${url}`);
+  if (!resp.body) {
+    const buf = new Uint8Array(await resp.arrayBuffer());
+    await pacer?.admit(buf.byteLength);
+    yield buf;
+    return;
+  }
+  const rd = resp.body.getReader();
+  for (; ; ) {
+    const { done, value } = await rd.read();
+    if (done) break;
+    await pacer?.admit(value.byteLength);
+    yield value;
+  }
+}
+async function streamFetch(url, onBytes, pacer) {
+  const parts = [];
+  let total = 0;
+  for await (const c of byteChunks(url, pacer)) {
+    parts.push(c);
+    total += c.byteLength;
     onBytes?.(total);
   }
   const all = new Uint8Array(total);
@@ -3107,6 +3511,11 @@ async function gunzip(gz) {
   const buf = await new Response(new Response(gz).body.pipeThrough(ds)).arrayBuffer();
   return new Uint8Array(buf);
 }
+
+// examples/livecodec/livecodec-scene.ts
+var DEFAULT_BUCKET = "https://js2.jetstream-cloud.org:8001/livecodec-demo/";
+var bucketParam = typeof location !== "undefined" ? new URLSearchParams(location.search).get("bucket") : null;
+var BUCKET = bucketParam ? bucketParam.endsWith("/") ? bucketParam : bucketParam + "/" : DEFAULT_BUCKET;
 function latentShapes(meta) {
   const f = meta.latent.fine, c = meta.latent.coarse;
   const s = {
@@ -3380,6 +3789,7 @@ var race = {
   htj2k: { t0: 0, stage: "waiting", note: "", got: 0, expected: 0, tFirst: null, tFinal: null, error: null }
 };
 var elapsed = (k) => (performance.now() - race[k].t0) / 1e3;
+var spinup = { neural: 0, htj2k: 0 };
 function updateBars() {
   for (const k of ["neural", "htj2k"]) {
     const r = race[k];
@@ -3485,6 +3895,69 @@ async function main() {
   setSimulatedBandwidth(netParam === "off" ? null : Number(netParam) * 1e6);
   const pacers = { neural: new LinkPacer(), htj2k: new LinkPacer() };
   const meters = { neural: new BandwidthMeter(), htj2k: new BandwidthMeter() };
+  const FPS = 60;
+  const MAX_DISTINCT = 320;
+  const frames = { neural: [], htj2k: [] };
+  const gen = { neural: 0, htj2k: 0 };
+  let distinctBytes = 0;
+  const touch = (key) => {
+    gen[key]++;
+  };
+  function planeBytes() {
+    const [Z2, Y2, X2] = sc.shape;
+    return (Y2 * X2 + Z2 * X2 + Z2 * Y2) * 2;
+  }
+  function thin(key) {
+    const f = frames[key];
+    const seen = /* @__PURE__ */ new Set();
+    const keep = [];
+    for (let i = 0; i < f.length; i++) {
+      if (f[i].gen !== f[i - 1]?.gen && (seen.size % 2 === 0 || i === f.length - 1)) keep.push(f[i]);
+      else if (f[i].gen === f[i - 1]?.gen) keep.push({ ...f[i], p: keep[keep.length - 1]?.p ?? f[i].p });
+      seen.add(f[i].gen);
+    }
+    frames[key] = keep;
+  }
+  function recorder(key) {
+    let lastGen = -1;
+    let last = null;
+    let distinct = 0;
+    const tick = () => {
+      const bytes2 = meters[key].summary().bytes;
+      const ms = performance.now() - race[key].t0;
+      if (gen[key] !== lastGen || last == null) {
+        const [Z2, Y2, X2] = sc.shape;
+        last = capturePlanes(sc.rows[key].vol, Z2, Y2, X2);
+        lastGen = gen[key];
+        distinct++;
+        distinctBytes += planeBytes();
+        if (distinct > MAX_DISTINCT) {
+          thin(key);
+          distinct = Math.ceil(distinct / 2);
+        }
+      }
+      frames[key].push({ ms, bytes: bytes2, gen: lastGen, p: last });
+    };
+    tick();
+    const id = setInterval(tick, 1e3 / FPS);
+    return { stop: () => {
+      clearInterval(id);
+      tick();
+    } };
+  }
+  function capturePlanes(vol, Z2, Y2, X2) {
+    const zc = Z2 >> 1, yc = Y2 >> 1, xc = X2 >> 1;
+    const ax = new Int16Array(Y2 * X2), co = new Int16Array(Z2 * X2), sa = new Int16Array(Z2 * Y2);
+    const base = zc * Y2 * X2;
+    for (let i = 0; i < Y2 * X2; i++) ax[i] = vol[base + i];
+    for (let z = 0; z < Z2; z++) {
+      const rowOff = z * Y2 * X2 + yc * X2;
+      for (let x = 0; x < X2; x++) co[z * X2 + x] = vol[rowOff + x];
+      const colOff = z * Y2 * X2 + xc;
+      for (let y = 0; y < Y2; y++) sa[z * Y2 + y] = vol[colOff + y * X2];
+    }
+    return { ax, co, sa };
+  }
   const reportIfDone = () => {
     if (race.neural.tFinal == null || race.htj2k.tFinal == null) return;
     const ns = meters.neural.summary(), hs = meters.htj2k.summary();
@@ -3685,6 +4158,9 @@ async function main() {
       const declared = version?.heads;
       const previewP = (declared ? Promise.resolve(declared.includes("preview") ? true : false) : fetch(modelBase + "decoder25-preview.graph.json", { method: "HEAD" }).then((resp) => resp.ok).catch(() => false)).then((has) => has ? loadNet("decoder25-preview") : null).catch(() => null);
       const netP = loadNet("decoder25");
+      netP.then(() => {
+        spinup.neural = performance.now() - race.neural.t0;
+      });
       netP.catch(() => {
       });
       previewP.catch(() => {
@@ -3714,6 +4190,7 @@ async function main() {
         const z0 = ch * sh.chunkZ;
         mapOutputToHU(out, vol, z0, Z, sh, dec, scale2);
         sc.writeSlab("neural", z0, Math.min(Z, z0 + sh.chunkZ));
+        touch("neural");
       };
       const tDec = performance.now();
       for (let ch = 0; ch < sh.chunks; ch++) {
@@ -3754,6 +4231,7 @@ async function main() {
         console.warn(`dc grid size ${dcGrid.length} does not match the volume shape \u2014 skipping DC correction`);
       }
       sc.writeSlab("neural", 0, Z);
+      touch("neural");
       requestDraw();
       if (bytes.residual) {
         r.stage = "residual";
@@ -3797,24 +4275,20 @@ async function main() {
             const u16 = new Uint16Array(out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength));
             writeResidualPlane(e.z, 0, u16);
           };
-          const resp = await fetch(neuralBase + "residual.bin", { cache: "no-store" });
-          if (!resp.ok || !resp.body) throw new Error(`residual.bin HTTP ${resp.status}`);
           const mRes = meters.neural.begin("residual.bin");
-          const rrd = resp.body.getReader();
-          for (; ; ) {
-            const { done, value } = await rrd.read();
-            if (done) break;
-            await pacers.neural.admit(value.byteLength);
+          for await (const value of byteChunks(neuralBase + "residual.bin", pacers.neural)) {
             mRes.add(value.byteLength);
             rbuf.set(value, received);
             received += value.byteLength;
             r.got = received;
             while (next < ridx.length && ridx[next].offset + ridx[next].bytes <= received) {
               applySlice(ridx[next]);
+              touch("neural");
               next++;
               r.note = `${next}/${ridx.length} slices`;
               if (next - flushed >= 32) {
                 sc.writeSlab("neural", flushed, next);
+                touch("neural");
                 flushed = next;
                 requestDraw();
               }
@@ -3825,6 +4299,7 @@ async function main() {
             next++;
           }
           sc.writeSlab("neural", flushed, Z);
+          touch("neural");
           requestDraw();
         }
         r.note = "near-lossless";
@@ -3920,6 +4395,7 @@ async function main() {
       }
       if (maxZ < 0) return;
       sc.writeSlab(row, minZ, maxZ + 1);
+      touch(row);
       let full = R;
       for (let si = 0; si < nS; si++) if (applied[si] < full) full = applied[si];
       if (full >= 1 && r.tFirst == null) r.tFirst = elapsed(row);
@@ -3960,12 +4436,15 @@ async function main() {
     try {
       const factory = globalThis.Module;
       if (!factory) throw new Error("openjph script did not load");
+      const ojEntry = performance.getEntriesByType("resource").find((e) => e.name.includes("openjph"));
+      const ojFetchMs = ojEntry ? ojEntry.duration : 0;
       const openjphP = factory();
       const idxResp = await fetch(htj2kBase + "index.json", { cache: "no-store" });
       if (!idxResp.ok) throw new Error(`index.json HTTP ${idxResp.status}`);
       const rawIdx = await idxResp.json();
       const openjph = await openjphP;
       const decoder = new openjph.HTJ2KDecoder();
+      spinup.htj2k = performance.now() - race.htj2k.t0 + ojFetchMs;
       const vol = sc.rows.htj2k.vol;
       const sliceSize = X * Y;
       if (!Array.isArray(rawIdx) && rawIdx.layout === "res-progressive") {
@@ -4007,24 +4486,20 @@ async function main() {
       const flush = () => {
         if (next <= flushed) return;
         sc.writeSlab("htj2k", flushed, next);
+        touch("htj2k");
         flushed = next;
         if (r.tFirst == null) r.tFirst = elapsed("htj2k");
         requestDraw();
       };
-      const resp = await fetch(htj2kBase + "slices.bin", { cache: "no-store" });
-      if (!resp.ok || !resp.body) throw new Error(`slices.bin HTTP ${resp.status}`);
       const mSl = meters.htj2k.begin("slices.bin");
-      const rd = resp.body.getReader();
-      for (; ; ) {
-        const { done, value } = await rd.read();
-        if (done) break;
-        await pacers.htj2k.admit(value.byteLength);
+      for await (const value of byteChunks(htj2kBase + "slices.bin", pacers.htj2k)) {
         mSl.add(value.byteLength);
         buf.set(value, received);
         received += value.byteLength;
         r.got = received;
         while (next < idx.length && idx[next].offset + idx[next].bytes <= received) {
           decodeSlice(idx[next]);
+          touch("htj2k");
           next++;
           r.note = `${next}/${idx.length} slices`;
           if (next - flushed >= 32) flush();
@@ -4061,21 +4536,72 @@ async function main() {
       updateBars();
     }
   }, 100);
+  async function prefetchAll() {
+    const urls = [
+      neuralBase + "coarse.gz",
+      neuralBase + "fine.gz",
+      neuralBase + "dc.gz",
+      neuralBase + "residual-index.json",
+      neuralBase + "residual.bin",
+      htj2kBase + "index.json",
+      htj2kBase + "slices.bin"
+    ];
+    let done = 0;
+    for (const u of urls) {
+      const short = u.slice(u.lastIndexOf("/") + 1);
+      status(`caching ${short} (${++done}/${urls.length})\u2026`);
+      try {
+        await prefetch(u);
+      } catch (e) {
+        console.warn("prefetch skipped", u, e);
+      }
+    }
+    status(`cached ${(cacheSize() / 1e6).toFixed(1)} MB \u2014 replaying at the simulated rate`);
+  }
+  function buildCompare() {
+    makeSnapshotViewer({
+      shape: sc.shape,
+      spacing: scan.spacing,
+      win: sc.win,
+      lev: sc.lev,
+      frames,
+      keys,
+      el
+    });
+  }
+  el("cmpopen").addEventListener("click", () => {
+    if (!frames.neural.length && !frames.htj2k.length) {
+      status("nothing recorded yet \u2014 let a race finish");
+      return;
+    }
+    el("cmp").classList.add("on");
+    buildCompare();
+  });
+  el("cmpclose").addEventListener("click", () => el("cmp").classList.remove("on"));
+  const record = async (key, run) => {
+    const rec = recorder(key);
+    try {
+      await run();
+    } finally {
+      rec.stop();
+    }
+  };
+  if (raceMode === "cached") await prefetchAll();
   if (raceMode === "live") {
     const start = performance.now();
     race.neural.t0 = start;
     race.htj2k.t0 = start;
     status(`racing on ${scan.id} (live, simultaneous \u2014 times include contention)`);
-    await Promise.all([runNeural(), runHTJ2K()]);
+    await Promise.all([record("neural", runNeural), record("htj2k", runHTJ2K)]);
   } else {
     status(`measuring neural on ${scan.id} (fair mode \u2014 one arm at a time)\u2026`);
     race.neural.t0 = performance.now();
-    await runNeural();
+    await record("neural", runNeural);
     updateBars();
     status(`measuring HTJ2K on ${scan.id}\u2026`);
     race.htj2k.t0 = performance.now();
-    await runHTJ2K();
-    status(`${scan.id} \u2014 fair mode: each arm timed alone. Scroll a slice, drag a 3D to orbit.`);
+    await record("htj2k", runHTJ2K);
+    status(raceMode === "cached" ? `${scan.id} \u2014 cached replay at the simulated rate (${(cacheSize() / 1e6).toFixed(1)} MB held). Change net or encoding to re-race instantly. Scroll a slice, drag a 3D to orbit.` : `${scan.id} \u2014 fair mode: each arm timed alone. Scroll a slice, drag a 3D to orbit.`);
   }
   updateBars();
   drawAll();
