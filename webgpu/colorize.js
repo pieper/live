@@ -2510,13 +2510,13 @@ function presetLUT(name) {
 async function buildColorizeScene(gpu2, base, format, onProgress2) {
   const manifest = await (await fetch(base + "colorize.json")).json();
   const blobBase = base + "blobs/";
-  const ctTotal2 = manifest.ct.bytes ?? 0, labTotal = manifest.labels.bytes ?? 0;
-  const labZ = await fetchZarrVolume(
-    blobBase,
-    manifest.labels,
-    (n) => onProgress2?.({ bytes: n, total: labTotal, what: "labels" })
-  );
-  onProgress2?.({ bytes: labTotal, total: labTotal, what: "labels", done: true });
+  const ctTotal = manifest.ct.bytes ?? 0, labTotal = manifest.labels.bytes ?? 0;
+  let labGot = 0;
+  const labZ = await fetchZarrVolume(blobBase, manifest.labels, (n) => {
+    labGot += n;
+    onProgress2?.({ bytes: labGot, total: labTotal, what: "labels" });
+  });
+  onProgress2?.({ bytes: Math.max(labGot, labTotal), total: labTotal, what: "labels", done: true });
   const [nz, ny, nx] = manifest.ct.shape;
   const dims = [nx, ny, nz];
   let preset = "CT-Soft-Tissue";
@@ -2552,15 +2552,15 @@ async function buildColorizeScene(gpu2, base, format, onProgress2) {
   const ctReady = new Promise((res) => {
     onCtArrived = res;
   });
-  const ctFetch = fetchZarrVolume(
-    blobBase,
-    manifest.ct,
-    (n) => onProgress2?.({ bytes: n, total: ctTotal2, what: "ct" })
-  ).then((ctZ) => {
+  let ctGot = 0;
+  const ctFetch = fetchZarrVolume(blobBase, manifest.ct, (n) => {
+    ctGot += n;
+    onProgress2?.({ bytes: ctGot, total: ctTotal, what: "ct" });
+  }).then((ctZ) => {
     field.setCT(ctZ.data);
     field.setCtModulation(0.55);
     field.setContextOpacity(0.12);
-    onProgress2?.({ bytes: ctTotal2, total: ctTotal2, what: "ct", done: true });
+    onProgress2?.({ bytes: Math.max(ctGot, ctTotal), total: ctTotal, what: "ct", done: true });
     onCtArrived?.();
   });
   void ctFetch;
@@ -3341,7 +3341,7 @@ function mountAdaptive3d(opts) {
     if (!sc2) return;
     const { w: vw, h: vh } = opts.size();
     if (!vw || !vh) return;
-    const s = Math.min(movingCap, budget.scale(vw, vh)), t02 = performance.now();
+    const s = Math.min(movingCap, budget.scale(vw, vh)), t0 = performance.now();
     if (s > 0.98) {
       opts.setCamera(sc2, vw, vh);
       sc2.renderToView(opts.view(), vw, vh);
@@ -3351,7 +3351,7 @@ function mountAdaptive3d(opts) {
       sc2.renderUpscaled(opts.view(), rw, rh, vw, vh);
     }
     opts.gpu.device.queue.onSubmittedWorkDone().then(() => {
-      const ms = performance.now() - t02;
+      const ms = performance.now() - t0;
       budget.update(ms);
       dbgTick("mov", ms, s);
     });
@@ -3362,10 +3362,10 @@ function mountAdaptive3d(opts) {
     if (!sc2) return;
     const { w: vw, h: vh } = opts.size();
     if (!vw || !vh) return;
-    const t02 = performance.now();
+    const t0 = performance.now();
     opts.setCamera(sc2, vw, vh);
     sc2.renderAccum(opts.view(), vw, vh, reset);
-    if (DBG) opts.gpu.device.queue.onSubmittedWorkDone().then(() => dbgTick("set", performance.now() - t02, 1));
+    if (DBG) opts.gpu.device.queue.onSubmittedWorkDone().then(() => dbgTick("set", performance.now() - t0, 1));
     opts.onFrame?.();
   };
   const loop = mountAdaptiveLoop({
@@ -4029,22 +4029,21 @@ var loadPct = $("loadpct");
 var loadWrap = $("loadwrap");
 var loadTitle = $("loadtitle");
 var loadSub = $("loadsub");
-var ctBytes = 0;
-var ctTotal = 0;
-var t0 = performance.now();
+var ctStart = 0;
+var fmt = (b) => (b / 1048576).toFixed(1);
 var onProgress = (p) => {
+  const frac = p.total ? Math.min(1, p.bytes / p.total) : 0;
+  barFill.style.width = `${Math.max(2, frac * 100).toFixed(1)}%`;
   if (p.what === "labels") {
-    if (!p.done) loadPct.textContent = `segmentation ${(p.bytes / 1048576).toFixed(1)} MB`;
+    loadPct.textContent = p.done ? "segmentation ready \u2014 fetching the CT\u2026" : `segmentation  ${fmt(p.bytes)} / ${fmt(p.total)} MB`;
     return;
   }
-  ctBytes = p.bytes;
-  ctTotal = p.total || ctTotal;
-  const frac = ctTotal ? Math.min(1, ctBytes / ctTotal) : 0;
-  barFill.style.width = `${Math.max(2, frac * 100).toFixed(1)}%`;
-  const secs = (performance.now() - t0) / 1e3;
-  const rate = ctBytes / Math.max(secs, 1e-3) / 1048576;
-  const left = rate > 0.05 && ctTotal ? Math.max(0, (ctTotal - ctBytes) / 1048576 / rate) : NaN;
-  loadPct.textContent = `${(ctBytes / 1048576).toFixed(1)} / ${(ctTotal / 1048576).toFixed(1)} MB  \xB7  ${(frac * 100).toFixed(0)}%  \xB7  ${rate.toFixed(1)} MB/s` + (Number.isFinite(left) ? `  \xB7  ${left.toFixed(0)}s left` : "");
+  if (!ctStart) ctStart = performance.now();
+  const secs = (performance.now() - ctStart) / 1e3;
+  const rate = secs > 0.25 ? p.bytes / secs / 1048576 : 0;
+  const left = rate > 0.05 ? (p.total - p.bytes) / 1048576 / rate : NaN;
+  const settling = p.done || frac >= 0.995;
+  loadPct.textContent = `${fmt(p.bytes)} / ${fmt(p.total)} MB  \xB7  ${(frac * 100).toFixed(0)}%` + (rate > 0 && !settling ? `  \xB7  ${rate.toFixed(1)} MB/s` : "") + (Number.isFinite(left) && !settling ? `  \xB7  ${left < 1 ? "<1" : left.toFixed(0)}s left` : "") + (p.done ? "  \xB7  decoding" : "");
 };
 status("loading segmentation\u2026");
 var sc = await buildColorizeScene(gpu, DATA_BASE, srgb, onProgress);
