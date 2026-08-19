@@ -1760,11 +1760,16 @@ function makeSnapshotViewer(cfg) {
         const src = pi === 0 ? s.ax : pi === 1 ? s.co : s.sa;
         const img = ctx.createImageData(cv.width, cv.height);
         const d = img.data;
-        for (let j = 0; j < src.length; j++) {
-          const g = Math.max(0, Math.min(255, (src[j] - lo) / span * 255)) | 0;
-          const o = j * 4;
-          d[o] = d[o + 1] = d[o + 2] = g;
-          d[o + 3] = 255;
+        const flipY = pi !== 0;
+        const W = cv.width, H = cv.height;
+        for (let y = 0; y < H; y++) {
+          const sy2 = flipY ? H - 1 - y : y;
+          for (let x = 0; x < W; x++) {
+            const g = Math.max(0, Math.min(255, (src[sy2 * W + x] - lo) / span * 255)) | 0;
+            const o = (y * W + x) * 4;
+            d[o] = d[o + 1] = d[o + 2] = g;
+            d[o + 3] = 255;
+          }
         }
         ctx.putImageData(img, 0, 0);
       });
@@ -1840,6 +1845,152 @@ function makeSnapshotViewer(cfg) {
   draw(+slider.value);
 }
 
+// examples/livecodec/livecodec-range.ts
+var TOP = 1 << 24;
+var RangeDecoder = class {
+  constructor(buf) {
+    this.buf = buf;
+    this.byte();
+    for (let i = 0; i < 4; i++) this.code = (this.code << 8 | this.byte()) >>> 0;
+  }
+  pos = 0;
+  range = 4294967295;
+  code = 0;
+  byte() {
+    return this.pos < this.buf.length ? this.buf[this.pos++] : 0;
+  }
+  /** `cums` holds K+1 cumulative frequencies; returns the decoded symbol. */
+  decode(cums, K) {
+    const tot = cums[K];
+    const r = Math.floor(this.range / tot);
+    let v = Math.floor(this.code / r);
+    if (v > tot - 1) v = tot - 1;
+    let s = 0;
+    while (cums[s + 1] <= v) s++;
+    this.code = this.code - r * cums[s] >>> 0;
+    this.range = r * (cums[s + 1] - cums[s]);
+    while (this.range < TOP) {
+      this.code = this.code * 256 + this.byte() >>> 0;
+      this.range = this.range * 256 >>> 0;
+    }
+    return s;
+  }
+};
+var AdaptiveModel = class {
+  freq;
+  cums;
+  K;
+  inc = 24;
+  limit = 1 << 13;
+  constructor(nCtx, K) {
+    this.K = K;
+    this.freq = new Int32Array(nCtx * K).fill(1);
+    this.cums = new Int32Array(K + 1);
+  }
+  cumsFor(c) {
+    const base = c * this.K;
+    this.cums[0] = 0;
+    for (let i = 0; i < this.K; i++) this.cums[i + 1] = this.cums[i] + this.freq[base + i];
+    return this.cums;
+  }
+  update(c, s) {
+    const base = c * this.K;
+    this.freq[base + s] += this.inc;
+    let tot = 0;
+    for (let i = 0; i < this.K; i++) tot += this.freq[base + i];
+    if (tot > this.limit) {
+      for (let i = 0; i < this.K; i++) this.freq[base + i] = this.freq[base + i] + 1 >> 1;
+    }
+  }
+};
+var NBR = 4;
+function decodeStage(buf, prevQ, prevN, q, K, dims) {
+  const [C, D, H, W] = dims;
+  const dec = new RangeDecoder(buf);
+  const model = new AdaptiveModel(NBR * NBR * NBR * NBR, K);
+  const out = new Int32Array(prevQ.length);
+  const sc = (a) => Math.floor(a * NBR / Math.max(1, q));
+  const hereScale = Math.max(1, prevN);
+  const HW = H * W, DHW = D * HW;
+  for (let k = 0; k < C; k++) {
+    for (let z = 0; z < D; z++) {
+      for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+          const i = k * DHW + z * HW + y * W + x;
+          const left = x ? sc(out[i - 1]) : 0;
+          const up = y ? sc(out[i - W]) : 0;
+          const pz = z ? sc(out[i - HW]) : 0;
+          const here = Math.floor(prevQ[i] * NBR / hereScale);
+          const c = ((here * NBR + left) * NBR + up) * NBR + pz;
+          const s = dec.decode(model.cumsFor(c), K);
+          model.update(c, s);
+          out[i] = Math.floor(prevQ[i] * q / hereScale) + s;
+        }
+      }
+    }
+  }
+  return out;
+}
+function bucketsToCodes(q, nBuckets, levels) {
+  const out = new Float32Array(q.length);
+  const w = levels / nBuckets;
+  for (let i = 0; i < q.length; i++) {
+    out[i] = nBuckets >= levels ? q[i] : Math.min(levels - 1, (q[i] + 0.5) * w - 0.5);
+  }
+  return out;
+}
+function decodeFineStage(payload, index, levels, prev, prevN, chunks, Df, Hf, Wf) {
+  const per = Df * Hf * Wf;
+  const C = levels.length;
+  const out = new Float32Array(chunks * C * per);
+  const buckets = [];
+  let off = 0;
+  for (let c = 0; c < C; c++) {
+    const n = index.parts[c];
+    const q = index.buckets[c];
+    let b;
+    if (n === 0) {
+      b = prev[c];
+    } else {
+      const slice = payload.subarray(off, off + n);
+      b = decodeStage(slice, prev[c], prevN[c], q, index.K[c], [chunks, Df, Hf, Wf]);
+      off += n;
+    }
+    buckets.push(b);
+    const codes = bucketsToCodes(b, q, levels[c]);
+    for (let ch = 0; ch < chunks; ch++) {
+      const dst = ch * C * per + c * per;
+      const src = ch * per;
+      for (let i = 0; i < per; i++) out[dst + i] = codes[src + i];
+    }
+  }
+  return { buckets, codes: out };
+}
+function dequantFine(codes, chunk, s, dec) {
+  const { C, Df, Hf, Wf } = s;
+  const per = Df * Hf * Wf;
+  const src = chunk * C * per;
+  const out = new Float32Array(C * per);
+  let o = 0;
+  for (let c = 0; c < C; c++) {
+    const off = dec.offset[c], inv = 1 / dec.half[c];
+    const cb = src + c * per;
+    for (let i = 0; i < per; i++) out[o++] = (codes[cb + i] - off) * inv;
+  }
+  return out;
+}
+function dequantFineFloat(codes, chunk, C, per, offset, half) {
+  const src = chunk * C * per;
+  const out = new Float32Array(C * per);
+  let o = 0;
+  for (let c = 0; c < C; c++) {
+    const off = offset[c], inv = 1 / half[c];
+    const cb = src + c * per;
+    for (let i = 0; i < per; i++) out[o++] = (codes[cb + i] - off) * inv;
+  }
+  return out;
+}
+
 // render/demos/view-grid.ts
 function attachDoubleClick(canvas, onDbl) {
   let last = 0, lx = 0, ly = 0;
@@ -1877,7 +2028,8 @@ var DEFAULT_HELP = [
     ["Shift + Space", "Toggle reverse cruise"],
     ["Escape", "Stop"],
     ["Left-drag", "Look around"],
-    ["Shift + click", "Autopilot target"]
+    ["Shift + click", "Autopilot target"],
+    ["Speed slider", "Travel speed in mm/s (live, applies mid-flight)"]
   ] },
   { title: "Slice views", rows: [
     ["Wheel / Left-drag", "Scroll through slices"],
@@ -3571,19 +3723,6 @@ function dequantCoarseUp(codes, chunk, s, dec) {
   }
   return out;
 }
-function dequantFine(codes, chunk, s, dec) {
-  const { C, Df, Hf, Wf } = s;
-  const per = Df * Hf * Wf;
-  const src = chunk * C * per;
-  const out = new Float32Array(C * per);
-  let o = 0;
-  for (let c = 0; c < C; c++) {
-    const off = dec.offset[c], inv = 1 / dec.half[c];
-    const cb = src + c * per;
-    for (let i = 0; i < per; i++) out[o++] = (codes[cb + i] - off) * inv;
-  }
-  return out;
-}
 function mapOutputToHU(out, vol, z0, Z, s, dec, scale2 = 1) {
   const zw = Math.min(s.chunkZ, Z - z0);
   const hu = (dec.hu_max - dec.hu_min) / 2;
@@ -3846,7 +3985,11 @@ async function main() {
     const fmtParams = (p) => typeof p === "number" ? p >= 1e6 ? `${(p / 1e6).toFixed(1)}M` : `${Math.round(p / 1e3)}k` : p;
     verSel.add(new Option("v3 \xB7 31 vols (baseline)", ""));
     for (const v of versions) {
-      verSel.add(new Option(`${v.tag} \xB7 ${fmtSteps(v.steps)} steps \xB7 ${fmtParams(v.params)}`, v.tag));
+      const prog = v.staged ? " \xB7 progressive" : "";
+      verSel.add(new Option(
+        `${v.tag} \xB7 ${fmtSteps(v.steps)} steps \xB7 ${fmtParams(v.params)}${prog}`,
+        v.tag
+      ));
     }
     verSel.value = version?.tag ?? "";
     verSel.addEventListener("change", () => {
@@ -4202,30 +4345,93 @@ async function main() {
       console.log(`livecodec: coarse decode ${sh.chunks} chunks in ${((performance.now() - tDec) / 1e3).toFixed(1)} s (${pscale > 1 ? `preview head, ${sh.W / pscale}px` : "full head"})`);
       r.note = "";
       requestDraw();
+      const staged = meta.staged;
       r.stage = "fine+dc";
-      r.expected = bytes.fine + bytes.dc;
+      r.expected = (staged ? staged.bytes.reduce((a, b) => a + b, 0) : bytes.fine) + bytes.dc;
       r.got = 0;
       let fGot = 0, dGot = 0;
-      const [fineGz, dcGz] = await Promise.all([
-        streamFetch(neuralBase + "fine.gz", /* @__PURE__ */ ((m) => (n) => {
-          fGot = n;
-          r.got = fGot + dGot;
-          m.at(n);
-        })(meters.neural.begin("fine.gz")), pacers.neural),
-        streamFetch(neuralBase + "dc.gz", /* @__PURE__ */ ((m) => (n) => {
+      const dcP = streamFetch(
+        neuralBase + "dc.gz",
+        /* @__PURE__ */ ((m) => (n) => {
           dGot = n;
           r.got = fGot + dGot;
           m.at(n);
-        })(meters.neural.begin("dc.gz")), pacers.neural)
-      ]);
-      const fineCodes = await gunzip(fineGz);
-      const dcBytes = await gunzip(dcGz);
-      const dcGrid = new Int8Array(dcBytes.buffer, dcBytes.byteOffset, dcBytes.byteLength);
-      for (let ch = 0; ch < sh.chunks; ch++) {
-        r.note = `refine ${ch + 1}/${sh.chunks}`;
-        await decodeChunk(net, 1, dequantFine(fineCodes, ch, sh, dec), ch);
-        requestDraw();
+        })(
+          meters.neural.begin("dc.gz")
+        ),
+        pacers.neural
+      );
+      if (staged) {
+        let prev = dec.levels.map(() => new Int32Array(
+          sh.chunks * sh.Df * sh.Hf * sh.Wf
+        ));
+        let prevN = dec.levels.map(() => 1);
+        const per = sh.Df * sh.Hf * sh.Wf;
+        for (let s = 1; s <= staged.stages; s++) {
+          const idxP = fetch(neuralBase + `fine-s${s}.json`).then((x) => x.json());
+          const mS = meters.neural.begin(`fine-s${s}.bin`);
+          const buf = await streamFetch(
+            neuralBase + `fine-s${s}.bin`,
+            /* @__PURE__ */ ((base) => (n) => {
+              fGot = base + n;
+              r.got = fGot + dGot;
+              mS.at(n);
+            })(fGot),
+            pacers.neural
+          );
+          const idx = await idxP;
+          r.note = `stage ${s}/${staged.stages}`;
+          const tS = performance.now();
+          const out = decodeFineStage(
+            buf,
+            idx,
+            dec.levels,
+            prev,
+            prevN,
+            sh.chunks,
+            sh.Df,
+            sh.Hf,
+            sh.Wf
+          );
+          const entropyMs = performance.now() - tS;
+          prev = out.buckets;
+          prevN = idx.buckets;
+          for (let ch = 0; ch < sh.chunks; ch++) {
+            r.note = `stage ${s}/${staged.stages} \xB7 chunk ${ch + 1}/${sh.chunks}`;
+            await decodeChunk(net, 1, dequantFineFloat(
+              out.codes,
+              ch,
+              sh.C,
+              per,
+              dec.offset,
+              dec.half
+            ), ch);
+            touch("neural");
+            requestDraw();
+          }
+          console.log(`livecodec: fine stage ${s} \u2014 ${(buf.byteLength / 1024).toFixed(0)} KB, entropy decode ${entropyMs.toFixed(0)} ms, neural decode ${(performance.now() - tS - entropyMs).toFixed(0)} ms`);
+        }
+      } else {
+        const fineGz = await streamFetch(
+          neuralBase + "fine.gz",
+          /* @__PURE__ */ ((m) => (n) => {
+            fGot = n;
+            r.got = fGot + dGot;
+            m.at(n);
+          })(
+            meters.neural.begin("fine.gz")
+          ),
+          pacers.neural
+        );
+        const fineCodes = await gunzip(fineGz);
+        for (let ch = 0; ch < sh.chunks; ch++) {
+          r.note = `refine ${ch + 1}/${sh.chunks}`;
+          await decodeChunk(net, 1, dequantFine(fineCodes, ch, sh, dec), ch);
+          requestDraw();
+        }
       }
+      const dcBytes = await gunzip(await dcP);
+      const dcGrid = new Int8Array(dcBytes.buffer, dcBytes.byteOffset, dcBytes.byteLength);
       r.note = "dc correction";
       if (!applyDcCorrection(vol, scan.shape, dcGrid)) {
         console.warn(`dc grid size ${dcGrid.length} does not match the volume shape \u2014 skipping DC correction`);
@@ -4541,6 +4747,7 @@ async function main() {
       neuralBase + "coarse.gz",
       neuralBase + "fine.gz",
       neuralBase + "dc.gz",
+      ...meta.staged ? Array.from({ length: meta.staged.stages }, (_, i) => [neuralBase + `fine-s${i + 1}.bin`, neuralBase + `fine-s${i + 1}.json`]).flat() : [],
       neuralBase + "residual-index.json",
       neuralBase + "residual.bin",
       htj2kBase + "index.json",
