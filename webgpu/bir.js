@@ -1784,6 +1784,11 @@ var ImageField = class {
   getClim() {
     return [this.clim[0], this.clim[1]];
   }
+  /** Phong shading tuple [ka, kd, ks, shininess] — re-packed into the material uniform next
+   *  render (VR presets carry their own lighting). [1,0,0,1] = flat emission (no shading). */
+  setShade(shade) {
+    this.shade = [shade[0], shade[1], shade[2], shade[3]];
+  }
   origP2t;
   // sampling matrix + box at identity, for setWorldTransform
   origBox;
@@ -3858,7 +3863,13 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
   const dims = ct.dims;
   const data = ct.vol instanceof Float32Array ? ct.vol : Float32Array.from(ct.vol);
   const clim = [ct.lev - ct.win / 2, ct.lev + ct.win / 2];
-  const baseVolLut = modalityLUT(ct.modality);
+  const grayLut = modalityLUT(ct.modality);
+  const grayClim = [clim[0], clim[1]];
+  const grayShade = [0.25, 0.7, 0.45, 20];
+  let baseVolLut = grayLut;
+  let baseClim = [clim[0], clim[1]];
+  let baseShade = [grayShade[0], grayShade[1], grayShade[2], grayShade[3]];
+  let volShift = 0;
   const scaledVolLut = (o) => {
     const l = baseVolLut.slice();
     for (let i = 0; i < 256; i++) l[i * 4 + 3] = Math.round(l[i * 4 + 3] * o);
@@ -3867,7 +3878,7 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
   const volumeField = new ImageField(dev, data, dims, [1, 1, 1], baseVolLut, {
     clim,
     ijkToRAS: ct.ijkToRAS,
-    shade: [0.25, 0.7, 0.45, 20]
+    shade: baseShade
   });
   const segments = [];
   const palette = new Float32Array(256 * 4);
@@ -3975,6 +3986,27 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
       if (was !== showVolume) rebuild();
     },
     volumeOpacity: () => volumeOpacity,
+    setVolumePreset(bake) {
+      if (bake) {
+        baseVolLut = bake.lut;
+        baseClim = [bake.clim[0], bake.clim[1]];
+        baseShade = bake.shade;
+      } else {
+        baseVolLut = grayLut;
+        baseClim = [grayClim[0], grayClim[1]];
+        baseShade = grayShade;
+      }
+      volumeField.setLUT(scaledVolLut(volumeOpacity));
+      volumeField.setClim(baseClim[0] + volShift, baseClim[1] + volShift);
+      volumeField.setShade(baseShade);
+      scene.syncUniforms();
+    },
+    setVolumeShift(hu) {
+      volShift = hu;
+      volumeField.setClim(baseClim[0] + volShift, baseClim[1] + volShift);
+      scene.syncUniforms();
+    },
+    volumeShift: () => volShift,
     setSegOpacity(o) {
       segLayerOpacity = Math.max(0, Math.min(1, o));
       const was = showSeg;
@@ -5138,9 +5170,62 @@ function installChrome(opts) {
       }
       const row = document.createElement("div");
       row.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:14px;padding:5px 0;";
+      if (c.slider) {
+        row.style.cssText = "display:flex;flex-direction:column;gap:4px;padding:6px 0;";
+        const top = document.createElement("div");
+        top.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:12px;";
+        const lab2 = document.createElement("span");
+        lab2.textContent = c.label;
+        const val = document.createElement("span");
+        val.style.cssText = "font:600 11px ui-monospace,Menlo,monospace;color:#9fe9ff;font-variant-numeric:tabular-nums;";
+        top.appendChild(lab2);
+        top.appendChild(val);
+        const inp = document.createElement("input");
+        inp.type = "range";
+        inp.min = String(c.slider.min);
+        inp.max = String(c.slider.max);
+        inp.step = String(c.slider.step ?? 1);
+        inp.value = String(c.slider.get());
+        inp.style.cssText = "width:100%;accent-color:#54c6f0;cursor:pointer;";
+        const fmt = c.slider.format ?? ((v) => String(Math.round(v)));
+        const paint = () => {
+          val.textContent = fmt(c.slider.get());
+        };
+        inp.oninput = () => {
+          c.slider.set(parseFloat(inp.value));
+          paint();
+          opts.onChange?.();
+        };
+        inp.onpointerdown = (e) => e.stopPropagation();
+        paint();
+        row.appendChild(top);
+        row.appendChild(inp);
+        pop.appendChild(row);
+        rows.push({ c, row, repaint: () => {
+          inp.value = String(c.slider.get());
+          paint();
+        } });
+        continue;
+      }
       const lab = document.createElement("span");
       lab.textContent = c.label;
       row.appendChild(lab);
+      if (c.button) {
+        const pill = document.createElement("span");
+        pill.style.cssText = "max-width:60%;border-radius:7px;padding:4px 10px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font:600 12px -apple-system,system-ui,sans-serif;color:#eaf0ff;background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.20);";
+        pill.textContent = c.button.text();
+        pill.onclick = (e) => {
+          e.stopPropagation();
+          c.button.run();
+        };
+        pill.onpointerdown = (e) => e.stopPropagation();
+        row.appendChild(pill);
+        pop.appendChild(row);
+        rows.push({ c, row, repaint: () => {
+          pill.textContent = c.button.text();
+        } });
+        continue;
+      }
       if (c.getOpacity && c.setOpacity) {
         const box = document.createElement("span");
         box.style.cssText = OPBOX_CSS;
@@ -6385,6 +6470,186 @@ globalThis.__slicerLiveIdc = {
   downloadStudyWithDialog
 };
 
+// render/scene-volume.ts
+function interpTF(tf, s, comps) {
+  if (!tf.length) return new Array(comps).fill(0);
+  if (s <= tf[0][0]) return tf[0].slice(1, 1 + comps);
+  const last = tf[tf.length - 1];
+  if (s >= last[0]) return last.slice(1, 1 + comps);
+  for (let i = 1; i < tf.length; i++) {
+    if (s <= tf[i][0]) {
+      const a = tf[i - 1], b = tf[i];
+      const u = (s - a[0]) / Math.max(b[0] - a[0], 1e-9);
+      return Array.from({ length: comps }, (_, c) => a[1 + c] + u * (b[1 + c] - a[1 + c]));
+    }
+  }
+  return last.slice(1, 1 + comps);
+}
+function lutFromTransferFunctions(colorTF, opacityTF, clim) {
+  const lut = new Uint8Array(256 * 4);
+  for (let i = 0; i < 256; i++) {
+    const s = clim[0] + i / 255 * (clim[1] - clim[0]);
+    const [r, g, b] = interpTF(colorTF, s, 3);
+    const [a] = interpTF(opacityTF, s, 1);
+    lut[i * 4 + 0] = Math.round(Math.max(0, Math.min(1, r)) * 255);
+    lut[i * 4 + 1] = Math.round(Math.max(0, Math.min(1, g)) * 255);
+    lut[i * 4 + 2] = Math.round(Math.max(0, Math.min(1, b)) * 255);
+    lut[i * 4 + 3] = Math.round(Math.max(0, Math.min(1, a)) * 255);
+  }
+  return lut;
+}
+
+// render/ct-vr-presets.ts
+var CT_VR_PRESETS = [
+  {
+    name: "CT-AAA",
+    label: "CT AAA (angio)",
+    shade: true,
+    light: [0.1, 0.9, 0.2, 10],
+    colorTF: [[-3024, 0, 0, 0], [143.556, 0.6157, 0.3569, 0.1843], [166.222, 0.8824, 0.6039, 0.2902], [214.389, 1, 1, 1], [419.736, 1, 0.937, 0.9545], [3071, 0.8275, 0.6588, 1]],
+    opacityTF: [[-3024, 0], [143.556, 0], [166.222, 0.6863], [214.389, 0.6961], [419.736, 0.8333], [3071, 0.8039]]
+  },
+  {
+    name: "CT-Bone",
+    label: "CT Bone",
+    shade: true,
+    light: [0.1, 0.9, 0.2, 10],
+    colorTF: [[-3024, 0, 0, 0], [-16.446, 0.7294, 0.2549, 0.302], [641.385, 0.9059, 0.8157, 0.5529], [3071, 1, 1, 1]],
+    opacityTF: [[-3024, 0], [-16.446, 0], [641.385, 0.7157], [3071, 0.7059]]
+  },
+  {
+    name: "CT-Bones",
+    label: "CT Bones",
+    shade: true,
+    light: [0.2, 1, 0, 1],
+    colorTF: [[-1e3, 0.3, 0.3, 1], [-488, 0.3, 1, 0.3], [463.28, 1, 0, 0], [659.15, 1, 0.9125, 0.0375], [953, 1, 0.3, 0.3]],
+    opacityTF: [[-1e3, 0], [152.19, 0], [278.93, 0.1905], [952, 0.2]]
+  },
+  {
+    name: "CT-Cardiac",
+    label: "CT Cardiac",
+    shade: true,
+    light: [0.1, 0.9, 0.2, 10],
+    colorTF: [[-3024, 0, 0, 0], [-77.688, 0.549, 0.251, 0.149], [94.952, 0.8824, 0.6039, 0.2902], [179.052, 1, 0.937, 0.9545], [260.439, 0.6157, 0, 0], [3071, 0.8275, 0.6588, 1]],
+    opacityTF: [[-3024, 0], [-77.688, 0], [94.952, 0.2857], [179.052, 0.5536], [260.439, 0.8482], [3071, 0.875]]
+  },
+  {
+    name: "CT-Chest-Contrast-Enhanced",
+    label: "CT Chest (contrast)",
+    shade: true,
+    light: [0.1, 0.9, 0.2, 10],
+    colorTF: [[-3024, 0, 0, 0], [67.011, 0.549, 0.251, 0.149], [251.105, 0.8824, 0.6039, 0.2902], [439.291, 1, 0.937, 0.9545], [3071, 0.8275, 0.6588, 1]],
+    opacityTF: [[-3024, 0], [67.011, 0], [251.105, 0.4464], [439.291, 0.625], [3071, 0.6161]]
+  },
+  {
+    name: "CT-Coronary-Arteries",
+    label: "CT Coronary",
+    shade: false,
+    light: [0.2, 1, 0, 1],
+    colorTF: [[-2048, 0, 0, 0], [136.47, 0, 0, 0], [159.215, 0.1598, 0.1598, 0.1598], [318.43, 0.7647, 0.7647, 0.7647], [478.693, 1, 1, 1], [3661, 1, 1, 1]],
+    opacityTF: [[-2048, 0], [136.47, 0], [159.215, 0.2589], [318.43, 0.5714], [478.693, 0.7768], [3661, 1]]
+  },
+  {
+    name: "CT-Fat",
+    label: "CT Fat",
+    shade: false,
+    light: [0.2, 1, 0, 1],
+    colorTF: [[-1e3, 0.3, 0.3, 1], [-497.5, 0.3, 1, 0.3], [-99, 0, 0, 1], [-76.946, 0, 1, 0], [-65.481, 0.8354, 0.8889, 0.0165], [83.89, 1, 0, 0], [463.28, 1, 0, 0], [659.15, 1, 0.9125, 0.0375], [2952, 1, 0.3003, 0.2999]],
+    opacityTF: [[-1e3, 0], [-100, 0], [-99, 0.15], [-60, 0.15], [-59, 0], [101.2, 0], [952, 0]]
+  },
+  {
+    name: "CT-Lung",
+    label: "CT Lung",
+    shade: true,
+    light: [0.2, 1, 0, 1],
+    colorTF: [[-1e3, 0.3, 0.3, 1], [-600, 0, 0, 1], [-530, 0.1347, 0.7817, 0.0725], [-460, 0.9292, 1, 0.1095], [-400, 0.8889, 0.2549, 0.024], [2952, 1, 0.3, 0.3]],
+    opacityTF: [[-1e3, 0], [-600, 0], [-599, 0.15], [-400, 0.15], [-399, 0], [2952, 0]]
+  },
+  {
+    name: "CT-MIP",
+    label: "CT MIP",
+    shade: true,
+    light: [0.1, 0.9, 0.2, 10],
+    colorTF: [[-3024, 0, 0, 0], [-637.62, 1, 1, 1], [700, 1, 1, 1], [3071, 1, 1, 1]],
+    opacityTF: [[-3024, 0], [-637.62, 0], [700, 1], [3071, 1]]
+  },
+  {
+    name: "CT-Muscle",
+    label: "CT Muscle",
+    shade: true,
+    light: [0.1, 0.9, 0.2, 10],
+    colorTF: [[-3024, 0, 0, 0], [-155.407, 0.549, 0.251, 0.149], [217.641, 0.8824, 0.6039, 0.2902], [419.736, 1, 0.937, 0.9545], [3071, 0.8275, 0.6588, 1]],
+    opacityTF: [[-3024, 0], [-155.407, 0], [217.641, 0.6765], [419.736, 0.8333], [3071, 0.8039]]
+  },
+  {
+    name: "CT-Pulmonary-Arteries",
+    label: "CT Pulmonary",
+    shade: true,
+    light: [0.2, 1, 0, 1],
+    colorTF: [[-2048, 0, 0, 0], [-568.625, 0, 0, 0], [-364.081, 0.3961, 0.302, 0.1804], [-244.813, 0.6118, 0.3529, 0.0706], [18.277, 0.8431, 0.0157, 0.1569], [447.798, 0.7529, 0.7529, 0.7529], [3592.73, 1, 1, 1]],
+    opacityTF: [[-2048, 0], [-568.625, 0], [-364.081, 0.0714], [-244.813, 0.4018], [18.277, 0.6071], [447.798, 0.8304], [3592.73, 0.8393]]
+  },
+  {
+    name: "CT-Soft-Tissue",
+    label: "CT Soft Tissue",
+    shade: false,
+    light: [0.2, 1, 0, 1],
+    colorTF: [[-2048, 0, 0, 0], [-167.01, 0, 0, 0], [-160, 0.0556, 0.0556, 0.0556], [240, 1, 1, 1], [3661, 1, 1, 1]],
+    opacityTF: [[-2048, 0], [-167.01, 0], [-160, 1], [240, 1], [3661, 1]]
+  }
+];
+function presetLUT(p) {
+  const lo = p.colorTF[0][0];
+  const hi = p.colorTF[p.colorTF.length - 1][0];
+  const clim = [lo, hi];
+  const lut = lutFromTransferFunctions(p.colorTF, p.opacityTF, clim);
+  const shade = p.shade ? [p.light[0], p.light[1], p.light[2], p.light[3]] : [1, 0, 0, 1];
+  return { lut, clim, shade };
+}
+
+// render/demos/vr-preset-menu.ts
+function openVrPresetMenu(opts) {
+  if (document.getElementById("vr-preset-menu")) return;
+  const overlay = document.createElement("div");
+  overlay.id = "vr-preset-menu";
+  overlay.style.cssText = "position:fixed;inset:0;z-index:2100;background:rgba(5,6,10,.82);display:flex;align-items:center;justify-content:center;";
+  const card = document.createElement("div");
+  card.style.cssText = "background:#11141d;border:1px solid #33507e;border-radius:12px;padding:18px 20px;max-width:min(720px,94vw);max-height:88vh;overflow-y:auto;font:13px -apple-system,system-ui,sans-serif;color:#d6e2f2;";
+  card.innerHTML = `<div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:12px;"><h3 style="margin:0;color:#fff;font-size:16px;">Volume rendering preset</h3><span style="color:#5a6b85;font-size:11px;">Slicer CT presets \xB7 thumbnails rendered from this study</span></div>`;
+  const grid = document.createElement("div");
+  grid.style.cssText = "display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px;";
+  card.appendChild(grid);
+  const close = () => overlay.remove();
+  for (const it of opts.items) {
+    const cell = document.createElement("button");
+    const sel = it.name === opts.current;
+    cell.style.cssText = "display:flex;flex-direction:column;align-items:center;gap:6px;padding:8px 6px 7px;cursor:pointer;background:" + (sel ? "rgba(84,198,240,.18)" : "rgba(255,255,255,.04)") + ";border:1px solid " + (sel ? "#54c6f0" : "rgba(255,255,255,.12)") + ";border-radius:10px;color:#eaf0ff;";
+    it.canvas.style.cssText = "width:110px;height:110px;border-radius:7px;background:#05060a;display:block;";
+    const lab = document.createElement("div");
+    lab.textContent = it.label;
+    lab.style.cssText = "font:600 11.5px -apple-system,system-ui,sans-serif;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:110px;" + (sel ? "color:#9fe9ff;" : "");
+    cell.appendChild(it.canvas);
+    cell.appendChild(lab);
+    cell.onclick = () => {
+      opts.onPick(it.name);
+      close();
+    };
+    grid.appendChild(cell);
+  }
+  overlay.appendChild(card);
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) close();
+  });
+  const esc = (e) => {
+    if (e.key === "Escape") {
+      close();
+      document.removeEventListener("keydown", esc, true);
+    }
+  };
+  document.addEventListener("keydown", esc, true);
+  document.body.appendChild(overlay);
+}
+
 // render/demos/bir-browser.ts
 var P = new URLSearchParams(location.search);
 var KITS_DEFAULT = {
@@ -6820,6 +7085,68 @@ async function main() {
     getOffset: (o) => off[o],
     onJump: jumpAll
   });
+  let vrPreset = null;
+  let vrShift = 0;
+  const vd = res.ct.vol;
+  let vmin = Infinity, vmax = -Infinity;
+  const vstride = Math.max(1, Math.floor(vd.length / 2e6));
+  for (let i = 0; i < vd.length; i += vstride) {
+    const v = vd[i];
+    if (v < vmin) vmin = v;
+    if (v > vmax) vmax = v;
+  }
+  const shiftRange = Math.max(200, (vmax - vmin) / 2);
+  const bakeOf = (name) => name ? presetLUT(CT_VR_PRESETS.find((p) => p.name === name)) : null;
+  const presetLabel = () => vrPreset ? CT_VR_PRESETS.find((p) => p.name === vrPreset)?.label ?? vrPreset : "Default (W/L)";
+  const applyVrPreset = (name) => {
+    vrPreset = name;
+    sc.setVolumePreset(bakeOf(name));
+    if (sc.volumeOpacity() <= 0) sc.setVolumeOpacity(1);
+    draw3d();
+    xhair?.redraw();
+  };
+  const applyVrShift = (hu) => {
+    vrShift = hu;
+    sc.setVolumeShift(hu);
+    draw3d();
+    xhair?.redraw();
+  };
+  const renderPresetThumbnails = () => {
+    const THUMB = 116;
+    const savedOp = sc.volumeOpacity(), savedShift = sc.volumeShift(), savedSeg = sc.segOpacity();
+    sc.setVolumeShift(0);
+    if (savedSeg > 0) sc.setSegOpacity(0);
+    if (savedOp < 1) sc.setVolumeOpacity(1);
+    const entries = [
+      { name: null, label: "Default (W/L)" },
+      ...CT_VR_PRESETS.map((p) => ({ name: p.name, label: p.label }))
+    ];
+    const items = [];
+    for (const e of entries) {
+      const c = document.createElement("canvas");
+      c.width = THUMB;
+      c.height = THUMB;
+      const cxt = c.getContext("webgpu");
+      cxt.configure({ device: gpu.device, format: preferred, viewFormats: [srgb], alphaMode: "opaque" });
+      sc.setVolumePreset(bakeOf(e.name));
+      sc.scene.setCamera(camera.position, camera.focalPoint, camera.viewUp, camera.viewAngle, THUMB, THUMB);
+      sc.scene.renderToView(cxt.getCurrentTexture().createView({ format: srgb }), THUMB, THUMB);
+      items.push({ name: e.name, label: e.label, canvas: c });
+    }
+    sc.setVolumePreset(bakeOf(vrPreset));
+    sc.setVolumeShift(savedShift);
+    if (savedSeg > 0) sc.setSegOpacity(savedSeg);
+    if (savedOp < 1) sc.setVolumeOpacity(savedOp);
+    draw3d();
+    return items;
+  };
+  Object.assign(globalThis.__birDbg, {
+    presets: () => CT_VR_PRESETS.map((p) => p.name),
+    setPreset: (name) => applyVrPreset(name),
+    setShift: (hu) => applyVrShift(hu),
+    vrState: () => ({ preset: vrPreset, shift: vrShift, shiftRange, dataRange: [vmin, vmax] }),
+    thumbCount: () => renderPresetThumbnails().length
+  });
   const controls = [
     {
       label: "Volume render",
@@ -6830,6 +7157,24 @@ async function main() {
         xhair?.redraw();
       },
       color: [0.75, 0.78, 0.85]
+    },
+    // Slicer's VR "Shift" — a plain slider directly below the opacity control.
+    {
+      label: "Shift",
+      slider: {
+        min: -shiftRange,
+        max: shiftRange,
+        step: Math.max(1, Math.round(shiftRange / 200)),
+        get: () => vrShift,
+        set: (v) => applyVrShift(v),
+        format: (v) => (v > 0 ? "+" : "") + Math.round(v)
+      },
+      disabled: () => sc.volumeOpacity() <= 0
+    },
+    // Volume-rendering preset — opens the on-the-fly thumbnail menu (Slicer/OHIF CT presets).
+    {
+      label: "Preset",
+      button: { text: () => presetLabel(), run: () => openVrPresetMenu({ items: renderPresetThumbnails(), current: vrPreset, onPick: applyVrPreset }) }
     },
     {
       label: "Segmentation",
