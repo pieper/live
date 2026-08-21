@@ -1741,7 +1741,20 @@ var ImageField = class {
   constructor(dev, data, dims, spacing, lut, opts) {
     const center = opts.center ?? [0, 0, 0];
     this.volTex = dev.createTexture({ size: dims, dimension: "3d", format: "r32float", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
-    dev.queue.writeTexture({ texture: this.volTex }, data, { bytesPerRow: dims[0] * 4, rowsPerImage: dims[1] }, dims);
+    {
+      const bytesPerRow = dims[0] * 4, rowsPerImage = dims[1], sliceBytes = bytesPerRow * rowsPerImage;
+      const CHUNK = 256 * 1024 * 1024;
+      const slab = Math.max(1, Math.min(dims[2], Math.floor(CHUNK / Math.max(1, sliceBytes))));
+      for (let z = 0; z < dims[2]; z += slab) {
+        const depth = Math.min(slab, dims[2] - z);
+        dev.queue.writeTexture(
+          { texture: this.volTex, origin: { x: 0, y: 0, z } },
+          data,
+          { offset: z * sliceBytes, bytesPerRow, rowsPerImage },
+          [dims[0], dims[1], depth]
+        );
+      }
+    }
     this.lutTex = dev.createTexture({ size: [256, 1], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
     dev.queue.writeTexture({ texture: this.lutTex }, lut, { bytesPerRow: 256 * 4 }, [256, 1]);
     if (opts.ijkToRAS) {
@@ -5326,6 +5339,9 @@ async function s3ListKeys(prefix, bucket) {
   }
   return keys;
 }
+function ohifViewerURL(studyInstanceUID) {
+  return studyInstanceUID ? `https://viewer.imaging.datacommons.cancer.gov/viewer/${studyInstanceUID}` : null;
+}
 
 // render/vendor/idc_tools/loader.js
 var _worker = null;
@@ -6195,19 +6211,320 @@ function mountBir(cfg) {
   };
 }
 
+// render/demos/idc-share.ts
+function studyShareURL(src) {
+  const u = new URL(globalThis.location.origin + globalThis.location.pathname);
+  if (src.st) u.searchParams.set("StudyInstanceUIDs", src.st);
+  u.searchParams.set("series", src.c);
+  if (src.cb && src.cb !== "idc-open-data") u.searchParams.set("bucket", src.cb);
+  if (src.s) u.searchParams.set("seg", src.s);
+  if (src.sb && src.sb !== "idc-open-data") u.searchParams.set("segBucket", src.sb);
+  if (src.m && src.m !== "CT") u.searchParams.set("modality", src.m);
+  const pid = (src.sd.split("\xB7")[0] || "").trim();
+  if (pid && pid !== "IDC") u.searchParams.set("patient", pid);
+  if (src.col && src.col !== "IDC") u.searchParams.set("collection", src.col);
+  return u.toString();
+}
+var OVERLAY_CSS = "position:fixed;inset:0;z-index:2000;background:rgba(5,6,10,.85);display:flex;align-items:center;justify-content:center;";
+var CARD_CSS = "background:#11141d;border:1px solid #33507e;border-radius:10px;padding:20px 24px;width:600px;max-width:92vw;font:13px -apple-system,system-ui,sans-serif;color:#d6e2f2;";
+function shareStudy(src) {
+  if (document.getElementById("idc-share")) return;
+  const here = studyShareURL(src);
+  const portal = src.st && ohifViewerURL(src.st) || "";
+  const overlay = document.createElement("div");
+  overlay.id = "idc-share";
+  overlay.style.cssText = OVERLAY_CSS;
+  const esc = (s) => s.replace(/"/g, "&quot;");
+  const row = (label, url, hint) => `
+    <div style="margin:0 0 14px;">
+      <div style="color:#9fd0b3;font-weight:600;margin-bottom:4px;">${label}</div>
+      <div style="display:flex;gap:6px;">
+        <input readonly value="${esc(url)}" style="flex:1;font:12px ui-monospace,monospace;color:#d6e2f2;
+          background:#0b0e16;border:1px solid #33507e;border-radius:4px;padding:6px 8px;">
+        <button data-copy="${esc(url)}" style="font:600 12px -apple-system,system-ui,sans-serif;color:#d6e2f2;
+          background:#1b2740;border:1px solid #33507e;border-radius:4px;padding:6px 12px;cursor:pointer;">Copy</button>
+      </div>
+      <div style="color:#5a6b85;font-size:11px;margin-top:3px;">${hint}</div>
+    </div>`;
+  overlay.innerHTML = `
+    <div style="${CARD_CSS}">
+      <h3 style="margin:0 0 4px;color:#fff;">Share study</h3>
+      <p style="margin:0 0 16px;color:#9fb3d0;">${src.sd}${src.st ? " \xB7 " + src.st : ""}</p>
+      ${row("Open in SlicerLive (this viewer)", here, "Reopens this study in the SlicerLive BIR reader (OHIF-style + direct-S3 params).")}
+      ${portal ? row("Open in IDC OHIF portal", portal, "The canonical IDC viewer link for the same study.") : ""}
+      <div style="text-align:right;margin-top:6px;">
+        <button id="idc-share-close" style="font:600 12px -apple-system,system-ui,sans-serif;color:#9fb3d0;
+          background:none;border:none;cursor:pointer;padding:6px 4px;">Close</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  const close = () => overlay.remove();
+  overlay.addEventListener("click", (e) => e.target === overlay && close());
+  overlay.querySelector("#idc-share-close").addEventListener("click", close);
+  for (const b of overlay.querySelectorAll("button[data-copy]")) {
+    b.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(b.dataset.copy);
+        b.textContent = "Copied \u2713";
+        setTimeout(() => b.textContent = "Copy", 1400);
+      } catch {
+        b.textContent = "Copy failed";
+      }
+    });
+  }
+}
+var DL_LANES = Math.max(2, Math.min(6, (navigator.hardwareConcurrency || 4) - 1));
+var safeName = (s) => s.replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 80) || "study";
+async function downloadStudy(src, seriesList, onProgress, opts) {
+  let root;
+  if (opts?.root) root = opts.root;
+  else {
+    const picker = globalThis.showDirectoryPicker;
+    if (!picker) throw new Error("File System Access API unavailable \u2014 cannot pick a download folder");
+    root = await picker({ mode: "readwrite", id: "slicerlive-idc-download" });
+  }
+  onProgress(0, 0, 0, "listing series\u2026");
+  const studyDir = await root.getDirectoryHandle(
+    safeName(`${src.col}_${(src.st || src.c).slice(-12)}`),
+    { create: true }
+  );
+  const tasks = [];
+  let total = 0, sn = 0;
+  for (const s of seriesList) {
+    onProgress(0, total, 0, `listing ${s.modality} ${s.seriesDescription || s.prefix.slice(0, 8) + "\u2026"}\u2026`);
+    let keys = await s3ListKeys(s.prefix, s.bucket);
+    if (!keys.length) continue;
+    if (opts?.maxFilesPerSeries) keys = keys.slice(0, opts.maxFilesPerSeries);
+    total += keys.length;
+    const dir = await studyDir.getDirectoryHandle(
+      safeName(`${s.seriesNumber || ++sn}_${s.modality}_${s.prefix.slice(0, 8)}`),
+      { create: true }
+    );
+    tasks.push({ dir, base: idcS3(s.bucket), keys });
+  }
+  if (!total) throw new Error("no DICOM objects found to download");
+  onProgress(0, total, 0, `downloading ${total} files (${DL_LANES} at a time)\u2026`);
+  let done = 0, bytes = 0;
+  const errors = [];
+  for (const task of tasks) {
+    let next = 0;
+    const lane = async () => {
+      while (next < task.keys.length) {
+        const key = task.keys[next++];
+        try {
+          const resp = await fetchRetry(task.base + key, {});
+          const buf = await resp.arrayBuffer();
+          const fname = safeName(key.split("/").pop() || `obj-${done}.dcm`);
+          const fh = await task.dir.getFileHandle(fname, { create: true });
+          const w = await fh.createWritable();
+          await w.write(buf);
+          await w.close();
+          bytes += buf.byteLength;
+        } catch (e) {
+          errors.push(`${key}: ${e.message}`);
+        }
+        done++;
+        if (done % 5 === 0 || done === total) onProgress(done, total, bytes, `${done}/${total} files`);
+      }
+    };
+    await Promise.all(Array.from({ length: DL_LANES }, lane));
+  }
+  const mb = (bytes / 1e6).toFixed(0);
+  onProgress(
+    done,
+    total,
+    bytes,
+    `saved ${done - errors.length}/${total} files (${mb} MB) to \u201C${root.name}/${studyDir.name}\u201D` + (errors.length ? ` \u2014 ${errors.length} failed` : "")
+  );
+  if (errors.length) console.warn("IDC download errors:", errors.slice(0, 10));
+}
+async function downloadStudyWithDialog(src, listAll) {
+  if (document.getElementById("idc-download")) return;
+  const overlay = document.createElement("div");
+  overlay.id = "idc-download";
+  overlay.style.cssText = OVERLAY_CSS;
+  overlay.innerHTML = `
+    <div style="${CARD_CSS.replace("width:600px", "width:560px")}">
+      <h3 style="margin:0 0 4px;color:#fff;">Downloading study</h3>
+      <p style="margin:0 0 6px;color:#9fb3d0;">${src.sd}${src.st ? " \xB7 " + src.st : ""}</p>
+      <p style="margin:0 0 14px;color:#5a6b85;font-size:11px;">${src.lic || "NCI Imaging Data Commons \u2014 open data"}</p>
+      <div style="height:8px;background:#0b0e16;border:1px solid #1b2740;border-radius:5px;overflow:hidden;">
+        <div id="idc-dl-bar" style="height:100%;width:0%;background:#2b6cb0;transition:width .2s;"></div>
+      </div>
+      <p id="idc-dl-note" style="margin:10px 0 0;color:#9fb3d0;font-variant-numeric:tabular-nums;">starting\u2026</p>
+      <div style="text-align:right;margin-top:12px;">
+        <button id="idc-dl-close" style="font:600 12px -apple-system,system-ui,sans-serif;color:#9fb3d0;
+          background:none;border:none;cursor:pointer;padding:6px 4px;">Close</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  const bar = overlay.querySelector("#idc-dl-bar");
+  const note = overlay.querySelector("#idc-dl-note");
+  const closeBtn = overlay.querySelector("#idc-dl-close");
+  closeBtn.addEventListener("click", () => overlay.remove());
+  try {
+    const loaded = [{ prefix: src.c, bucket: src.cb, modality: src.m }];
+    if (src.s) loaded.push({ prefix: src.s, bucket: src.sb || "idc-open-data", modality: "SEG" });
+    const seriesList = listAll ? await listAll().catch(() => loaded) : loaded;
+    await downloadStudy(src, seriesList.length ? seriesList : loaded, (done, total, bytes, msg) => {
+      bar.style.width = (total ? 100 * done / total : 0).toFixed(1) + "%";
+      note.textContent = total ? `${done.toLocaleString("en-US")} / ${total.toLocaleString("en-US")} files \xB7 ${(bytes / 1e6).toFixed(0)} MB \u2014 ${msg}` : msg;
+    });
+    bar.style.width = "100%";
+    closeBtn.textContent = "Done";
+  } catch (err) {
+    note.textContent = "download failed: " + err.message;
+    note.style.color = "#ff6b74";
+    closeBtn.textContent = "Close";
+  }
+}
+globalThis.__slicerLiveIdc = {
+  studyShareURL,
+  shareStudy,
+  downloadStudy,
+  downloadStudyWithDialog
+};
+
 // render/demos/bir-browser.ts
 var P = new URLSearchParams(location.search);
-var DEMO = {
-  c: P.get("series") || "e3e86cde-da96-44b0-9e3b-b0b7bdd5a675",
-  cb: P.get("bucket") || "idc-open-data",
-  s: P.get("seg") || "04a800eb-2f06-4e29-a10d-934a6f5c7d47",
-  sb: P.get("segBucket") || "idc-open-data",
+var KITS_DEFAULT = {
+  c: "e3e86cde-da96-44b0-9e3b-b0b7bdd5a675",
+  cb: "idc-open-data",
+  s: "04a800eb-2f06-4e29-a10d-934a6f5c7d47",
+  sb: "idc-open-data",
   m: "CT",
   col: "c4kc_kits",
   st: "1.3.6.1.4.1.14519.5.2.1.6919.4624.368281589441706814147998236429",
   sd: "KiTS-00051 \xB7 noncontrast abdomen + kidney/tumour SEG",
   lic: "CC BY 3.0 \xB7 IDC c4kc_kits \xB7 doi:10.7937/tcia.2019.ix49e8nx"
 };
+var IDC_INDEX_BASE = globalThis.__IDC_INDEX_BASE || P.get("indexBase") || "https://js2.jetstream-cloud.org:8001/swift/v1/idc-index/";
+var GROUPS_URL = new URL("idc-rad-groups.json", IDC_INDEX_BASE).href;
+var PARQUET_URL = new URL("idc-rad-slim.parquet", IDC_INDEX_BASE).href;
+var HYPARQUET_ESM = "https://cdn.jsdelivr.net/npm/hyparquet@1.28.2/+esm";
+var splitList = (v) => (v ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+var _dirCache = null;
+async function loadGroupDir(onStatus) {
+  if (_dirCache) return _dirCache;
+  onStatus("fetching the IDC index directory\u2026");
+  let resp;
+  try {
+    const cache = globalThis.caches ? await globalThis.caches.open("idc-rad") : null;
+    if (cache) resp = await cache.match(GROUPS_URL);
+    if (!resp) {
+      resp = await fetch(GROUPS_URL);
+      if (resp.ok && cache) await cache.put(GROUPS_URL, resp.clone());
+    }
+  } catch {
+    resp = await fetch(GROUPS_URL);
+  }
+  if (!resp || !resp.ok) throw new Error(`index directory not reachable at ${GROUPS_URL} (HTTP ${resp?.status ?? "?"})`);
+  _dirCache = await resp.json();
+  return _dirCache;
+}
+var SLIM_COLS = [
+  "StudyInstanceUID",
+  "SeriesInstanceUID",
+  "crdc_series_uuid",
+  "aws_bucket",
+  "Modality",
+  "instanceCount",
+  "SeriesDescription",
+  "PatientID",
+  "collection_id",
+  "license_short_name",
+  "source_DOI"
+];
+async function readStudyRows(studyUID, onStatus) {
+  const dir = await loadGroupDir(onStatus);
+  const RGS = dir.rowGroupSize;
+  const spans = [];
+  for (let i = 0; i < dir.groups.length; i++) {
+    const g = dir.groups[i];
+    if (studyUID >= g.min && studyUID <= g.max) spans.push([i * RGS, Math.min((i + 1) * RGS, dir.total)]);
+  }
+  if (!spans.length) {
+    throw new Error(
+      `StudyInstanceUID not found in the slim IDC index (${dir.version}): ${studyUID}. It may be a non-radiology study, or from a newer index. The direct form always works: ?series=<crdc_series_uuid>&bucket=idc-open-data.`
+    );
+  }
+  onStatus(`range-reading the IDC index (${spans.length} group${spans.length > 1 ? "s" : ""})\u2026`);
+  try {
+    const hp = await import(HYPARQUET_ESM);
+    const file = await hp.asyncBufferFromUrl({ url: PARQUET_URL });
+    const metadata = await hp.parquetMetadataAsync(file);
+    const parts = await Promise.all(
+      spans.map(([rowStart, rowEnd]) => hp.parquetReadObjects({ file, metadata, columns: SLIM_COLS, rowStart, rowEnd }))
+    );
+    const rows = parts.flat().filter((r) => r.StudyInstanceUID === studyUID);
+    if (!rows.length) throw new Error(`StudyInstanceUID not found in the IDC index: ${studyUID}`);
+    return rows;
+  } catch (e) {
+    if (e.message.includes("not found")) throw e;
+    throw new Error(
+      `couldn't range-read the slim IDC index at ${PARQUET_URL} \u2014 check the CORS bucket (?indexBase=). Meanwhile the direct form works: ?series=<crdc_series_uuid>&bucket=idc-open-data. (${e.message})`
+    );
+  }
+}
+async function resolveSource(onStatus) {
+  const series = P.get("series");
+  if (series) {
+    return {
+      c: series,
+      cb: P.get("bucket") || "idc-open-data",
+      s: P.get("seg") || void 0,
+      sb: P.get("segBucket") || "idc-open-data",
+      m: (P.get("modality") || "CT").toUpperCase(),
+      col: P.get("collection") || "IDC",
+      st: "",
+      sd: `${P.get("patient") || "IDC"} \xB7 ${series.slice(0, 8)}\u2026`,
+      lic: "NCI Imaging Data Commons"
+    };
+  }
+  const studyUIDs = [...splitList(P.get("StudyInstanceUIDs")), ...splitList(P.get("studyUID"))];
+  if (studyUIDs.length) {
+    const want = [
+      ...splitList(P.get("SeriesInstanceUIDs")),
+      ...splitList(P.get("initialSeriesInstanceUID")),
+      ...splitList(P.get("seriesUID"))
+    ];
+    return await resolveFromIndex(studyUIDs[0], want, onStatus);
+  }
+  return KITS_DEFAULT;
+}
+async function resolveFromIndex(studyUID, wantSeries, onStatus) {
+  const memoKey = `idc-rad:${studyUID}:${wantSeries.join(",")}`;
+  try {
+    const hit = localStorage.getItem(memoKey);
+    if (hit) return JSON.parse(hit);
+  } catch {
+  }
+  const inStudy = await readStudyRows(studyUID, onStatus);
+  const want = new Set(wantSeries);
+  const IMG = /* @__PURE__ */ new Set(["CT", "MR", "PT", "PET", "NM"]);
+  const imgs = inStudy.filter((r) => IMG.has(String(r.Modality).toUpperCase()));
+  const segs = inStudy.filter((r) => String(r.Modality).toUpperCase() === "SEG");
+  const chosen = imgs.find((r) => want.has(r.SeriesInstanceUID)) ?? imgs.slice().sort((a, b) => Number(b.instanceCount) - Number(a.instanceCount))[0];
+  if (!chosen) throw new Error("no CT/MR/PET/NM image series found in this study");
+  const seg = segs.find((r) => want.has(r.SeriesInstanceUID)) ?? segs[0];
+  const mod = String(chosen.Modality).toUpperCase();
+  const src = {
+    c: String(chosen.crdc_series_uuid),
+    cb: String(chosen.aws_bucket),
+    s: seg ? String(seg.crdc_series_uuid) : void 0,
+    sb: seg ? String(seg.aws_bucket) : void 0,
+    m: mod === "PET" ? "PT" : mod,
+    col: String(chosen.collection_id),
+    st: studyUID,
+    sd: `${chosen.PatientID} \xB7 ${chosen.SeriesDescription || mod}`,
+    lic: `${chosen.license_short_name || "IDC"} \xB7 ${chosen.collection_id}${chosen.source_DOI ? " \xB7 doi:" + chosen.source_DOI : ""}`
+  };
+  try {
+    localStorage.setItem(memoKey, JSON.stringify(src));
+  } catch {
+  }
+  return src;
+}
 var status = (msg, err = false) => {
   const el = document.getElementById("status");
   if (el) {
@@ -6243,10 +6560,14 @@ async function main() {
   }
   const mosaic = createMosaic(document.getElementById("viewer"));
   mosaic.status("contacting the NCI Imaging Data Commons\u2026");
-  const res = await loadSeries(DEMO, {
+  const setLoad = (m) => {
+    status(m);
+    mosaic.status(m);
+  };
+  const source = await resolveSource(setLoad);
+  const res = await loadSeries(source, {
     onProgress: (p) => {
-      status(`${p.msg}${p.frac ? ` \u2014 ${Math.round(p.frac * 100)}%` : ""}`);
-      mosaic.status(`${p.msg}${p.frac ? ` \u2014 ${Math.round(p.frac * 100)}%` : ""}`);
+      setLoad(`${p.msg}${p.frac ? ` \u2014 ${Math.round(p.frac * 100)}%` : ""}`);
     },
     onSliceCount: (n) => mosaic.setCount(n),
     onThumb: (n, w, h, rgba) => mosaic.thumb(n, w, h, rgba)
@@ -6269,8 +6590,8 @@ async function main() {
         cell.appendChild(e);
         return e;
       };
-      const pid = (DEMO.sd.split("\xB7")[0] || "").trim() || DEMO.col;
-      mk("tl", `${pid}<br>${DEMO.col} \xB7 ${res.ct.modality}`);
+      const pid = (source.sd.split("\xB7")[0] || "").trim() || source.col;
+      mk("tl", `${pid}<br>${source.col} \xB7 ${res.ct.modality}`);
       mk("tr", `${res.ct.modality} \xB7 ${sc.dims[2]} slices${sc.hasSeg ? " \xB7 SEG" : ""}<br>${sc.dims[0]}\xD7${sc.dims[1]}`);
       annEls[p] = { br: mk("br", "") };
     }
@@ -6365,6 +6686,17 @@ async function main() {
     drawAll();
   };
   const sliceControls = [];
+  const listAllStudySeries = source.st ? async () => {
+    const rows = await readStudyRows(source.st, () => {
+    });
+    return rows.map((r) => ({
+      prefix: String(r.crdc_series_uuid),
+      bucket: String(r.aws_bucket),
+      modality: String(r.Modality).toUpperCase(),
+      seriesUID: String(r.SeriesInstanceUID),
+      seriesDescription: r.SeriesDescription ? String(r.SeriesDescription) : void 0
+    }));
+  } : void 0;
   bir = mountBir({
     overlay: document.getElementById("viewer"),
     bar: document.getElementById("bir-bar"),
@@ -6390,7 +6722,21 @@ async function main() {
     resetViews: () => sliceControls.forEach((c) => c.resetView()),
     close: () => status("This is the SlicerLive Basic Image Review demo \u2014 reload to restart."),
     jumpAll,
-    modality: res.ct.modality
+    modality: res.ct.modality,
+    extraTools: [
+      {
+        id: "idc-share",
+        icon: "share",
+        title: "Share \u2014 copy a link that reopens this study here (or in the IDC OHIF portal)",
+        run: () => shareStudy(source)
+      },
+      {
+        id: "idc-download",
+        icon: "download",
+        title: "Download this study's DICOM to a local folder (streamed, parallel)",
+        run: () => downloadStudyWithDialog(source, listAllStudySeries)
+      }
+    ]
   });
   globalThis.__birDbg = {
     ready: () => !!bir,
@@ -6561,7 +6907,7 @@ async function main() {
   buildAnnotations();
   applyAnn();
   const info = document.getElementById("info");
-  if (info) info.textContent = `${DEMO.sd} \xB7 CT ${sc.dims.join("\xD7")} \xB7 ${DEMO.lic}`;
+  if (info) info.textContent = `${source.sd} \xB7 ${res.ct.modality} ${sc.dims.join("\xD7")} \xB7 ${source.lic}`;
   resize();
   mosaic.done();
   status("KiTS abdomen CT \u2014 scroll to page slices, pick a tool from the toolbar, drag 3D to orbit");
