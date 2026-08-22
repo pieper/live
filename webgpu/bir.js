@@ -1738,18 +1738,31 @@ var ImageField = class {
   unit;
   stepMm;
   box;
+  normScale = 1;
+  // r8unorm samples return raw/255; clim is packed /normScale so shader math is unchanged
   constructor(dev, data, dims, spacing, lut, opts) {
     const center = opts.center ?? [0, 0, 0];
-    this.volTex = dev.createTexture({ size: dims, dimension: "3d", format: "r32float", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+    let src = data, fmt = "r32float", bpe = 4;
+    this.normScale = 1;
+    if (data instanceof Uint8Array) {
+      fmt = "r8unorm";
+      bpe = 1;
+      this.normScale = 255;
+    } else if (data instanceof Uint16Array) {
+      src = Float32Array.from(data);
+      fmt = "r32float";
+      bpe = 4;
+    }
+    this.volTex = dev.createTexture({ size: dims, dimension: "3d", format: fmt, usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
     {
-      const bytesPerRow = dims[0] * 4, rowsPerImage = dims[1], sliceBytes = bytesPerRow * rowsPerImage;
+      const bytesPerRow = dims[0] * bpe, rowsPerImage = dims[1], sliceBytes = bytesPerRow * rowsPerImage;
       const CHUNK = 256 * 1024 * 1024;
       const slab = Math.max(1, Math.min(dims[2], Math.floor(CHUNK / Math.max(1, sliceBytes))));
       for (let z = 0; z < dims[2]; z += slab) {
         const depth = Math.min(slab, dims[2] - z);
         dev.queue.writeTexture(
           { texture: this.volTex, origin: { x: 0, y: 0, z } },
-          data,
+          src,
           { offset: z * sliceBytes, bytesPerRow, rowsPerImage },
           [dims[0], dims[1], depth]
         );
@@ -1889,8 +1902,8 @@ fn sample_field_img${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
   }
   fillUniforms(out, off) {
     out.set(this.p2t, off);
-    out[off + 16] = this.clim[0];
-    out[off + 17] = this.clim[1];
+    out[off + 16] = this.clim[0] / this.normScale;
+    out[off + 17] = this.clim[1] / this.normScale;
     out[off + 20] = this.shade[0];
     out[off + 21] = this.shade[1];
     out[off + 22] = this.shade[2];
@@ -5720,12 +5733,21 @@ function mountBir(cfg) {
       }
     }
     const near = (m) => m.plane === p && Math.abs(m.mm - cfg.offsetMm(p)) <= cfg.spacing(p) / 2;
-    ctx.font = "600 11px -apple-system,system-ui,sans-serif";
+    ctx.font = "700 15px -apple-system,system-ui,sans-serif";
+    ctx.lineJoin = "round";
+    ctx.textBaseline = "alphabetic";
+    const label = (text, x, y) => {
+      ctx.lineWidth = 4;
+      ctx.strokeStyle = "rgba(6,10,16,.92)";
+      ctx.strokeText(text, x, y);
+      ctx.fillStyle = "#8dffc4";
+      ctx.fillText(text, x, y);
+    };
     for (const m of [...measurements.filter(near), ...pending && pending.plane === p ? [pending] : []]) {
       const px = m.pts.map((r) => toPx(p, r, w, h));
       ctx.strokeStyle = "#6ce0a8";
       ctx.fillStyle = "#6ce0a8";
-      ctx.lineWidth = 1.5;
+      ctx.lineWidth = 2;
       for (let i = 0; i + 1 < px.length; i += 2) {
         ctx.beginPath();
         ctx.moveTo(px[i].x, px[i].y);
@@ -5734,7 +5756,7 @@ function mountBir(cfg) {
       }
       for (const q of px) {
         ctx.beginPath();
-        ctx.arc(q.x, q.y, 2.5, 0, Math.PI * 2);
+        ctx.arc(q.x, q.y, 3.5, 0, Math.PI * 2);
         ctx.fill();
       }
       if (m.kind === "distance" && m.pts.length === 2) {
@@ -5743,7 +5765,7 @@ function mountBir(cfg) {
           m.pts[0][1] - m.pts[1][1],
           m.pts[0][2] - m.pts[1][2]
         );
-        ctx.fillText(`${d.toFixed(1)} mm`, (px[0].x + px[1].x) / 2 + 6, (px[0].y + px[1].y) / 2 - 6);
+        label(`${d.toFixed(1)} mm`, (px[0].x + px[1].x) / 2 + 8, (px[0].y + px[1].y) / 2 - 8);
       } else if (m.kind === "angle" && m.pts.length === 4) {
         const v1 = [m.pts[1][0] - m.pts[0][0], m.pts[1][1] - m.pts[0][1], m.pts[1][2] - m.pts[0][2]];
         const v2 = [m.pts[3][0] - m.pts[2][0], m.pts[3][1] - m.pts[2][1], m.pts[3][2] - m.pts[2][2]];
@@ -5751,7 +5773,7 @@ function mountBir(cfg) {
         const deg = Math.acos(
           Math.min(1, Math.abs(dot3) / (Math.hypot(...v1) * Math.hypot(...v2) || 1))
         ) * 180 / Math.PI;
-        ctx.fillText(`${deg.toFixed(1)}\xB0`, px[3].x + 6, px[3].y - 6);
+        label(`${deg.toFixed(1)}\xB0`, px[3].x + 8, px[3].y - 8);
       }
     }
   };
