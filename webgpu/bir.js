@@ -263,10 +263,11 @@ fn fs_main(v : V) -> @location(0) vec4<f32> {
 `
 );
 var BASES = {
-  axial: { uDir: [-1, 0, 0], vDir: [0, 1, 0], uAxis: 0, vAxis: 1, nAxis: 2 },
-  coronal: { uDir: [-1, 0, 0], vDir: [0, 0, 1], uAxis: 0, vAxis: 2, nAxis: 1 },
-  sagittal: { uDir: [0, -1, 0], vDir: [0, 0, 1], uAxis: 1, vAxis: 2, nAxis: 0 }
+  axial: { uDir: [-1, 0, 0], vDir: [0, 1, 0], nDir: [0, 0, 1] },
+  coronal: { uDir: [-1, 0, 0], vDir: [0, 0, 1], nDir: [0, 1, 0] },
+  sagittal: { uDir: [0, -1, 0], vDir: [0, 0, 1], nDir: [1, 0, 0] }
 };
+var dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 function ijkAxisForRasAxis(ijkToRAS, rasAxis) {
   let best = 0, bestMag = -1;
   for (let c = 0; c < 3; c++) {
@@ -280,7 +281,8 @@ function ijkAxisForRasAxis(ijkToRAS, rasAxis) {
 }
 function slicerDefaultOffset01(orient, dims, ijkToRAS, rasLo, rasHi) {
   const b = BASES[orient];
-  const n = b.nAxis;
+  const nAbs = b.nDir.map(Math.abs);
+  const n = nAbs[0] >= nAbs[1] && nAbs[0] >= nAbs[2] ? 0 : nAbs[1] >= nAbs[2] ? 1 : 2;
   const a = ijkAxisForRasAxis(ijkToRAS, n);
   const m = Math.floor((dims[a] - 1) / 2);
   const ijk = [(dims[0] - 1) / 2, (dims[1] - 1) / 2, (dims[2] - 1) / 2];
@@ -322,6 +324,9 @@ var SliceRenderer = class {
   };
   cX = [0, 0, 0];
   // in-plane centre of the LAST rendered frame (for viewToTex picking)
+  // Optional per-orientation basis override (reslice along a volume's own axes). null = the
+  // anatomical preset.
+  basisOverride = {};
   constructor(gpu, format = DEFAULT_FORMAT) {
     this.dev = gpu.device;
     this.format = format;
@@ -363,6 +368,32 @@ var SliceRenderer = class {
       this.dev.queue.writeTexture({ texture: this.emptyOverlay }, new Uint16Array(4), { bytesPerRow: 8, rowsPerImage: 1 }, [1, 1, 1]);
     }
     return this.emptyOverlay;
+  }
+  /** Reslice this orientation along an arbitrary RAS basis instead of the anatomical preset.
+   *  Pass null to restore. The vectors should be unit length and mutually orthogonal; they are
+   *  used verbatim, so the caller owns the display convention for a non-anatomical frame. */
+  setBasis(orient, basis) {
+    this.basisOverride[orient] = basis;
+  }
+  basisOf(orient) {
+    return this.basisOverride[orient] ?? BASES[orient];
+  }
+  /** Extent of the volume's RAS bounding box projected onto a direction — the generalisation
+   *  of "rasHi[axis] - rasLo[axis]" to an oblique axis. Reduces to exactly that for the
+   *  anatomical bases, since projecting an axis-aligned box on its own axis is the axis span. */
+  extentAlong(d) {
+    let lo = Infinity, hi = -Infinity;
+    for (let i = 0; i < 8; i++) {
+      const c = [
+        i & 1 ? this.rasHi[0] : this.rasLo[0],
+        i & 2 ? this.rasHi[1] : this.rasLo[1],
+        i & 4 ? this.rasHi[2] : this.rasLo[2]
+      ];
+      const t = dot3(c, d);
+      if (t < lo) lo = t;
+      if (t > hi) hi = t;
+    }
+    return { lo, hi };
   }
   /** Volume geometry: patientToTexture (RAS->tex[0,1], encodes ijkToRAS) + the RAS
    *  bounding box (for plane extents/scrub range). Get both from the ImageField. */
@@ -432,10 +463,9 @@ var SliceRenderer = class {
    *  Slicer: Red FOV=[891.78,256] at viewport 634x182 -> vertical FOV == the 256mm
    *  A-extent, horizontal follows viewport aspect.) */
   viewSpanMm() {
-    const b = BASES[this.orient];
-    const uExt = this.rasHi[b.uAxis] - this.rasLo[b.uAxis];
-    const vExt = this.rasHi[b.vAxis] - this.rasLo[b.vAxis];
-    return Math.max(uExt, vExt);
+    const b = this.basisOf(this.orient);
+    const u = this.extentAlong(b.uDir), v = this.extentAlong(b.vDir);
+    return Math.max(u.hi - u.lo, v.hi - v.lo);
   }
   /** The fitted in-plane extent (mm) used for a given orientation — the value directly
    *  comparable to a Slicer slice node's fitted fieldOfView. */
@@ -452,9 +482,9 @@ var SliceRenderer = class {
    *  axis fills the window, no needless margin). Replaces the old max(uExt,vExt) span, which
    *  under-zoomed whenever the larger extent wasn't on the viewport's limiting axis. */
   fitUV(orient, aspectWH) {
-    const b = BASES[orient];
-    const uExt = this.rasHi[b.uAxis] - this.rasLo[b.uAxis];
-    const vExt = this.rasHi[b.vAxis] - this.rasLo[b.vAxis];
+    const b = this.basisOf(orient);
+    const u = this.extentAlong(b.uDir), v = this.extentAlong(b.vDir);
+    const uExt = u.hi - u.lo, vExt = v.hi - v.lo;
     const uS0 = Math.max(uExt, vExt * aspectWH);
     return { uS0, vS0: uS0 / aspectWH };
   }
@@ -464,12 +494,17 @@ var SliceRenderer = class {
    *  pan/zoom. Returns the plane centre `c` (RAS, incl. scrub offset + pan) and the half-... no:
    *  uS/vS are the FULL in-plane extents mapped across the viewport width/height. */
   frameFor(orient, offset01, aspectWH) {
-    const b = BASES[orient];
+    const b = this.basisOf(orient);
     const vs = this.viewState[orient];
     const { uS0, vS0 } = this.fitUV(orient, aspectWH);
     const uS = uS0 / vs.zoom, vS = vS0 / vs.zoom;
     const c = [(this.rasLo[0] + this.rasHi[0]) / 2, (this.rasLo[1] + this.rasHi[1]) / 2, (this.rasLo[2] + this.rasHi[2]) / 2];
-    c[b.nAxis] = this.rasLo[b.nAxis] + Math.max(0, Math.min(1, offset01)) * (this.rasHi[b.nAxis] - this.rasLo[b.nAxis]);
+    const nx = this.extentAlong(b.nDir);
+    const want = nx.lo + Math.max(0, Math.min(1, offset01)) * (nx.hi - nx.lo);
+    const have = dot3(c, b.nDir);
+    c[0] += b.nDir[0] * (want - have);
+    c[1] += b.nDir[1] * (want - have);
+    c[2] += b.nDir[2] * (want - have);
     c[0] += b.uDir[0] * vs.panU + b.vDir[0] * vs.panV;
     c[1] += b.uDir[1] * vs.panU + b.vDir[1] * vs.panV;
     c[2] += b.uDir[2] * vs.panU + b.vDir[2] * vs.panV;
@@ -517,9 +552,9 @@ var SliceRenderer = class {
    *  zoom proportionally; pan is the centre's offset from the volume centre projected onto the
    *  plane's in-plane axes. The out-of-plane offset is applied separately via setPlane. */
   setMirrorFrame(orient, centerRAS, fovX, fovY) {
-    const b = BASES[orient];
-    const uExt = this.rasHi[b.uAxis] - this.rasLo[b.uAxis];
-    const vExt = this.rasHi[b.vAxis] - this.rasLo[b.vAxis];
+    const b = this.basisOf(orient);
+    const ux = this.extentAlong(b.uDir), vx = this.extentAlong(b.vDir);
+    const uExt = ux.hi - ux.lo, vExt = vx.hi - vx.lo;
     const zoom = Math.max(uExt / Math.max(fovX, 1e-6), vExt / Math.max(fovY, 1e-6));
     const volC = [(this.rasLo[0] + this.rasHi[0]) / 2, (this.rasLo[1] + this.rasHi[1]) / 2, (this.rasLo[2] + this.rasHi[2]) / 2];
     const d = [centerRAS[0] - volC[0], centerRAS[1] - volC[1], centerRAS[2] - volC[2]];
@@ -531,7 +566,7 @@ var SliceRenderer = class {
    *  plane — for click picking. Returns the tex coord; the caller converts to IJK via
    *  ijk = tex*dims - 0.5. Anisotropy/rotation are handled by the same p2t the shader uses. */
   viewToTex(u, v) {
-    const b = BASES[this.orient];
+    const b = this.basisOf(this.orient);
     const uS = this.uSpanMm || this.viewSpanMm();
     const vS = this.vSpanMm || this.viewSpanMm();
     const c = this.cX;
@@ -551,7 +586,7 @@ var SliceRenderer = class {
     const d = [ras[0] - c[0], ras[1] - c[1], ras[2] - c[2]];
     const u = 0.5 + (d[0] * b.uDir[0] + d[1] * b.uDir[1] + d[2] * b.uDir[2]) / uS;
     const v = 0.5 - (d[0] * b.vDir[0] + d[1] * b.vDir[1] + d[2] * b.vDir[2]) / vS;
-    return { u, v, distMm: d[b.nAxis] };
+    return { u, v, distMm: dot3(d, b.nDir) };
   }
   /** Map a view (u,v in [0,1], y down) on a plane back to a RAS point ON that plane —
    *  the exact inverse of rasToView (same pan/zoom/aspect). Used to drag a 2D markup:
@@ -5769,9 +5804,9 @@ function mountBir(cfg) {
       } else if (m.kind === "angle" && m.pts.length === 4) {
         const v1 = [m.pts[1][0] - m.pts[0][0], m.pts[1][1] - m.pts[0][1], m.pts[1][2] - m.pts[0][2]];
         const v2 = [m.pts[3][0] - m.pts[2][0], m.pts[3][1] - m.pts[2][1], m.pts[3][2] - m.pts[2][2]];
-        const dot3 = v1[0] * v2[0] + v1[1] * v2[1] + v1[2] * v2[2];
+        const dot4 = v1[0] * v2[0] + v1[1] * v2[1] + v1[2] * v2[2];
         const deg = Math.acos(
-          Math.min(1, Math.abs(dot3) / (Math.hypot(...v1) * Math.hypot(...v2) || 1))
+          Math.min(1, Math.abs(dot4) / (Math.hypot(...v1) * Math.hypot(...v2) || 1))
         ) * 180 / Math.PI;
         label(`${deg.toFixed(1)}\xB0`, px[3].x + 8, px[3].y - 8);
       }
@@ -6860,6 +6895,15 @@ async function main() {
     onThumb: (n, w, h, rgba) => mosaic.thumb(n, w, h, rgba)
   });
   const sc = buildSegrouletteScene(gpu, srgb, res.ct, res.seg);
+  const vd = res.ct.vol;
+  let vmin = Infinity, vmax = -Infinity;
+  const vstride = Math.max(1, Math.floor(vd.length / 2e6));
+  for (let i = 0; i < vd.length; i += vstride) {
+    const v = vd[i];
+    if (v < vmin) vmin = v;
+    if (v > vmax) vmax = v;
+  }
+  const dataRange = () => [vmin, vmax];
   sc.setVolumeOpacity(0.5);
   let sliceOutline = false;
   let roiEnabled = false, roiVisible = false, roiFirstEnable = true;
@@ -7060,7 +7104,7 @@ async function main() {
         enabled: () => bir.tool() === "wl",
         get: () => [wl.win, wl.lev],
         set: setWL,
-        range: () => res.ct.range,
+        range: dataRange,
         reset: () => setWL(sc.win, sc.lev)
       },
       leftMode: () => bir.leftMode(),
@@ -7109,14 +7153,6 @@ async function main() {
   });
   let vrPreset = null;
   let vrShift = 0;
-  const vd = res.ct.vol;
-  let vmin = Infinity, vmax = -Infinity;
-  const vstride = Math.max(1, Math.floor(vd.length / 2e6));
-  for (let i = 0; i < vd.length; i += vstride) {
-    const v = vd[i];
-    if (v < vmin) vmin = v;
-    if (v > vmax) vmax = v;
-  }
   const shiftRange = Math.max(200, (vmax - vmin) / 2);
   const bakeOf = (name) => name ? presetLUT(CT_VR_PRESETS.find((p) => p.name === name)) : null;
   const presetLabel = () => vrPreset ? CT_VR_PRESETS.find((p) => p.name === vrPreset)?.label ?? vrPreset : "Default (W/L)";
