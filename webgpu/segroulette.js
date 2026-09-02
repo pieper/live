@@ -4,7 +4,7 @@ async function initDevice() {
   if (!gpu) throw new Error("WebGPU not available (need Chrome/Edge/Safari or Deno --unstable-webgpu)");
   const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
   if (!adapter) throw new Error("no WebGPU adapter");
-  const want = ["float32-filterable", "timestamp-query"].filter((f) => adapter.features.has(f));
+  const want = ["float32-filterable", "timestamp-query", "shader-f16"].filter((f) => adapter.features.has(f));
   const lim = adapter.limits;
   const requiredLimits = {};
   const raise = (k) => {
@@ -42,6 +42,21 @@ function perspectiveZO(fovy, aspect, near, far) {
   m[5] = f;
   m[11] = -1;
   m[10] = far / (near - far);
+  m[14] = far * near / (near - far);
+  return m;
+}
+function perspectiveZOTile(fovy, viewW, viewH, x, y, w, h, near, far) {
+  const t = near * Math.tan(fovy / 2), b = -t;
+  const r = t * (viewW / viewH), l = -r;
+  const l2 = l + (r - l) * x / viewW, r2 = l + (r - l) * (x + w) / viewW;
+  const t2 = t - (t - b) * y / viewH, b2 = t - (t - b) * (y + h) / viewH;
+  const m = new Float32Array(16);
+  m[0] = 2 * near / (r2 - l2);
+  m[5] = 2 * near / (t2 - b2);
+  m[8] = (r2 + l2) / (r2 - l2);
+  m[9] = (t2 + b2) / (t2 - b2);
+  m[10] = far / (near - far);
+  m[11] = -1;
   m[14] = far * near / (near - far);
   return m;
 }
@@ -174,13 +189,29 @@ struct U {
   uvec : vec4<f32>,      // RAS vector spanning the view width  (isotropic mm)
   vvec : vec4<f32>,      // RAS vector spanning the view height (isotropic mm)
   params : vec4<f32>,    // win, lev, fillOpacity, outlineOpacity
-  size : vec4<f32>,      // sizeX, sizeY, _, _
+  size : vec4<f32>,      // sizeX, sizeY, labelOverlayMode, bgLutMode (0 gray, 1 LUT row 0)
+  // \u2500\u2500 Slicer slice-composite layers (vtkMRMLSliceCompositeNode): a FOREGROUND volume blended over the
+  //    background with its own geometry, W/L and LUT, and a LABEL volume coloured through a colour table.
+  p2tFg : mat4x4<f32>,   // RAS -> foreground texture[0,1]
+  fgParams : vec4<f32>,  // win, lev, opacity (0 = no foreground), compositing (0 alpha,1 reverse alpha,2 add,3 subtract)
+  p2tLabel : mat4x4<f32>,// RAS -> label texture[0,1]
+  labelParams : vec4<f32>, // opacity (0 = no label layer), lutEntries, fgLutMode (0 gray, 1 LUT row 1), _
 };
 @group(0) @binding(0) var<uniform> u : U;
 @group(0) @binding(1) var s_lin : sampler;
 @group(0) @binding(2) var t_scalar : texture_3d<f32>;
 @group(0) @binding(3) var t_overlay : texture_3d<f32>;
 @group(0) @binding(4) var s_nn : sampler;   // NEAREST \u2014 labelmap overlay is per-voxel crisp (matches Slicer)
+// Label-overlay mode (size.z > 0.5): instead of a pre-coloured rgba volume, take the segment
+// number from a u8 label volume and its colour+opacity from the same 256x2 palette the
+// ColorizeField uses. A coloured overlay of a 509x365x299 CT would be 222 MB; label + palette
+// is 55 MB and, because it shares the palette, hiding an organ group in 3D hides it here too.
+@group(0) @binding(5) var t_labels : texture_3d<u32>;
+@group(0) @binding(6) var t_palette : texture_2d<f32>;
+@group(0) @binding(7) var t_fg : texture_3d<f32>;       // foreground scalar volume
+@group(0) @binding(8) var t_lut : texture_2d<f32>;      // 256x2 colour LUTs: row 0 background, row 1 foreground (sampled over the W/L ramp)
+@group(0) @binding(9) var t_labelVol : texture_3d<f32>; // label volume (integer values stored as float)
+@group(0) @binding(10) var t_labelLut : texture_2d<f32>;// Nx1 colour table indexed by label value
 
 struct V { @builtin(position) position : vec4<f32> };
 @vertex
@@ -193,10 +224,21 @@ fn srgb2physical(c : vec3<f32>) -> vec3<f32> {
   let lo = c / 12.92; let hi = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
   return select(lo, hi, c > vec3<f32>(0.04045));
 }
+/** The overlay colour at a texture coordinate, from whichever source is configured. */
+fn ov_tex(t : vec3<f32>) -> vec4<f32> {
+  if (u.size.z > 0.5) {
+    let d = vec3<f32>(textureDimensions(t_labels));
+    let vi = vec3<i32>(clamp(floor(t * d), vec3<f32>(0.0), d - vec3<f32>(1.0)));
+    let lab = i32(textureLoad(t_labels, vi, 0).r);
+    if (lab == 0) { return vec4<f32>(0.0); }
+    return textureLoad(t_palette, vec2<i32>(lab, 1), 0);
+  }
+  return textureSampleLevel(t_overlay, s_nn, t, 0.0);
+}
 fn ov_at(ras : vec3<f32>) -> vec4<f32> {   // overlay at a RAS point (0 outside the volume)
   let t = (u.p2t * vec4<f32>(ras, 1.0)).xyz;
   if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { return vec4<f32>(0.0); }
-  return textureSampleLevel(t_overlay, s_nn, t, 0.0);
+  return ov_tex(t);
 }
 @fragment
 fn fs_main(v : V) -> @location(0) vec4<f32> {
@@ -209,7 +251,37 @@ fn fs_main(v : V) -> @location(0) vec4<f32> {
   let win = max(u.params.x, 1e-6);
   let g = clamp((val - (u.params.y - win * 0.5)) / win, 0.0, 1.0);
   var col = vec3<f32>(g);
-  let ov = textureSampleLevel(t_overlay, s_nn, tex, 0.0);
+  if (u.size.w > 0.5) { col = textureLoad(t_lut, vec2<i32>(i32(g * 255.0), 0), 0).rgb; }
+  // \u2500\u2500 foreground layer (Slicer's vtkImageBlend semantics per compositing mode) \u2500\u2500
+  if (u.fgParams.z > 0.0) {
+    let tf = (u.p2tFg * vec4<f32>(ras, 1.0)).xyz;
+    if (all(tf >= vec3<f32>(0.0)) && all(tf <= vec3<f32>(1.0))) {
+      let fv = textureSampleLevel(t_fg, s_lin, tf, 0.0).r;
+      let fwin = max(u.fgParams.x, 1e-6);
+      let fg = clamp((fv - (u.fgParams.y - fwin * 0.5)) / fwin, 0.0, 1.0);
+      var fcol = vec3<f32>(fg);
+      if (u.labelParams.z > 0.5) { fcol = textureLoad(t_lut, vec2<i32>(i32(fg * 255.0), 1), 0).rgb; }
+      let a = u.fgParams.z;
+      let mode = i32(u.fgParams.w + 0.5);
+      if (mode == 0) { col = mix(col, fcol, a); }                       // alpha: fg over bg
+      else if (mode == 1) { col = mix(fcol, col, a); }                  // reverse alpha: bg over fg
+      else if (mode == 2) { col = clamp(col + fcol * a, vec3<f32>(0.0), vec3<f32>(1.0)); }   // add
+      else { col = clamp(col - fcol * a, vec3<f32>(0.0), vec3<f32>(1.0)); }                   // subtract
+    }
+  }
+  // \u2500\u2500 label layer: integer label -> colour table entry, blended at labelOpacity (label 0 = transparent) \u2500\u2500
+  if (u.labelParams.x > 0.0) {
+    let tl = (u.p2tLabel * vec4<f32>(ras, 1.0)).xyz;
+    if (all(tl >= vec3<f32>(0.0)) && all(tl <= vec3<f32>(1.0))) {
+      let lv = i32(textureSampleLevel(t_labelVol, s_nn, tl, 0.0).r + 0.5);
+      let nEntries = i32(u.labelParams.y);
+      if (lv > 0 && lv < nEntries) {
+        let lc = textureLoad(t_labelLut, vec2<i32>(lv, 0), 0);
+        col = mix(col, lc.rgb, clamp(lc.a * u.labelParams.x, 0.0, 1.0));
+      }
+    }
+  }
+  let ov = ov_tex(tex);
   // Slicer-style 2D segmentation: a semi-transparent per-voxel FILL plus a brighter boundary
   // OUTLINE, with independent opacities (params.z = fill, params.w = outline). The outline is
   // screen-space (constant pixel width under zoom), drawn in the segment's own colour along its
@@ -231,10 +303,11 @@ fn fs_main(v : V) -> @location(0) vec4<f32> {
 `
 );
 var BASES = {
-  axial: { uDir: [-1, 0, 0], vDir: [0, 1, 0], uAxis: 0, vAxis: 1, nAxis: 2 },
-  coronal: { uDir: [-1, 0, 0], vDir: [0, 0, 1], uAxis: 0, vAxis: 2, nAxis: 1 },
-  sagittal: { uDir: [0, -1, 0], vDir: [0, 0, 1], uAxis: 1, vAxis: 2, nAxis: 0 }
+  axial: { uDir: [-1, 0, 0], vDir: [0, 1, 0], nDir: [0, 0, 1] },
+  coronal: { uDir: [-1, 0, 0], vDir: [0, 0, 1], nDir: [0, 1, 0] },
+  sagittal: { uDir: [0, -1, 0], vDir: [0, 0, 1], nDir: [1, 0, 0] }
 };
+var dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 function ijkAxisForRasAxis(ijkToRAS, rasAxis) {
   let best = 0, bestMag = -1;
   for (let c = 0; c < 3; c++) {
@@ -248,7 +321,8 @@ function ijkAxisForRasAxis(ijkToRAS, rasAxis) {
 }
 function slicerDefaultOffset01(orient, dims, ijkToRAS, rasLo, rasHi) {
   const b = BASES[orient];
-  const n = b.nAxis;
+  const nAbs = b.nDir.map(Math.abs);
+  const n = nAbs[0] >= nAbs[1] && nAbs[0] >= nAbs[2] ? 0 : nAbs[1] >= nAbs[2] ? 1 : 2;
   const a = ijkAxisForRasAxis(ijkToRAS, n);
   const m = Math.floor((dims[a] - 1) / 2);
   const ijk = [(dims[0] - 1) / 2, (dims[1] - 1) / 2, (dims[2] - 1) / 2];
@@ -264,10 +338,27 @@ var SliceRenderer = class {
   sampler;
   nnSampler;
   ubuf;
-  u = new Float32Array(36);
-  // p2t(16) + origin(4) + uvec(4) + vvec(4) + params(4) + size(4)
+  u = new Float32Array(80);
+  // p2t(16) origin(4) uvec(4) vvec(4) params(4) size(4) | p2tFg(16) fgParams(4) p2tLabel(16) labelParams(4)
   bind;
+  // Adaptive downsample (moving frames): render the reslice into a low-res target, then bilinear-blit
+  // it up to the view — the 2D analogue of SceneRenderer.renderUpscaled. Lets a slice cell degrade
+  // resolution under load to keep interactive latency low, snapping back to native when settled.
+  blitPipeline;
+  lowTex;
+  lowView;
+  lowW = 0;
+  lowH = 0;
+  blitBind;
   overlay;
+  labels;
+  palette;
+  scalarTex;
+  fgTex;
+  lutTex;
+  // 256x2 rgba8: row 0 bg LUT, row 1 fg LUT
+  labelVolTex;
+  labelLutTex;
   // actual in-plane extents (mm) spanned by the LAST rendered viewport, aspect-corrected so
   // pixels stay isotropic on a non-square view (0 until first render → fall back to the square span).
   uSpanMm = 0;
@@ -287,6 +378,9 @@ var SliceRenderer = class {
   };
   cX = [0, 0, 0];
   // in-plane centre of the LAST rendered frame (for viewToTex picking)
+  // Optional per-orientation basis override (reslice along a volume's own axes). null = the
+  // anatomical preset.
+  basisOverride = {};
   constructor(gpu, format = DEFAULT_FORMAT) {
     this.dev = gpu.device;
     this.format = format;
@@ -303,6 +397,90 @@ var SliceRenderer = class {
     this.setWindowLevel(255, 127);
     this.setOverlayOpacity(0.55);
   }
+  /** 1x1x1 stand-ins so the label-overlay bindings always exist. The pipeline layout is fixed,
+   *  so every caller must bind them even when it only wants a plain MPR. */
+  emptyLabels;
+  emptyPalette;
+  noLabels() {
+    if (!this.emptyLabels) {
+      this.emptyLabels = this.dev.createTexture({ size: [1, 1, 1], dimension: "3d", format: "r8uint", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+      this.dev.queue.writeTexture({ texture: this.emptyLabels }, new Uint8Array(1), { bytesPerRow: 1, rowsPerImage: 1 }, [1, 1, 1]);
+    }
+    return this.emptyLabels;
+  }
+  noPalette() {
+    if (!this.emptyPalette) {
+      this.emptyPalette = this.dev.createTexture({ size: [256, 2], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+      this.dev.queue.writeTexture({ texture: this.emptyPalette }, new Uint8Array(256 * 2 * 4), { bytesPerRow: 256 * 4 }, [256, 2]);
+    }
+    return this.emptyPalette;
+  }
+  emptyScalar;
+  noScalar() {
+    if (!this.emptyScalar) {
+      this.emptyScalar = this.dev.createTexture({ size: [1, 1, 1], dimension: "3d", format: "r32float", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+      this.dev.queue.writeTexture({ texture: this.emptyScalar }, new Float32Array(1), { bytesPerRow: 4, rowsPerImage: 1 }, [1, 1, 1]);
+    }
+    return this.emptyScalar;
+  }
+  emptyLut;
+  noLut() {
+    if (!this.emptyLut) {
+      this.emptyLut = this.dev.createTexture({ size: [256, 2], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+      this.dev.queue.writeTexture({ texture: this.emptyLut }, new Uint8Array(256 * 2 * 4), { bytesPerRow: 256 * 4 }, [256, 2]);
+    }
+    return this.emptyLut;
+  }
+  /** Foreground layer: a second scalar volume with its own RAS->texture mapping, W/L, opacity and
+   *  compositing mode (Slicer's slice composite node). Pass null to remove. */
+  setForeground(tex, p2t, win, lev, opacity, compositing = 0) {
+    this.fgTex = tex ?? void 0;
+    if (p2t) this.u.set(p2t, 36);
+    this.u[52] = win;
+    this.u[53] = lev;
+    this.u[54] = tex ? opacity : 0;
+    this.u[55] = compositing;
+    if (this.scalarTex) this.rebind();
+  }
+  /** Colour LUTs over the W/L ramp for the background (row 0) and foreground (row 1): 256 rgba8 entries
+   *  each, or null for the grayscale ramp. */
+  setLayerLUTs(bg, fg) {
+    if (!bg && !fg) {
+      this.lutTex = void 0;
+      this.u[35] = 0;
+      this.u[58] = 0;
+      if (this.scalarTex) this.rebind();
+      return;
+    }
+    if (!this.lutTex) this.lutTex = this.dev.createTexture({ size: [256, 2], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+    const gray = new Uint8Array(256 * 4);
+    for (let i = 0; i < 256; i++) {
+      gray[i * 4] = gray[i * 4 + 1] = gray[i * 4 + 2] = i;
+      gray[i * 4 + 3] = 255;
+    }
+    this.dev.queue.writeTexture({ texture: this.lutTex, origin: [0, 0] }, bg ?? gray, { bytesPerRow: 256 * 4 }, [256, 1]);
+    this.dev.queue.writeTexture({ texture: this.lutTex, origin: [0, 1] }, fg ?? gray, { bytesPerRow: 256 * 4 }, [256, 1]);
+    this.u[35] = bg ? 1 : 0;
+    this.u[58] = fg ? 1 : 0;
+    if (this.scalarTex) this.rebind();
+  }
+  /** Label layer: a label volume (integer values in a float texture) coloured through a colour table
+   *  (rgba8 entries, index = label value), blended at `opacity`. Pass null to remove. */
+  setLabelLayer(tex, p2t, table, opacity) {
+    this.labelVolTex = tex ?? void 0;
+    if (p2t) this.u.set(p2t, 60);
+    const n = table ? table.length / 4 : 0;
+    if (table && n > 0) {
+      if (!this.labelLutTex || this.labelLutTex.width !== n) {
+        this.labelLutTex?.destroy();
+        this.labelLutTex = this.dev.createTexture({ size: [n, 1], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+      }
+      this.dev.queue.writeTexture({ texture: this.labelLutTex }, table, { bytesPerRow: n * 4 }, [n, 1]);
+    }
+    this.u[76] = tex && table ? opacity : 0;
+    this.u[77] = n;
+    if (this.scalarTex) this.rebind();
+  }
   emptyOverlay;
   transparentOverlay() {
     if (!this.emptyOverlay) {
@@ -310,6 +488,40 @@ var SliceRenderer = class {
       this.dev.queue.writeTexture({ texture: this.emptyOverlay }, new Uint16Array(4), { bytesPerRow: 8, rowsPerImage: 1 }, [1, 1, 1]);
     }
     return this.emptyOverlay;
+  }
+  /** Reslice this orientation along an arbitrary RAS basis instead of the anatomical preset.
+   *  Pass null to restore. The vectors should be unit length and mutually orthogonal; they are
+   *  used verbatim, so the caller owns the display convention for a non-anatomical frame. */
+  setBasis(orient, basis) {
+    this.basisOverride[orient] = basis;
+  }
+  /** offset01 (the setPlane scrub coordinate) for a RAS point, along the plane's current normal — the
+   *  inverse of what setPlane does internally, so a caller holding a position in mm (a slice node's
+   *  centre, a crosshair) can address the same slice for anatomical AND oblique bases. */
+  offset01Along(orient, ras) {
+    const n = this.basisOf(orient).nDir;
+    const { lo, hi } = this.extentAlong(n);
+    return Math.max(0, Math.min(1, (dot3(ras, n) - lo) / Math.max(hi - lo, 1e-6)));
+  }
+  basisOf(orient) {
+    return this.basisOverride[orient] ?? BASES[orient];
+  }
+  /** Extent of the volume's RAS bounding box projected onto a direction — the generalisation
+   *  of "rasHi[axis] - rasLo[axis]" to an oblique axis. Reduces to exactly that for the
+   *  anatomical bases, since projecting an axis-aligned box on its own axis is the axis span. */
+  extentAlong(d) {
+    let lo = Infinity, hi = -Infinity;
+    for (let i = 0; i < 8; i++) {
+      const c = [
+        i & 1 ? this.rasHi[0] : this.rasLo[0],
+        i & 2 ? this.rasHi[1] : this.rasLo[1],
+        i & 4 ? this.rasHi[2] : this.rasLo[2]
+      ];
+      const t = dot3(c, d);
+      if (t < lo) lo = t;
+      if (t > hi) hi = t;
+    }
+    return { lo, hi };
   }
   /** Volume geometry: patientToTexture (RAS->tex[0,1], encodes ijkToRAS) + the RAS
    *  bounding box (for plane extents/scrub range). Get both from the ImageField. */
@@ -324,14 +536,34 @@ var SliceRenderer = class {
    *  same RAS->tex mapping addresses both. Omit overlay for a plain MPR. */
   setTextures(scalar, overlay) {
     this.overlay = overlay ?? this.transparentOverlay();
+    this.scalarTex = scalar;
+    this.rebind();
+  }
+  /** Colour the overlay from a u8 label volume + the 256x2 palette (row 1 = colour/opacity),
+   *  instead of a pre-coloured rgba volume. Same geometry requirement as setTextures. Pass
+   *  nulls to go back to the rgba overlay. */
+  setLabelOverlay(labels, palette) {
+    this.labels = labels ?? void 0;
+    this.palette = palette ?? void 0;
+    this.u[34] = labels && palette ? 1 : 0;
+    if (this.scalarTex) this.rebind();
+  }
+  rebind() {
+    if (!this.scalarTex) return;
     this.bind = this.dev.createBindGroup({
       layout: this.pipeline.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: this.ubuf } },
         { binding: 1, resource: this.sampler },
-        { binding: 2, resource: scalar.createView() },
-        { binding: 3, resource: this.overlay.createView() },
-        { binding: 4, resource: this.nnSampler }
+        { binding: 2, resource: this.scalarTex.createView() },
+        { binding: 3, resource: (this.overlay ?? this.transparentOverlay()).createView() },
+        { binding: 4, resource: this.nnSampler },
+        { binding: 5, resource: (this.labels ?? this.noLabels()).createView() },
+        { binding: 6, resource: (this.palette ?? this.noPalette()).createView() },
+        { binding: 7, resource: (this.fgTex ?? this.noScalar()).createView() },
+        { binding: 8, resource: (this.lutTex ?? this.noLut()).createView() },
+        { binding: 9, resource: (this.labelVolTex ?? this.noScalar()).createView() },
+        { binding: 10, resource: (this.labelLutTex ?? this.noPalette()).createView() }
       ]
     });
   }
@@ -363,10 +595,9 @@ var SliceRenderer = class {
    *  Slicer: Red FOV=[891.78,256] at viewport 634x182 -> vertical FOV == the 256mm
    *  A-extent, horizontal follows viewport aspect.) */
   viewSpanMm() {
-    const b = BASES[this.orient];
-    const uExt = this.rasHi[b.uAxis] - this.rasLo[b.uAxis];
-    const vExt = this.rasHi[b.vAxis] - this.rasLo[b.vAxis];
-    return Math.max(uExt, vExt);
+    const b = this.basisOf(this.orient);
+    const u = this.extentAlong(b.uDir), v = this.extentAlong(b.vDir);
+    return Math.max(u.hi - u.lo, v.hi - v.lo);
   }
   /** The fitted in-plane extent (mm) used for a given orientation — the value directly
    *  comparable to a Slicer slice node's fitted fieldOfView. */
@@ -377,10 +608,17 @@ var SliceRenderer = class {
     this.orient = prev;
     return s;
   }
-  /** Fitted (zoom=1) in-plane extent for an orientation. */
-  baseSpan(orient) {
-    const b = BASES[orient];
-    return Math.max(this.rasHi[b.uAxis] - this.rasLo[b.uAxis], this.rasHi[b.vAxis] - this.rasLo[b.vAxis]);
+  /** Letterbox fit at zoom=1 (Slicer's FitSliceToVolume): the in-plane FOV (uS0×vS0) that
+   *  exactly contains the slice's bounding box in a viewport of the given aspect — the whole
+   *  slice is visible and the LIMITING axis touches the window edge (so the largest fitting
+   *  axis fills the window, no needless margin). Replaces the old max(uExt,vExt) span, which
+   *  under-zoomed whenever the larger extent wasn't on the viewport's limiting axis. */
+  fitUV(orient, aspectWH) {
+    const b = this.basisOf(orient);
+    const u = this.extentAlong(b.uDir), v = this.extentAlong(b.vDir);
+    const uExt = u.hi - u.lo, vExt = v.hi - v.lo;
+    const uS0 = Math.max(uExt, vExt * aspectWH);
+    return { uS0, vS0: uS0 / aspectWH };
   }
   /** The complete in-plane view frame for an orientation at a given viewport aspect, folding
    *  in pan (mm along uDir/vDir) + zoom. Single source of truth shared by drawInto, rasToView,
@@ -388,12 +626,17 @@ var SliceRenderer = class {
    *  pan/zoom. Returns the plane centre `c` (RAS, incl. scrub offset + pan) and the half-... no:
    *  uS/vS are the FULL in-plane extents mapped across the viewport width/height. */
   frameFor(orient, offset01, aspectWH) {
-    const b = BASES[orient];
+    const b = this.basisOf(orient);
     const vs = this.viewState[orient];
-    const span = this.baseSpan(orient) / vs.zoom;
-    const uS = span * Math.max(1, aspectWH), vS = span * Math.max(1, 1 / aspectWH);
+    const { uS0, vS0 } = this.fitUV(orient, aspectWH);
+    const uS = uS0 / vs.zoom, vS = vS0 / vs.zoom;
     const c = [(this.rasLo[0] + this.rasHi[0]) / 2, (this.rasLo[1] + this.rasHi[1]) / 2, (this.rasLo[2] + this.rasHi[2]) / 2];
-    c[b.nAxis] = this.rasLo[b.nAxis] + Math.max(0, Math.min(1, offset01)) * (this.rasHi[b.nAxis] - this.rasLo[b.nAxis]);
+    const nx = this.extentAlong(b.nDir);
+    const want = nx.lo + Math.max(0, Math.min(1, offset01)) * (nx.hi - nx.lo);
+    const have = dot3(c, b.nDir);
+    c[0] += b.nDir[0] * (want - have);
+    c[1] += b.nDir[1] * (want - have);
+    c[2] += b.nDir[2] * (want - have);
     c[0] += b.uDir[0] * vs.panU + b.vDir[0] * vs.panV;
     c[1] += b.uDir[1] * vs.panU + b.vDir[1] * vs.panV;
     c[2] += b.uDir[2] * vs.panU + b.vDir[2] * vs.panV;
@@ -405,26 +648,35 @@ var SliceRenderer = class {
   }
   /** Pan the in-plane view by a pixel delta (drag): the anatomy under the cursor follows it. */
   panByPixels(orient, dxPx, dyPx, w, h) {
-    const span = this.baseSpan(orient) / this.viewState[orient].zoom;
-    const uS = span * Math.max(1, w / h), vS = span * Math.max(1, h / w);
+    const z = this.viewState[orient].zoom;
+    const { uS0, vS0 } = this.fitUV(orient, w / h);
+    const uS = uS0 / z, vS = vS0 / z;
     this.viewState[orient].panU -= dxPx / w * uS;
     this.viewState[orient].panV += dyPx / h * vS;
   }
   /** Zoom by `factor` (>1 zooms in) about a pivot (u,v in [0,1]); the pivot point stays fixed. */
   zoomAbout(orient, factor, pu, pv, w, h) {
     const vs = this.viewState[orient];
-    const base = this.baseSpan(orient);
-    const spanOld = base / vs.zoom;
+    const { uS0, vS0 } = this.fitUV(orient, w / h);
     const z = Math.max(0.2, Math.min(50, vs.zoom * factor));
-    const spanNew = base / z;
-    const au = Math.max(1, w / h), av = Math.max(1, h / w);
-    vs.panU += (pu - 0.5) * (spanOld - spanNew) * au;
-    vs.panV += (0.5 - pv) * (spanOld - spanNew) * av;
+    vs.panU += (pu - 0.5) * (uS0 / vs.zoom - uS0 / z);
+    vs.panV += (0.5 - pv) * (vS0 / vs.zoom - vS0 / z);
     vs.zoom = z;
   }
   /** Reset pan/zoom for an orientation to the fitted view. */
   resetView(orient) {
     this.viewState[orient] = { panU: 0, panV: 0, zoom: 1 };
+  }
+  /** Snapshot per-orientation pan+zoom (e.g. to persist a view across reloads). */
+  getViewState() {
+    return structuredClone(this.viewState);
+  }
+  /** Restore a (possibly partial) snapshot from getViewState(). */
+  setViewState(vs) {
+    for (const k of Object.keys(vs)) {
+      const v = vs[k];
+      if (v && Number.isFinite(v.zoom) && v.zoom > 0) this.viewState[k] = { ...v };
+    }
   }
   /** Mirror Slicer's in-plane navigation for an orientation: drive pan + zoom from the slice
    *  node's RAS centre and field of view (mm). zoom = extent/FOV on the limiting axis (== 1 when
@@ -432,21 +684,37 @@ var SliceRenderer = class {
    *  zoom proportionally; pan is the centre's offset from the volume centre projected onto the
    *  plane's in-plane axes. The out-of-plane offset is applied separately via setPlane. */
   setMirrorFrame(orient, centerRAS, fovX, fovY) {
-    const b = BASES[orient];
-    const uExt = this.rasHi[b.uAxis] - this.rasLo[b.uAxis];
-    const vExt = this.rasHi[b.vAxis] - this.rasLo[b.vAxis];
-    const zoom = Math.max(uExt / Math.max(fovX, 1e-6), vExt / Math.max(fovY, 1e-6));
+    const b = this.basisOf(orient);
+    const aspect = fovX / Math.max(fovY, 1e-6);
+    const { uS0 } = this.fitUV(orient, aspect);
+    const zoom = Math.max(1e-3, uS0 / Math.max(fovX, 1e-6));
     const volC = [(this.rasLo[0] + this.rasHi[0]) / 2, (this.rasLo[1] + this.rasHi[1]) / 2, (this.rasLo[2] + this.rasHi[2]) / 2];
     const d = [centerRAS[0] - volC[0], centerRAS[1] - volC[1], centerRAS[2] - volC[2]];
     const panU = d[0] * b.uDir[0] + d[1] * b.uDir[1] + d[2] * b.uDir[2];
     const panV = d[0] * b.vDir[0] + d[1] * b.vDir[1] + d[2] * b.vDir[2];
-    this.viewState[orient] = { panU, panV, zoom: Math.max(1e-3, zoom) };
+    this.viewState[orient] = { panU, panV, zoom };
+  }
+  /** The current pan/zoom of a plane expressed the way Slicer's slice node stores it: in-plane centre
+   *  (RAS, without the out-of-plane offset which the caller owns) + field of view (mm) — the inverse
+   *  of setMirrorFrame, so a local pan/zoom can be written back to the app as a slice frame. */
+  mirrorFrame(orient, aspectWH) {
+    const b = this.basisOf(orient);
+    const st = this.viewState[orient];
+    const { uS0, vS0 } = this.fitUV(orient, aspectWH);
+    const fovX = uS0 / st.zoom, fovY = vS0 / st.zoom;
+    const volC = [(this.rasLo[0] + this.rasHi[0]) / 2, (this.rasLo[1] + this.rasHi[1]) / 2, (this.rasLo[2] + this.rasHi[2]) / 2];
+    const centerRAS = [
+      volC[0] + b.uDir[0] * st.panU + b.vDir[0] * st.panV,
+      volC[1] + b.uDir[1] * st.panU + b.vDir[1] * st.panV,
+      volC[2] + b.uDir[2] * st.panU + b.vDir[2] * st.panV
+    ];
+    return { centerRAS, fovX, fovY };
   }
   /** Map a view (u,v) in [0,1] (y down) to normalized texture coords for the current
    *  plane — for click picking. Returns the tex coord; the caller converts to IJK via
    *  ijk = tex*dims - 0.5. Anisotropy/rotation are handled by the same p2t the shader uses. */
   viewToTex(u, v) {
-    const b = BASES[this.orient];
+    const b = this.basisOf(this.orient);
     const uS = this.uSpanMm || this.viewSpanMm();
     const vS = this.vSpanMm || this.viewSpanMm();
     const c = this.cX;
@@ -466,7 +734,7 @@ var SliceRenderer = class {
     const d = [ras[0] - c[0], ras[1] - c[1], ras[2] - c[2]];
     const u = 0.5 + (d[0] * b.uDir[0] + d[1] * b.uDir[1] + d[2] * b.uDir[2]) / uS;
     const v = 0.5 - (d[0] * b.vDir[0] + d[1] * b.vDir[1] + d[2] * b.vDir[2]) / vS;
-    return { u, v, distMm: d[b.nAxis] };
+    return { u, v, distMm: dot3(d, b.nDir) };
   }
   /** Map a view (u,v in [0,1], y down) on a plane back to a RAS point ON that plane —
    *  the exact inverse of rasToView (same pan/zoom/aspect). Used to drag a 2D markup:
@@ -511,6 +779,62 @@ var SliceRenderer = class {
   }
   renderToView(view, w, h) {
     this.drawInto(view, w, h);
+  }
+  /** Bilinear-blit pipeline (fullscreen triangle) that upsamples the low-res reslice to the view. */
+  ensureBlit() {
+    if (this.blitPipeline) return;
+    const m = this.dev.createShaderModule({
+      code: (
+        /* wgsl */
+        `
+struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex fn vs(@builtin(vertex_index) i: u32) -> VO {
+  var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+  var o: VO; o.pos = vec4<f32>(p[i], 0.0, 1.0);
+  o.uv = vec2<f32>((p[i].x + 1.0) * 0.5, (1.0 - p[i].y) * 0.5); return o;
+}
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+@fragment fn fs(in: VO) -> @location(0) vec4<f32> { return textureSample(src, samp, in.uv); }`
+      )
+    });
+    this.blitPipeline = this.dev.createRenderPipeline({
+      layout: "auto",
+      vertex: { module: m, entryPoint: "vs" },
+      fragment: { module: m, entryPoint: "fs", targets: [{ format: this.format }] },
+      primitive: { topology: "triangle-list", cullMode: "none" }
+    });
+  }
+  ensureLow(w, h) {
+    this.ensureBlit();
+    if (this.lowTex && this.lowW === w && this.lowH === h) return;
+    this.lowTex?.destroy();
+    this.lowTex = this.dev.createTexture({ size: [w, h], format: this.format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+    this.lowView = this.lowTex.createView();
+    this.lowW = w;
+    this.lowH = h;
+    this.blitBind = this.dev.createBindGroup({
+      layout: this.blitPipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: this.lowView }, { binding: 1, resource: this.sampler }]
+    });
+  }
+  /** Adaptive (moving-frame) render: reslice at `rw×rh` into an off-screen target, then bilinear-blit
+   *  up to the `vw×vh` view. Single frame, no accumulation — use while interacting; call renderToView
+   *  (native) when the view settles. At rw==vw/rh==vh this is a native render plus a pass-through blit. */
+  renderUpscaled(view, rw, rh, vw, vh) {
+    if (rw >= vw && rh >= vh) {
+      this.drawInto(view, vw, vh);
+      return;
+    }
+    this.ensureLow(rw, rh);
+    this.drawInto(this.lowView, rw, rh);
+    const enc = this.dev.createCommandEncoder();
+    const pass = enc.beginRenderPass({ colorAttachments: [{ view, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }] });
+    pass.setPipeline(this.blitPipeline);
+    pass.setBindGroup(0, this.blitBind);
+    pass.draw(3);
+    pass.end();
+    this.dev.queue.submit([enc.finish()]);
   }
   async renderToRGBA(w, h) {
     const target = this.dev.createTexture({ size: [w, h], format: this.format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
@@ -574,7 +898,6 @@ var SliceInteractor = class {
   constructor(geom) {
     this.geom = geom;
   }
-  geom;
   setGeometry(g) {
     this.geom = g;
   }
@@ -632,7 +955,121 @@ var SliceInteractor = class {
 var DEFAULT_FORMAT2 = "rgba8unorm-srgb";
 var SCENE_FLOATS = 16;
 var CLIP_FLOATS = 36;
+var MESH_WGSL = (
+  /* wgsl */
+  `
+struct MU { view_proj : mat4x4<f32>, eye : vec4<f32>, color : vec4<f32> };
+@group(0) @binding(0) var<uniform> mu : MU;
+struct VO { @builtin(position) pos : vec4<f32>, @location(0) wp : vec3<f32> };
+@vertex fn vs_mesh(@location(0) p : vec3<f32>) -> VO { var o : VO; o.pos = mu.view_proj * vec4<f32>(p, 1.0); o.wp = p; return o; }
+struct FO { @location(0) col : vec4<f32>, @location(1) depth : vec4<f32> };
+@fragment fn fs_mesh(i : VO) -> FO {
+  let n = normalize(cross(dpdx(i.wp), dpdy(i.wp)));       // flat face normal (no normals on the wire)
+  let l = normalize(mu.eye.xyz - i.wp);                   // headlight
+  let lam = 0.25 + 0.75 * abs(dot(n, l));
+  let a = mu.color.a;
+  var o : FO;
+  o.col = vec4<f32>(mu.color.rgb * lam * a, a);           // premultiplied
+  o.depth = vec4<f32>(distance(mu.eye.xyz, i.wp), 0.0, 0.0, 1.0);
+  return o;
+}`
+);
 var SceneRenderer = class _SceneRenderer {
+  // ── surface meshes (models): rasterised before each trace into colour+depth targets the march composites ──
+  meshPipeline;
+  gpuMeshes = [];
+  meshTargetsBySize = /* @__PURE__ */ new Map();
+  viewProj = new Float32Array(16);
+  eyePos = [0, 0, 0];
+  /** Replace the surface meshes (world/RAS float32 xyz + uint32 triangles, colour, opacity). */
+  setMeshes(meshes) {
+    for (const m of this.gpuMeshes) {
+      m.vbuf.destroy();
+      m.ibuf.destroy();
+      m.ubuf.destroy();
+    }
+    this.gpuMeshes = meshes.filter((m) => m.indices.length >= 3).map((m) => {
+      const vbuf = this.dev.createBuffer({ size: Math.ceil(m.positions.byteLength / 4) * 4, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+      this.dev.queue.writeBuffer(vbuf, 0, m.positions);
+      const ibuf = this.dev.createBuffer({ size: Math.ceil(m.indices.byteLength / 4) * 4, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
+      this.dev.queue.writeBuffer(ibuf, 0, m.indices);
+      const ubuf = this.dev.createBuffer({ size: 24 * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      return { vbuf, ibuf, count: m.indices.length, ubuf, color: m.color, opacity: m.opacity };
+    });
+  }
+  hasMeshes() {
+    return this.gpuMeshes.length > 0;
+  }
+  ensureMeshPipeline() {
+    if (this.meshPipeline) return;
+    const mod = this.dev.createShaderModule({ code: MESH_WGSL });
+    this.meshPipeline = this.dev.createRenderPipeline({
+      layout: "auto",
+      vertex: { module: mod, entryPoint: "vs_mesh", buffers: [{ arrayStride: 12, attributes: [{ shaderLocation: 0, offset: 0, format: "float32x3" }] }] },
+      fragment: { module: mod, entryPoint: "fs_mesh", targets: [{ format: "rgba16float" }, { format: "r32float" }] },
+      primitive: { topology: "triangle-list", cullMode: "none" },
+      depthStencil: { format: "depth24plus", depthWriteEnabled: true, depthCompare: "less" }
+    });
+  }
+  /** Colour/depth targets (+ the group-1 bind group of the trace pipeline) for a given trace size. */
+  meshTargets(w, h) {
+    const key = w + "x" + h;
+    let t = this.meshTargetsBySize.get(key);
+    if (!t) {
+      if (this.meshTargetsBySize.size > 4) {
+        for (const old of this.meshTargetsBySize.values()) {
+          old.col.destroy();
+          old.depth.destroy();
+          old.z.destroy();
+        }
+        this.meshTargetsBySize.clear();
+      }
+      t = {
+        w,
+        h,
+        col: this.dev.createTexture({ size: [w, h], format: "rgba16float", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING }),
+        depth: this.dev.createTexture({ size: [w, h], format: "r32float", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING }),
+        z: this.dev.createTexture({ size: [w, h], format: "depth24plus", usage: GPUTextureUsage.RENDER_ATTACHMENT })
+      };
+      this.meshTargetsBySize.set(key, t);
+    }
+    if (!t.bind) t.bind = this.dev.createBindGroup({ layout: this.pipeline.getBindGroupLayout(1), entries: [{ binding: 0, resource: t.col.createView() }, { binding: 1, resource: t.depth.createView() }] });
+    return t;
+  }
+  /** Rasterise the meshes for this frame's trace size; returns the bind group the trace pass needs. */
+  meshPass(enc, w, h) {
+    const t = this.meshTargets(w, h);
+    const pass = enc.beginRenderPass({
+      colorAttachments: [
+        { view: t.col.createView(), loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } },
+        { view: t.depth.createView(), loadOp: "clear", storeOp: "store", clearValue: { r: 1e30, g: 0, b: 0, a: 1 } }
+      ],
+      depthStencilAttachment: { view: t.z.createView(), depthClearValue: 1, depthLoadOp: "clear", depthStoreOp: "store" }
+    });
+    if (this.gpuMeshes.length) {
+      this.ensureMeshPipeline();
+      pass.setPipeline(this.meshPipeline);
+      for (const m of this.gpuMeshes) {
+        const u = new Float32Array(24);
+        u.set(this.viewProj, 0);
+        u[16] = this.eyePos[0];
+        u[17] = this.eyePos[1];
+        u[18] = this.eyePos[2];
+        u[19] = 1;
+        u[20] = m.color[0];
+        u[21] = m.color[1];
+        u[22] = m.color[2];
+        u[23] = m.opacity;
+        this.dev.queue.writeBuffer(m.ubuf, 0, u);
+        pass.setBindGroup(0, this.dev.createBindGroup({ layout: this.meshPipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: m.ubuf } }] }));
+        pass.setVertexBuffer(0, m.vbuf);
+        pass.setIndexBuffer(m.ibuf, "uint32");
+        pass.drawIndexed(m.count);
+      }
+    }
+    pass.end();
+    return t.bind;
+  }
   dev;
   format;
   placed = [];
@@ -930,9 +1367,11 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
     this.dev.queue.writeBuffer(this.superresBuf, 0, new Float32Array([renderW, renderH, viewW, viewH]));
     this.dev.queue.writeBuffer(this.resolveBgBuf, 0, this.mat.subarray(12, 16));
     const enc = this.dev.createCommandEncoder();
+    const mb = this.meshPass(enc, renderW, renderH);
     const tp = enc.beginRenderPass({ colorAttachments: [{ view: this.lowView, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
     tp.setPipeline(this.pipeline);
     tp.setBindGroup(0, this.bind);
+    tp.setBindGroup(1, mb);
     tp.draw(3);
     tp.end();
     const sp = enc.beginRenderPass({ colorAttachments: [{ view, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }] });
@@ -944,9 +1383,11 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
   }
   /** Encode trace (producer) + resolve (reconstructor) into `enc`, output to `outView`. */
   encodeFrame(enc, outView) {
+    const mb = this.meshPass(enc, this.traceW, this.traceH);
     const tp = enc.beginRenderPass({ colorAttachments: [{ view: this.traceView, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
     tp.setPipeline(this.pipeline);
     tp.setBindGroup(0, this.bind);
+    tp.setBindGroup(1, mb);
     tp.draw(3);
     tp.end();
     const rp = enc.beginRenderPass({ colorAttachments: [{ view: outView, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }] });
@@ -1014,13 +1455,16 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
     } else {
       this.dev.queue.writeBuffer(this.camBuf, 0, this.baseInvVP);
     }
+    this.dev.queue.writeBuffer(this.camBuf, 76, new Float32Array([n - 1]));
     this.flush();
     this.dev.queue.writeBuffer(this.accumUniformBuf, 0, new Float32Array([this.mat[12], this.mat[13], this.mat[14], 1 / n]));
     const prev = this.accumPing, next = 1 - this.accumPing;
     const enc = this.dev.createCommandEncoder();
+    const mb = this.meshPass(enc, width, height);
     const tp = enc.beginRenderPass({ colorAttachments: [{ view: this.traceView, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
     tp.setPipeline(this.pipeline);
     tp.setBindGroup(0, this.bind);
+    tp.setBindGroup(1, mb);
     tp.draw(3);
     tp.end();
     const ap = enc.beginRenderPass({ colorAttachments: [
@@ -1048,8 +1492,9 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
     });
     this.clipOff = uoff;
     this.pickOff = uoff + CLIP_FLOATS;
-    this.mat = new Float32Array(uoff + CLIP_FLOATS + 4);
-    this.matBuf = this.dev.createBuffer({ size: (uoff + CLIP_FLOATS + 4) * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.mat = new Float32Array(uoff + CLIP_FLOATS + 12);
+    this.matBuf = this.dev.createBuffer({ size: (uoff + CLIP_FLOATS + 12) * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    for (const t of this.meshTargetsBySize.values()) t.bind = void 0;
     const module = this.dev.createShaderModule({ code: this.wgsl() });
     this.pipeline = this.dev.createRenderPipeline({
       layout: "auto",
@@ -1158,9 +1603,16 @@ ${members}
   clip_planes : array<vec4<f32>, 8>,   // (nx, ny, nz, offset) inward; tail so field offsets are stable
   clip_count : vec4<f32>,              // (count, _, _, _)
   pick_cursor : vec4<f32>,             // (ndc_x, ndc_y, _, _) \u2014 the ray for fs_pick
+  probe_origin : vec4<f32>,            // explicit-ray probe: world origin
+  probe_dir : vec4<f32>,               // (dx, dy, dz, enabled) \u2014 w>0 uses this ray instead of the cursor
 };
 @group(0) @binding(0) var<uniform> u_cam : Camera;
 @group(0) @binding(1) var<uniform> u_material : Material;
+// Rasterised surface meshes (models): nearest-surface colour (premultiplied) + its distance along the
+// ray, produced by the mesh pass before each trace. The march composites the surface at that depth,
+// so volumes in front occlude it and it occludes what is behind \u2014 the depth-composite seam.
+@group(1) @binding(0) var t_mesh_col : texture_2d<f32>;
+@group(1) @binding(1) var t_mesh_depth : texture_2d<f32>;
 ${this.usesSampler() ? "@group(0) @binding(2) var s_lin : sampler;" : ""}
 ${decls}
 
@@ -1194,18 +1646,23 @@ fn fs_trace(v : Varyings) -> @location(0) vec4<f32> {
   let ro = ndc_to_world(vec4<f32>(ndc_x, ndc_y, 0.0, 1.0));
   let rd = normalize(ndc_to_world(vec4<f32>(ndc_x, ndc_y, 1.0, 1.0)) - ro);
 
+  let mpix = vec2<i32>(v.position.xy);
+  let mesh_c = textureLoad(t_mesh_col, mpix, 0);          // premultiplied surface colour (0 = no mesh)
+  let mesh_t = textureLoad(t_mesh_depth, mpix, 0).r;      // distance along the ray (1e30 = none)
+  var mesh_done = mesh_c.a <= 0.0;
+
   let inv = vec3<f32>(1.0) / rd;
   let tb = (u_material.bmin.xyz - ro) * inv;
   let tt = (u_material.bmax.xyz - ro) * inv;
   let tmn = min(tt, tb); let tmx = max(tt, tb);
   var t_near = max(max(tmn.x, tmn.y), tmn.z);
   var t_far  = min(min(tmx.x, tmx.y), tmx.z);
-  if (t_far <= t_near || t_far <= 0.0) { return vec4<f32>(0.0); }
+  if (t_far <= t_near || t_far <= 0.0) { return mesh_c; }
 
   let step = max(u_material.scene.x, 1e-3);
   t_near = max(t_near + step, 0.0);
   t_far  = t_far - step;
-  if (t_far <= t_near) { return vec4<f32>(0.0); }
+  if (t_far <= t_near) { return mesh_c; }
   let seed = ign(v.position.xy);
   var t = t_near;
   var integrated = vec4<f32>(0.0);
@@ -1218,7 +1675,27 @@ fn fs_trace(v : Varyings) -> @location(0) vec4<f32> {
 ${skipInit}
   loop {
     if (t >= t_far || safety >= 5000${hasGhost ? "" : " || integrated.a >= 0.99"}) { break; }
-    let js = fract(sin(dot(v.position.xy + vec2<f32>(f32(safety) * 0.7548, f32(safety) * 0.5698), vec2<f32>(12.9898, 78.233))) * 43758.5453) - 0.5; // per-(pixel,sample) jitter \u2014 frame-invariant; temporal AA rides on the sub-pixel NDC jitter (frame.xy), which is exact identity at 0
+    // Per-(pixel, step, ACCUM FRAME) ray-offset jitter. The frame term (u_cam.size.w, the
+    // accumulation index) is what makes temporal AA actually converge: with a frame-invariant
+    // offset the jitter turns banding into FIXED-PATTERN noise that averaging can never remove
+    // (measured: 32 samples was as grainy as 1). Varying it per frame decorrelates the samples
+    // so the mean approaches the true integral \u2014 no banding AND no noise. size.w is 0 for every
+    // non-accumulating path, so frame 1 stays byte-identical to a plain renderToView.
+    // Base offset: decorrelated per (pixel, step) so a single frame shows noise, not banding.
+    let jbase = fract(sin(dot(v.position.xy + vec2<f32>(f32(safety) * 0.7548, f32(safety) * 0.5698), vec2<f32>(12.9898, 78.233))) * 43758.5453);
+    // Advance it across accumulation frames by the golden-ratio additive recurrence
+    // (Cranley-Patterson rotation). MEASURED: this converges at the same 1/sqrt(n) rate as an
+    // independent random offset per frame (high-freq energy 1.36 vs 1.31 at n=64) \u2014 the low-
+    // discrepancy walk is NOT faster here, because the variance is dominated by the step size
+    // against a sharp transfer function, not by the sequence. Kept because it is deterministic
+    // and costs nothing; reduce sampleStep if you need less residual speckle.
+    // At size.w = 0 this is exactly jbase, so the first accumulated frame stays byte-identical
+    // to a plain renderToView \u2014 the property render/test baselines depend on.
+    let js = fract(jbase + u_cam.size.w * 0.6180339887) - 0.5;
+    if (!mesh_done && t + 0.5 * step >= mesh_t) {         // the ray reaches the surface: composite it here
+      integrated = integrated + (1.0 - integrated.a) * mesh_c;
+      mesh_done = true;
+    }
     let wp = ro + rd * (t + js * step);
     var sum = vec4<f32>(0.0);
     var all_defer = true;        // every field guarantees emptiness here -> we may leap
@@ -1240,6 +1717,7 @@ ${ghostDispatch}
     if (all_defer && jump_t > t + step) { t = jump_t; } else { t = t + step; }
     safety = safety + 1;
   }
+  if (!mesh_done) { integrated = integrated + (1.0 - integrated.a) * mesh_c; }   // surface beyond the slab
   // GHOST x-ray, applied ONCE (never compounding): the volume IN FRONT of a handle is shown
   // at residual = 1 - handle_opacity (50% for an inactive handle at opacity 0.5, 0% for an
   // active/hovered handle at opacity 1.0), then the handle (colour g_col at opacity g_op)
@@ -1258,8 +1736,16 @@ ${ghostDispatch}
 // Output: (wp.x, wp.y, wp.z, hit). hit=0 means the ray never reached 50% (empty/miss).
 @fragment
 fn fs_pick() -> @location(0) vec4<f32> {
-  let ro = ndc_to_world(vec4<f32>(u_material.pick_cursor.x, u_material.pick_cursor.y, 0.0, 1.0));
-  let rd = normalize(ndc_to_world(vec4<f32>(u_material.pick_cursor.x, u_material.pick_cursor.y, 1.0, 1.0)) - ro);
+  // Two ray sources: the screen cursor (pick) or an explicit world ray (probe). The explicit
+  // form exists because the cursor ray can only ever probe what is ON SCREEN \u2014 useless for
+  // "how much room is BEHIND me?", which endovascular navigation needs for reverse and for
+  // lateral clearance.
+  var ro = ndc_to_world(vec4<f32>(u_material.pick_cursor.x, u_material.pick_cursor.y, 0.0, 1.0));
+  var rd = normalize(ndc_to_world(vec4<f32>(u_material.pick_cursor.x, u_material.pick_cursor.y, 1.0, 1.0)) - ro);
+  if (u_material.probe_dir.w > 0.5) {
+    ro = u_material.probe_origin.xyz;
+    rd = normalize(u_material.probe_dir.xyz);
+  }
   let inv = vec3<f32>(1.0) / rd;
   let tb = (u_material.bmin.xyz - ro) * inv;
   let tt = (u_material.bmax.xyz - ro) * inv;
@@ -1401,12 +1887,38 @@ ${pickDispatch}
     const proj = perspectiveZO(fovyDeg * Math.PI / 180, width / height, 1, 1e5);
     const invVP = invert(multiply(proj, view));
     this.baseInvVP = invVP;
+    this.viewProj = multiply(proj, view);
+    this.eyePos = eye;
     const cam = new Float32Array(24);
     cam.set(invVP, 0);
     this.focalPx = height / 2 / Math.tan(fovyDeg * Math.PI / 360);
     cam[16] = width;
     cam[17] = height;
     cam[18] = height / 2 / Math.tan(fovyDeg * Math.PI / 360);
+    cam[19] = 0;
+    cam[20] = eye[0];
+    cam[21] = eye[1];
+    cam[22] = eye[2];
+    this.dev.queue.writeBuffer(this.camBuf, 0, cam);
+  }
+  /** Camera for ONE TILE of the view: the same rays the full frame would cast for `rect`, into a
+   *  rect.w×rect.h target. Screen-space glyph sizing stays keyed to the FULL view height, so a
+   *  patch of the gizmo is drawn at exactly the size the full frame drew it. Pair with
+   *  traceSamples(rect.w, rect.h) — its focal rewrite is then a no-op. */
+  setCameraTile(eye, center, up, fovyDeg, viewW, viewH, rect) {
+    const view = lookAt(eye, center, up);
+    const proj = perspectiveZOTile(fovyDeg * Math.PI / 180, viewW, viewH, rect.x, rect.y, rect.w, rect.h, 1, 1e5);
+    const invVP = invert(multiply(proj, view));
+    this.baseInvVP = invVP;
+    this.viewProj = multiply(proj, view);
+    this.eyePos = eye;
+    const cam = new Float32Array(24);
+    cam.set(invVP, 0);
+    this.focalPx = viewH / 2 / Math.tan(fovyDeg * Math.PI / 360);
+    cam[16] = rect.w;
+    cam[17] = rect.h;
+    cam[18] = this.focalPx;
+    cam[19] = 0;
     cam[20] = eye[0];
     cam[21] = eye[1];
     cam[22] = eye[2];
@@ -1421,9 +1933,50 @@ ${pickDispatch}
    *  Uses the camera set by the last setCamera(); returns null if the ray never reaches 50%. */
   async pick(u, v) {
     if (!this.pickPipeline || !this.pickBind || !this.placed.length) return null;
-    this.mat[this.pickOff] = u * 2 - 1;
-    this.mat[this.pickOff + 1] = 1 - v * 2;
-    this.flush();
+    return this.serialise(async () => {
+      this.mat[this.pickOff] = u * 2 - 1;
+      this.mat[this.pickOff + 1] = 1 - v * 2;
+      this.mat[this.pickOff + 11] = 0;
+      this.flush();
+      return await this.tracePick();
+    });
+  }
+  /** Trace an EXPLICIT world ray and return the distance (mm) to the first point where
+   *  front-to-back opacity reaches 50%, or Infinity if it never does. Unlike pick(), the ray
+   *  is independent of the camera, so it can look backwards and sideways — which is what makes
+   *  collision "rails" possible in a first-person flythrough. */
+  async probe(origin, dir) {
+    if (!this.pickPipeline || !this.pickBind || !this.placed.length) return Infinity;
+    const l = Math.hypot(dir[0], dir[1], dir[2]) || 1;
+    return this.serialise(async () => {
+      this.mat[this.pickOff + 4] = origin[0];
+      this.mat[this.pickOff + 5] = origin[1];
+      this.mat[this.pickOff + 6] = origin[2];
+      this.mat[this.pickOff + 8] = dir[0] / l;
+      this.mat[this.pickOff + 9] = dir[1] / l;
+      this.mat[this.pickOff + 10] = dir[2] / l;
+      this.mat[this.pickOff + 11] = 1;
+      this.flush();
+      const hit = await this.tracePick();
+      this.mat[this.pickOff + 11] = 0;
+      this.flush();
+      if (!hit) return Infinity;
+      return Math.hypot(hit[0] - origin[0], hit[1] - origin[1], hit[2] - origin[2]);
+    });
+  }
+  /** Serialises pick/probe. They share ONE uniform buffer and ONE readback buffer, so
+   *  concurrent calls would overwrite each other's ray and double-map the buffer — a
+   *  Promise.all of probes silently returns garbage. Callers may fire as many as they like;
+   *  they queue here. */
+  pickChain = Promise.resolve();
+  serialise(fn) {
+    const next = this.pickChain.then(fn, fn);
+    this.pickChain = next.catch(() => {
+    });
+    return next;
+  }
+  /** The shared 1x1 render + readback behind pick() and probe(). */
+  async tracePick() {
     if (!this.pickTarget) {
       this.pickTarget = this.dev.createTexture({ size: [1, 1], format: "rgba32float", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
       this.pickReadBuf = this.dev.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
@@ -1464,12 +2017,14 @@ ${pickDispatch}
     const samples = [];
     for (let i = 0; i < iters; i++) {
       const enc = this.dev.createCommandEncoder();
+      const mb = this.meshPass(enc, width, height);
       const pass = enc.beginRenderPass({
         colorAttachments: [{ view, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
         timestampWrites: { querySet: qs, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 }
       });
       pass.setPipeline(this.pipeline);
       pass.setBindGroup(0, this.bind);
+      pass.setBindGroup(1, mb);
       pass.draw(3);
       pass.end();
       enc.resolveQuerySet(qs, 0, 2, resolve, 0);
@@ -1513,13 +2068,19 @@ ${pickDispatch}
    *  background) as tightly-packed rgba8 — the bytes streamed to the remote client, which runs the
    *  same reconstruction (upsample + background composite) the local resolve does. The caller sets
    *  the camera to width×height first (like renderUpscaled). Returns width*height*4 bytes. */
-  async traceSamples(width, height) {
+  async traceSamples(width, height, viewH = height) {
     this.flush();
+    this.dev.queue.writeBuffer(this.camBuf, 64, new Float32Array([width, height]));
+    this.dev.queue.writeBuffer(this.camBuf, 72, new Float32Array([this.focalPx * (viewH / height)]));
     const target = this.dev.createTexture({ size: [width, height], format: "rgba8unorm", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
     const enc = this.dev.createCommandEncoder();
+    this.meshPass(enc, width, height);
+    const smt = this.meshTargets(width, height);
+    const streamMb = this.dev.createBindGroup({ layout: this.streamPipeline.getBindGroupLayout(1), entries: [{ binding: 0, resource: smt.col.createView() }, { binding: 1, resource: smt.depth.createView() }] });
     const tp = enc.beginRenderPass({ colorAttachments: [{ view: target.createView(), loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
     tp.setPipeline(this.streamPipeline);
     tp.setBindGroup(0, this.streamBind);
+    tp.setBindGroup(1, streamMb);
     tp.draw(3);
     tp.end();
     const bpr = Math.ceil(width * 4 / 256) * 256;
@@ -1562,10 +2123,38 @@ var ImageField = class {
   unit;
   stepMm;
   box;
+  normScale = 1;
+  // r8unorm samples return raw/255; clim is packed /normScale so shader math is unchanged
+  dims;
   constructor(dev, data, dims, spacing, lut, opts) {
+    this.dims = dims;
     const center = opts.center ?? [0, 0, 0];
-    this.volTex = dev.createTexture({ size: dims, dimension: "3d", format: "r32float", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
-    dev.queue.writeTexture({ texture: this.volTex }, data, { bytesPerRow: dims[0] * 4, rowsPerImage: dims[1] }, dims);
+    let src = data, fmt = "r32float", bpe = 4;
+    this.normScale = 1;
+    if (data instanceof Uint8Array) {
+      fmt = "r8unorm";
+      bpe = 1;
+      this.normScale = 255;
+    } else if (data instanceof Uint16Array) {
+      src = Float32Array.from(data);
+      fmt = "r32float";
+      bpe = 4;
+    }
+    this.volTex = dev.createTexture({ size: dims, dimension: "3d", format: fmt, usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+    {
+      const bytesPerRow = dims[0] * bpe, rowsPerImage = dims[1], sliceBytes = bytesPerRow * rowsPerImage;
+      const CHUNK = 256 * 1024 * 1024;
+      const slab = Math.max(1, Math.min(dims[2], Math.floor(CHUNK / Math.max(1, sliceBytes))));
+      for (let z = 0; z < dims[2]; z += slab) {
+        const depth = Math.min(slab, dims[2] - z);
+        dev.queue.writeTexture(
+          { texture: this.volTex, origin: { x: 0, y: 0, z } },
+          src,
+          { offset: z * sliceBytes, bytesPerRow, rowsPerImage },
+          [dims[0], dims[1], depth]
+        );
+      }
+    }
     this.lutTex = dev.createTexture({ size: [256, 1], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
     dev.queue.writeTexture({ texture: this.lutTex }, lut, { bytesPerRow: 256 * 4 }, [256, 1]);
     if (opts.ijkToRAS) {
@@ -1587,6 +2176,19 @@ var ImageField = class {
   setLUT(lut) {
     this.dev.queue.writeTexture({ texture: this.lutTex }, lut, { bytesPerRow: 256 * 4 }, [256, 1]);
   }
+  /** The scalar range the LUT spans — window/level for the volume rendering. Re-packed into
+   *  the material uniform on the next syncUniforms()/render, so no pipeline rebuild. */
+  setClim(lo, hi) {
+    this.clim = [lo, hi];
+  }
+  getClim() {
+    return [this.clim[0], this.clim[1]];
+  }
+  /** Phong shading tuple [ka, kd, ks, shininess] — re-packed into the material uniform next
+   *  render (VR presets carry their own lighting). [1,0,0,1] = flat emission (no shading). */
+  setShade(shade) {
+    this.shade = [shade[0], shade[1], shade[2], shade[3]];
+  }
   origP2t;
   // sampling matrix + box at identity, for setWorldTransform
   origBox;
@@ -1603,6 +2205,11 @@ var ImageField = class {
   /** The r32float 3D scalar texture (e.g. to share with a SliceRenderer for MPR). */
   volumeTexture() {
     return this.volTex;
+  }
+  /** r8unorm volumes sample /255, so clim is packed /normScale in the shader; a slice plane sharing this
+   *  texture must use the same factor. 1 for f32 volumes. */
+  normScaleOf() {
+    return this.normScale;
   }
   /** Centre of the volume in world (RAS) at identity — a natural pivot for a transform widget. */
   worldCenter() {
@@ -1623,6 +2230,12 @@ var ImageField = class {
   /** RAS(patient) -> texture[0,1] matrix (encodes the real ijkToRAS geometry). */
   patientToTexture() {
     return this.p2t;
+  }
+  /** Re-place the volume in RAS without re-uploading voxels (a parent transform moved it). */
+  setIjkToRAS(ijkToRAS) {
+    this.p2t = patientToTextureFromIjkToRAS(ijkToRAS, this.dims);
+    this.box = volumeAABBFromIjkToRAS(ijkToRAS, this.dims);
+    this.stepMm = Math.min(...spacingFromIjkToRAS(ijkToRAS));
   }
   structMembers(s) {
     return [
@@ -1687,8 +2300,8 @@ fn sample_field_img${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
   }
   fillUniforms(out, off) {
     out.set(this.p2t, off);
-    out[off + 16] = this.clim[0];
-    out[off + 17] = this.clim[1];
+    out[off + 16] = this.clim[0] / this.normScale;
+    out[off + 17] = this.clim[1] / this.normScale;
     out[off + 20] = this.shade[0];
     out[off + 21] = this.shade[1];
     out[off + 22] = this.shade[2];
@@ -1720,6 +2333,8 @@ var SegmentField = class {
   mode;
   colorFromTex;
   interfaceMode;
+  voxelMm = 1;
+  providesSkip;
   constructor(tex, dims, spacing, opts) {
     this.tex = tex;
     const center = opts.center ?? [0, 0, 0];
@@ -1739,7 +2354,9 @@ var SegmentField = class {
     this.bandMm = opts.bandMm ?? voxelMm;
     this.stepMm = opts.sampleStepMm ?? Math.max(0.5 * voxelMm, 0.1);
     this.clippable = opts.clippable ?? true;
+    this.voxelMm = voxelMm;
     this.mode = opts.mode ?? "iso";
+    this.providesSkip = this.mode === "sdf";
     this.colorFromTex = opts.colorFromTexture ?? false;
     this.interfaceMode = this.mode === "sdf" && (opts.interfaceMode ?? false);
     this.attrTex = this.mode === "sdf" ? opts.attrTexture : void 0;
@@ -1751,9 +2368,9 @@ var SegmentField = class {
     this.opacity = Math.max(0, Math.min(1, o));
   }
   uniformFloats() {
-    return 28;
+    return 36;
   }
-  // mat4(16) + color(4) + shade(4) + params(4)
+  // mat4(16) + color(4) + shade(4) + params(4) + bmin(4) + bmax(4)
   aabb() {
     return this.box;
   }
@@ -1764,6 +2381,29 @@ var SegmentField = class {
     if (destroyPrev && this.tex !== tex) this.tex.destroy();
     this.tex = tex;
   }
+  /** Empty-space skip for "sdf" mode: the texture .a is a TRUE distance-to-surface (mm), so the ray can
+   *  leap |sdf| minus the shell band toward the surface — sphere tracing. A one-voxel safety margin
+   *  absorbs the JFA distance approximation so the leap never overshoots a thin shell (image unchanged,
+   *  just far fewer march steps). Self-contained (no dependency on the sampling fns' emission order). */
+  skipWGSL(s) {
+    return (
+      /* wgsl */
+      `
+fn skip_seg${s}(wp : vec3<f32>) -> f32 {
+  let t4 = u_material.seg${s}_p2t * vec4<f32>(transform_point_seg${s}(wp), 1.0);
+  let t = t4.xyz;
+  if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) {
+    // OUTSIDE the SDF grid: leap only to the seg's AABB (a contract-valid lower bound), never past it.
+    let cen = (u_material.seg${s}_bmin.xyz + u_material.seg${s}_bmax.xyz) * 0.5;
+    let ext = (u_material.seg${s}_bmax.xyz - u_material.seg${s}_bmin.xyz) * 0.5;
+    let q = abs(transform_point_seg${s}(wp) - cen) - ext;
+    return max(0.0, length(max(q, vec3<f32>(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0));
+  }
+  let d = abs(textureSampleLevel(t_seg${s}, s_lin, t, 0.0).a);                  // |distance to surface| (mm)
+  return max(0.0, d - u_material.seg${s}_params.x - u_material.seg${s}_params.y);   // leap toward the shell (band + 1 voxel safe)
+}`
+    );
+  }
   structMembers(s) {
     return [
       `  seg${s}_p2t : mat4x4<f32>,`,
@@ -1771,8 +2411,11 @@ var SegmentField = class {
       // rgb, opacity
       `  seg${s}_shade : vec4<f32>,`,
       // ka, kd, ks, shininess
-      `  seg${s}_params : vec4<f32>,`
-      // band_mm, _, _, _
+      `  seg${s}_params : vec4<f32>,`,
+      // band_mm, voxel_mm, _, _
+      `  seg${s}_bmin : vec4<f32>,`,
+      // aabb min (RAS) — for a contract-valid skip outside the texture
+      `  seg${s}_bmax : vec4<f32>,`
     ].join("\n");
   }
   declareBindings(s, base) {
@@ -1992,6 +2635,13 @@ fn sample_field_seg${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
     out[off + 22] = this.shade[2];
     out[off + 23] = this.shade[3];
     out[off + 24] = this.bandMm;
+    out[off + 25] = this.voxelMm;
+    out[off + 28] = this.box[0][0];
+    out[off + 29] = this.box[0][1];
+    out[off + 30] = this.box[0][2];
+    out[off + 32] = this.box[1][0];
+    out[off + 33] = this.box[1][1];
+    out[off + 34] = this.box[1][2];
   }
   bindEntries(_s, base) {
     const e = [{ binding: base, resource: this.tex.createView() }];
@@ -2140,8 +2790,6 @@ var ColorizeBaker = class {
     this.blurPipe = dev.createComputePipeline({ layout: "auto", compute: { module: dev.createShaderModule({ code: BLUR_WGSL }), entryPoint: "main" } });
     this.g = [Math.ceil(dx / 4), Math.ceil(dy / 4), Math.ceil(dz / 4)];
   }
-  dev;
-  dims;
   labelTex;
   ownsLabel;
   // false when the label texture is owned externally (shared buffer)
@@ -2740,6 +3388,17 @@ var EditableSegmentation = class {
     this.device.queue.writeTexture({ texture: this.labelTex }, u32, { bytesPerRow: dx * 4, rowsPerImage: dy }, [dx, dy, dz]);
     this.markDirty();
   }
+  /** Region-limited labelmap write (`lo`/`size` in label-grid ijk; data x-fastest, tightly packed).
+   *  Deliberately NO dirty notification: the caller pairs it with a region-limited rebake
+   *  (SegmentationLogic.rebakeShellRegion) — an onDirty full rebake would defeat the point. */
+  writeLabelRegion(data, lo, size) {
+    this.device.queue.writeTexture(
+      { texture: this.labelTex, origin: lo },
+      data,
+      { bytesPerRow: size[0] * 4, rowsPerImage: size[1] },
+      size
+    );
+  }
   /** Read the master labelmap back to CPU (ids per voxel, x-fastest). Handles WebGPU's 256-byte
    *  bytesPerRow alignment. For tests + zarr serialization (A-7); not on the interactive path. */
   async readLabelmap() {
@@ -2770,7 +3429,7 @@ var EditableSegmentation = class {
 var INIT_WGSL2 = (
   /* wgsl */
   `
-struct U { ijkToRAS : mat4x4<f32>, dims : vec4<u32>, params : vec4<f32> };
+struct U { ijkToRAS : mat4x4<f32>, dims : vec4<u32>, params : vec4<f32>, origin : vec4<i32> };
 @group(0) @binding(0) var t_label : texture_3d<u32>;
 @group(0) @binding(1) var t_seed_out : texture_storage_3d<rgba32float, write>;
 @group(0) @binding(2) var<uniform> u : U;
@@ -2789,8 +3448,8 @@ fn labelAt(c : vec3<i32>) -> u32 {
 }
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  if (any(gid >= u.dims.xyz)) { return; }
-  let c = vec3<i32>(gid);
+  let c = vec3<i32>(gid) + u.origin.xyz;   // region-limited dispatch offsets into the grid
+  if (any(c >= vec3<i32>(u.dims.xyz))) { return; }
   let my = labelAt(c);
   let meIn = my != 0u;
   let allMode = u.params.y > 0.5;                   // 0 = outer boundary only; 1 = ANY label change (multi-material interfaces)
@@ -2809,22 +3468,22 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     if (isChange) { boundary = true; if (my == 0u && !allMode) { region = nl; } }
   }
   var seed = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-  if (boundary) { seed = vec4<f32>((u.ijkToRAS * vec4<f32>(vec3<f32>(gid), 1.0)).xyz, f32(region)); }
+  if (boundary) { seed = vec4<f32>((u.ijkToRAS * vec4<f32>(vec3<f32>(c), 1.0)).xyz, f32(region)); }
   textureStore(t_seed_out, c, seed);
 }`
 );
 var JFA_WGSL = (
   /* wgsl */
   `
-struct U { ijkToRAS : mat4x4<f32>, dims : vec4<u32>, params : vec4<f32> };
+struct U { ijkToRAS : mat4x4<f32>, dims : vec4<u32>, params : vec4<f32>, origin : vec4<i32> };
 @group(0) @binding(0) var t_seed_in : texture_3d<f32>;
 @group(0) @binding(1) var t_seed_out : texture_storage_3d<rgba32float, write>;
 @group(0) @binding(2) var<uniform> u : U;
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  if (any(gid >= u.dims.xyz)) { return; }
-  let c = vec3<i32>(gid);
-  let p = (u.ijkToRAS * vec4<f32>(vec3<f32>(gid), 1.0)).xyz;
+  let c = vec3<i32>(gid) + u.origin.xyz;   // region-limited dispatch offsets into the grid
+  if (any(c >= vec3<i32>(u.dims.xyz))) { return; }
+  let p = (u.ijkToRAS * vec4<f32>(vec3<f32>(c), 1.0)).xyz;
   let step = i32(u.params.x);
   let dmax = vec3<i32>(u.dims.xyz) - vec3<i32>(1);
   var best = textureLoad(t_seed_in, c, 0);
@@ -2848,7 +3507,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 var FINAL_WGSL = (
   /* wgsl */
   `
-struct U { ijkToRAS : mat4x4<f32>, dims : vec4<u32>, params : vec4<f32> };
+struct U { ijkToRAS : mat4x4<f32>, dims : vec4<u32>, params : vec4<f32>, origin : vec4<i32> };
 @group(0) @binding(0) var t_seed_in : texture_3d<f32>;
 @group(0) @binding(1) var t_label : texture_3d<u32>;
 @group(0) @binding(2) var t_out : texture_storage_3d<rgba16float, write>;
@@ -2858,9 +3517,9 @@ struct U { ijkToRAS : mat4x4<f32>, dims : vec4<u32>, params : vec4<f32> };
 @group(0) @binding(6) var<uniform> u_mode : array<vec4<f32>, 256>;   // .x = shading mode (0 surface, 1 volume)
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  if (any(gid >= u.dims.xyz)) { return; }
-  let c = vec3<i32>(gid);
-  let p = (u.ijkToRAS * vec4<f32>(vec3<f32>(gid), 1.0)).xyz;
+  let c = vec3<i32>(gid) + u.origin.xyz;   // region-limited dispatch offsets into the grid
+  if (any(c >= vec3<i32>(u.dims.xyz))) { return; }
+  let p = (u.ijkToRAS * vec4<f32>(vec3<f32>(c), 1.0)).xyz;
   let s = textureLoad(t_seed_in, c, 0);
   let valid = s.w > 0.5;
   let dist = select(1e3, distance(p, s.xyz), valid);
@@ -2890,15 +3549,15 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 var BLUR_WGSL2 = (
   /* wgsl */
   `
-struct BU { dims : vec4<u32>, axis_r : vec4<u32>, w : array<vec4<f32>, 4> };
+struct BU { dims : vec4<u32>, axis_r : vec4<u32>, w : array<vec4<f32>, 4>, origin : vec4<i32> };
 @group(0) @binding(0) var t_in : texture_3d<f32>;
 @group(0) @binding(1) var t_out : texture_storage_3d<rgba16float, write>;
 @group(0) @binding(2) var<uniform> u : BU;
 fn wt(i : u32) -> f32 { return u.w[i >> 2u][i & 3u]; }
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  if (any(gid >= u.dims.xyz)) { return; }
-  let c = vec3<i32>(gid);
+  let c = vec3<i32>(gid) + u.origin.xyz;
+  if (any(c >= vec3<i32>(u.dims.xyz))) { return; }
   let dmax = vec3<i32>(u.dims.xyz) - vec3<i32>(1);
   var av = vec3<i32>(0);
   if (u.axis_r.x == 0u) { av = vec3<i32>(1,0,0); } else if (u.axis_r.x == 1u) { av = vec3<i32>(0,1,0); } else { av = vec3<i32>(0,0,1); }
@@ -2915,15 +3574,15 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 var COLBLUR_WGSL = (
   /* wgsl */
   `
-struct BU { dims : vec4<u32>, axis_r : vec4<u32>, w : array<vec4<f32>, 4> };
+struct BU { dims : vec4<u32>, axis_r : vec4<u32>, w : array<vec4<f32>, 4>, origin : vec4<i32> };
 @group(0) @binding(0) var t_in : texture_3d<f32>;
 @group(0) @binding(1) var t_out : texture_storage_3d<rgba16float, write>;
 @group(0) @binding(2) var<uniform> u : BU;
 fn wt(i : u32) -> f32 { return u.w[i >> 2u][i & 3u]; }
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  if (any(gid >= u.dims.xyz)) { return; }
-  let c = vec3<i32>(gid);
+  let c = vec3<i32>(gid) + u.origin.xyz;
+  if (any(c >= vec3<i32>(u.dims.xyz))) { return; }
   let dmax = vec3<i32>(u.dims.xyz) - vec3<i32>(1);
   var av = vec3<i32>(0);
   if (u.axis_r.x == 0u) { av = vec3<i32>(1,0,0); } else if (u.axis_r.x == 1u) { av = vec3<i32>(0,1,0); } else { av = vec3<i32>(0,0,1); }
@@ -2940,15 +3599,15 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 var FULLBLUR_WGSL = (
   /* wgsl */
   `
-struct BU { dims : vec4<u32>, axis_r : vec4<u32>, w : array<vec4<f32>, 4> };
+struct BU { dims : vec4<u32>, axis_r : vec4<u32>, w : array<vec4<f32>, 4>, origin : vec4<i32> };
 @group(0) @binding(0) var t_in : texture_3d<f32>;
 @group(0) @binding(1) var t_out : texture_storage_3d<rgba16float, write>;
 @group(0) @binding(2) var<uniform> u : BU;
 fn wt(i : u32) -> f32 { return u.w[i >> 2u][i & 3u]; }
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-  if (any(gid >= u.dims.xyz)) { return; }
-  let c = vec3<i32>(gid);
+  let c = vec3<i32>(gid) + u.origin.xyz;
+  if (any(c >= vec3<i32>(u.dims.xyz))) { return; }
   let dmax = vec3<i32>(u.dims.xyz) - vec3<i32>(1);
   var av = vec3<i32>(0);
   if (u.axis_r.x == 0u) { av = vec3<i32>(1,0,0); } else if (u.axis_r.x == 1u) { av = vec3<i32>(0,1,0); } else { av = vec3<i32>(0,0,1); }
@@ -2991,12 +3650,13 @@ var JfaSdfBaker = class {
     this.ijkToRAS = m;
     const [dx, dy, dz] = this.dims;
     const mk = (fmt, extra = 0) => dev.createTexture({ size: this.dims, dimension: "3d", format: fmt, usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING | extra });
-    this.seed = [mk("rgba32float"), mk("rgba32float")];
+    const seedUsage = GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST;
+    this.seed = [mk("rgba32float", seedUsage), mk("rgba32float", seedUsage)];
     this.sdfTex = mk("rgba16float", GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC);
     this.attrTex = mk("rgba16float", GPUTextureUsage.COPY_DST);
     this.attrScratch = mk("rgba16float", GPUTextureUsage.COPY_SRC);
     this.sdfScratch = mk("rgba16float", GPUTextureUsage.COPY_SRC);
-    this.uni = dev.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.uni = dev.createBuffer({ size: 112, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.palBuf = dev.createBuffer({ size: 256 * 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.modeBuf = dev.createBuffer({ size: 256 * 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     const mod = (code) => dev.createComputePipeline({ layout: "auto", compute: { module: dev.createShaderModule({ code }), entryPoint: "main" } });
@@ -3012,9 +3672,6 @@ var JfaSdfBaker = class {
     for (let s = 1 << Math.floor(Math.log2(maxDim - 1)); s >= 1; s >>= 1) steps.push(s);
     this.steps = steps;
   }
-  labelTex;
-  dims;
-  ijkToRAS;
   dev;
   seed;
   // rgba32float ping-pong (RAS seed xyz + regionLabel)
@@ -3024,6 +3681,8 @@ var JfaSdfBaker = class {
   // rgba16float: .r = per-segment opacity, .g = shading mode — sampled by SegmentField
   attrScratch;
   // rgba16float attr-blur ping-pong
+  lastSeed = 0;
+  // seed buffer the last sweep finalized from
   sdfScratch;
   // rgba16float blur ping-pong
   uni;
@@ -3112,8 +3771,8 @@ var JfaSdfBaker = class {
     m.set(modes.subarray(0, Math.min(modes.length, 256 * 4)));
     this.dev.queue.writeBuffer(this.modeBuf, 0, m);
   }
-  writeUni(step) {
-    const ab = new ArrayBuffer(96);
+  writeUni(step, origin = [0, 0, 0]) {
+    const ab = new ArrayBuffer(112);
     const f = new Float32Array(ab), u = new Uint32Array(ab);
     f.set(transpose4(this.ijkToRAS), 0);
     u[16] = this.dims[0];
@@ -3124,6 +3783,11 @@ var JfaSdfBaker = class {
     f[21] = this.bmode;
     f[22] = 0;
     f[23] = 0;
+    const i32v = new Int32Array(ab);
+    i32v[24] = origin[0];
+    i32v[25] = origin[1];
+    i32v[26] = origin[2];
+    i32v[27] = 0;
     this.dev.queue.writeBuffer(this.uni, 0, ab);
   }
   /** FAST bake for LIVE editing: plain JFA (approximate) + a light distance-only blur (crisp colour
@@ -3139,6 +3803,121 @@ var JfaSdfBaker = class {
    *  under-smoothing). Higher quality lives in the resident texture, so camera renders stay cheap. */
   refine() {
     this.sweep([2, 1], this.smoothSigma, 1);
+  }
+  /** REGION-LIMITED refine: re-flood ONLY `regionIjk` (padded-grid coords) after a labelmap edit
+   *  confined to it — a per-vertebra visibility flip re-bakes a few % of the grid instead of the
+   *  whole volume, which is what makes level stepping feel instant. The seed ping-pong pair is
+   *  first made consistent with a full-texture copy, so region passes can ping-pong while JFA
+   *  taps read valid exterior seeds (surfaces just outside the region flood in correctly).
+   *  Exterior distances that referenced a surface REMOVED inside the region go stale, but only
+   *  ≫band away from any visible shell — invisible, and the next full sweep cleans them. */
+  refineRegion(regionIjk) {
+    const dev = this.dev, [dx, dy, dz] = this.dims;
+    const lo = [Math.max(0, regionIjk.lo[0]), Math.max(0, regionIjk.lo[1]), Math.max(0, regionIjk.lo[2])];
+    const hi = [Math.min(dx, regionIjk.hi[0]), Math.min(dy, regionIjk.hi[1]), Math.min(dz, regionIjk.hi[2])];
+    const [rx, ry, rz] = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
+    if (rx <= 0 || ry <= 0 || rz <= 0) return;
+    const g = [Math.ceil(rx / 4), Math.ceil(ry / 4), Math.ceil(rz / 4)];
+    const region = { lo, hi };
+    let src = this.lastSeed;
+    let enc = dev.createCommandEncoder();
+    enc.copyTextureToTexture({ texture: this.seed[src] }, { texture: this.seed[src ^ 1] }, this.dims);
+    dev.queue.submit([enc.finish()]);
+    this.writeUni(0, lo);
+    enc = dev.createCommandEncoder();
+    {
+      const b = dev.createBindGroup({ layout: this.initPipe.getBindGroupLayout(0), entries: [
+        { binding: 0, resource: this.labelTex.createView() },
+        { binding: 1, resource: this.seed[src].createView() },
+        { binding: 2, resource: { buffer: this.uni } }
+      ] });
+      const p2 = enc.beginComputePass();
+      p2.setPipeline(this.initPipe);
+      p2.setBindGroup(0, b);
+      p2.dispatchWorkgroups(g[0], g[1], g[2]);
+      p2.end();
+    }
+    dev.queue.submit([enc.finish()]);
+    const maxDim = Math.max(rx, ry, rz);
+    const steps = [];
+    for (let s = 1 << Math.floor(Math.log2(Math.max(2, maxDim - 1))); s >= 1; s >>= 1) steps.push(s);
+    steps.push(2, 1);
+    for (const step of steps) {
+      this.writeUni(step, lo);
+      const dst = src ^ 1;
+      enc = dev.createCommandEncoder();
+      const b = dev.createBindGroup({ layout: this.jfaPipe.getBindGroupLayout(0), entries: [
+        { binding: 0, resource: this.seed[src].createView() },
+        { binding: 1, resource: this.seed[dst].createView() },
+        { binding: 2, resource: { buffer: this.uni } }
+      ] });
+      const p2 = enc.beginComputePass();
+      p2.setPipeline(this.jfaPipe);
+      p2.setBindGroup(0, b);
+      p2.dispatchWorkgroups(g[0], g[1], g[2]);
+      p2.end();
+      dev.queue.submit([enc.finish()]);
+      src = dst;
+    }
+    this.lastSeed = src;
+    this.writeUni(0, lo);
+    enc = dev.createCommandEncoder();
+    const bf = dev.createBindGroup({ layout: this.finalPipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: this.seed[src].createView() },
+      { binding: 1, resource: this.labelTex.createView() },
+      { binding: 2, resource: this.sdfTex.createView() },
+      { binding: 3, resource: { buffer: this.uni } },
+      { binding: 4, resource: { buffer: this.palBuf } },
+      { binding: 5, resource: this.attrTex.createView() },
+      { binding: 6, resource: { buffer: this.modeBuf } }
+    ] });
+    const p = enc.beginComputePass();
+    p.setPipeline(this.finalPipe);
+    p.setBindGroup(0, bf);
+    p.dispatchWorkgroups(g[0], g[1], g[2]);
+    p.end();
+    dev.queue.submit([enc.finish()]);
+    this.blurStage(this.blurPipe, this.smoothSigma, this.sdfTex, this.sdfScratch, region);
+    this.blurStage(this.colBlurPipe, 1, this.sdfTex, this.sdfScratch, region);
+    this.blurStage(this.fullBlurPipe, 1, this.attrTex, this.attrScratch, region);
+  }
+  /** ATTR-ONLY rebake for palette/opacity changes (per-segment visibility): the distance field
+   *  doesn't move, so re-run ONLY the finalize (from the last sweep's seed) with its sdf writes
+   *  routed to the scratch texture (discarded — the blurred resident sdfTex stays pristine) and
+   *  re-blur the attribute seams. ~4 passes instead of the ~20-pass init+JFA+blur sweep, which is
+   *  what makes per-vertebra focus switching real-time. */
+  rebakeAttr(blurSeams = false, regionIjk) {
+    const dev = this.dev, [dx, dy, dz] = this.dims;
+    const region = regionIjk && {
+      lo: [Math.max(0, regionIjk.lo[0]), Math.max(0, regionIjk.lo[1]), Math.max(0, regionIjk.lo[2])],
+      hi: [Math.min(dx, regionIjk.hi[0]), Math.min(dy, regionIjk.hi[1]), Math.min(dz, regionIjk.hi[2])]
+    };
+    const [gx, gy, gz] = region ? [Math.ceil((region.hi[0] - region.lo[0]) / 4), Math.ceil((region.hi[1] - region.lo[1]) / 4), Math.ceil((region.hi[2] - region.lo[2]) / 4)] : this.g;
+    if (region && (gx <= 0 || gy <= 0 || gz <= 0)) return;
+    this.writeUni(0, region ? region.lo : [0, 0, 0]);
+    const enc = dev.createCommandEncoder();
+    const bf = dev.createBindGroup({ layout: this.finalPipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: this.seed[this.lastSeed].createView() },
+      { binding: 1, resource: this.labelTex.createView() },
+      { binding: 2, resource: this.sdfScratch.createView() },
+      // sdf writes discarded
+      { binding: 3, resource: { buffer: this.uni } },
+      { binding: 4, resource: { buffer: this.palBuf } },
+      { binding: 5, resource: this.attrTex.createView() },
+      { binding: 6, resource: { buffer: this.modeBuf } }
+    ] });
+    const p = enc.beginComputePass();
+    p.setPipeline(this.finalPipe);
+    p.setBindGroup(0, bf);
+    p.dispatchWorkgroups(gx, gy, gz);
+    p.end();
+    dev.queue.submit([enc.finish()]);
+    if (blurSeams) this.blurStage(this.fullBlurPipe, 1, this.attrTex, this.attrScratch, region);
+  }
+  /** Blur the attribute seams of the CURRENT attr texture in place (no re-finalize) — the
+   *  cheapest possible settle after a run of rebakeAttr(false) visibility steps. */
+  blurAttrOnly() {
+    this.blurStage(this.fullBlurPipe, 1, this.attrTex, this.attrScratch);
   }
   /** One full sweep: init → JFA (schedule + extra) → finalize → blur .a → optional blur .rgb. */
   sweep(extraSteps, distSigma, colorSigma) {
@@ -3176,6 +3955,7 @@ var JfaSdfBaker = class {
       dev.queue.submit([enc.finish()]);
       src = dst;
     }
+    this.lastSeed = src;
     enc = dev.createCommandEncoder();
     const bf = dev.createBindGroup({ layout: this.finalPipe.getBindGroupLayout(0), entries: [
       { binding: 0, resource: this.seed[src].createView() },
@@ -3198,21 +3978,28 @@ var JfaSdfBaker = class {
   }
   /** 3 separable Gaussian passes with the given pipeline (which channels it blurs), tex↔scratch,
    *  ending in scratch → copied back to `tex` so its identity stays stable for the renderer. */
-  blurStage(pipe, sigma, tex, scratch) {
-    const dev = this.dev, [gx, gy, gz] = this.g, [dx, dy, dz] = this.dims;
+  blurStage(pipe, sigma, tex, scratch, region) {
+    const dev = this.dev, [dx, dy, dz] = this.dims;
     const { radius, w } = gaussHalfKernel2(sigma);
     const passes = [[tex, scratch, 0], [scratch, tex, 1], [tex, scratch, 2]];
     const enc = dev.createCommandEncoder();
+    let passIdx = 0;
     for (const [srcT, dstT, axis] of passes) {
-      const ab = new ArrayBuffer(96);
-      const u32 = new Uint32Array(ab), f32 = new Float32Array(ab);
+      const expand = region ? (2 - passIdx) * radius : 0;
+      const lo = region ? [Math.max(0, region.lo[0] - expand), Math.max(0, region.lo[1] - expand), Math.max(0, region.lo[2] - expand)] : [0, 0, 0];
+      const hi = region ? [Math.min(dx, region.hi[0] + expand), Math.min(dy, region.hi[1] + expand), Math.min(dz, region.hi[2] + expand)] : [dx, dy, dz];
+      const ab = new ArrayBuffer(112);
+      const u32 = new Uint32Array(ab), f32 = new Float32Array(ab), i32 = new Int32Array(ab);
       u32[0] = dx;
       u32[1] = dy;
       u32[2] = dz;
       u32[4] = axis;
       u32[5] = radius;
       f32.set(w, 8);
-      const ub = dev.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      i32[24] = lo[0];
+      i32[25] = lo[1];
+      i32[26] = lo[2];
+      const ub = dev.createBuffer({ size: 112, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
       dev.queue.writeBuffer(ub, 0, ab);
       const b = dev.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
         { binding: 0, resource: srcT.createView() },
@@ -3222,10 +4009,16 @@ var JfaSdfBaker = class {
       const bp = enc.beginComputePass();
       bp.setPipeline(pipe);
       bp.setBindGroup(0, b);
-      bp.dispatchWorkgroups(gx, gy, gz);
+      bp.dispatchWorkgroups(Math.ceil((hi[0] - lo[0]) / 4), Math.ceil((hi[1] - lo[1]) / 4), Math.ceil((hi[2] - lo[2]) / 4));
       bp.end();
+      passIdx++;
     }
-    enc.copyTextureToTexture({ texture: scratch }, { texture: tex }, this.dims);
+    if (region) {
+      const sz = [region.hi[0] - region.lo[0], region.hi[1] - region.lo[1], region.hi[2] - region.lo[2]];
+      enc.copyTextureToTexture({ texture: scratch, origin: region.lo }, { texture: tex, origin: region.lo }, sz);
+    } else {
+      enc.copyTextureToTexture({ texture: scratch }, { texture: tex }, this.dims);
+    }
     dev.queue.submit([enc.finish()]);
   }
   destroy() {
@@ -3242,6 +4035,40 @@ var JfaSdfBaker = class {
 };
 
 // logic/segmentation-logic.ts
+function invertAffine(m) {
+  const r = [m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10]];
+  const det = r[0] * (r[4] * r[8] - r[5] * r[7]) - r[1] * (r[3] * r[8] - r[5] * r[6]) + r[2] * (r[3] * r[7] - r[4] * r[6]);
+  const i = [
+    (r[4] * r[8] - r[5] * r[7]) / det,
+    (r[2] * r[7] - r[1] * r[8]) / det,
+    (r[1] * r[5] - r[2] * r[4]) / det,
+    (r[5] * r[6] - r[3] * r[8]) / det,
+    (r[0] * r[8] - r[2] * r[6]) / det,
+    (r[2] * r[3] - r[0] * r[5]) / det,
+    (r[3] * r[7] - r[4] * r[6]) / det,
+    (r[1] * r[6] - r[0] * r[7]) / det,
+    (r[0] * r[4] - r[1] * r[3]) / det
+  ];
+  const t = [m[3], m[7], m[11]];
+  return [
+    i[0],
+    i[1],
+    i[2],
+    -(i[0] * t[0] + i[1] * t[1] + i[2] * t[2]),
+    i[3],
+    i[4],
+    i[5],
+    -(i[3] * t[0] + i[4] * t[1] + i[5] * t[2]),
+    i[6],
+    i[7],
+    i[8],
+    -(i[6] * t[0] + i[7] * t[1] + i[8] * t[2]),
+    0,
+    0,
+    0,
+    1
+  ];
+}
 var SegmentationLogic = class {
   constructor(device, seg, opts = {}) {
     this.seg = seg;
@@ -3251,6 +4078,7 @@ var SegmentationLogic = class {
     this.opacity = opts.opacity ?? 1;
     this.refineDelayMs = opts.refineDelayMs ?? 180;
     this.boundaryMode = opts.boundaryMode ?? "outer";
+    this.clippable = opts.clippable ?? false;
     this.setLabelColor(1, opts.color ?? [0.3, 0.85, 0.55]);
     if (this.renderMode === "sdf") {
       this.sdf = new JfaSdfBaker(device, seg.masterTexture(), seg.dims, seg.ijkToRAS, 1, 2, this.boundaryMode);
@@ -3266,8 +4094,9 @@ var SegmentationLogic = class {
       this.scheduleRefine();
     });
   }
-  seg;
   renderMode;
+  clippable;
+  attrSettleTimer;
   sdf;
   // sdf path
   baker;
@@ -3340,6 +4169,73 @@ var SegmentationLogic = class {
       for (const cb of this.redrawCbs) cb();
     }
   }
+  /** FAST per-segment opacity refresh: attr-only rebake (no JFA re-sweep) — for visibility
+   *  toggles where the labelmap and colours are unchanged.
+   *
+   *  With `regionRAS` (the bbox of the labels whose opacity changed): the finalize AND the
+   *  seam blur run region-limited in one shot — full settled quality lands immediately, no
+   *  two-phase. Without it: full-volume fast pass + a debounced full-volume seam blur. */
+  /** RAS bbox → padded-SDF-grid ijk bbox with an M-voxel margin (shell band + blur radii). */
+  regionToIjk(regionRAS, M = 8) {
+    const inv = invertAffine(this.sdf.sdfIjkToRAS());
+    const lo = [Infinity, Infinity, Infinity];
+    const hi = [-Infinity, -Infinity, -Infinity];
+    for (const x of [regionRAS.lo[0], regionRAS.hi[0]]) for (const y of [regionRAS.lo[1], regionRAS.hi[1]]) for (const z of [regionRAS.lo[2], regionRAS.hi[2]]) {
+      const i = inv[0] * x + inv[1] * y + inv[2] * z + inv[3];
+      const j = inv[4] * x + inv[5] * y + inv[6] * z + inv[7];
+      const k = inv[8] * x + inv[9] * y + inv[10] * z + inv[11];
+      lo[0] = Math.min(lo[0], i);
+      lo[1] = Math.min(lo[1], j);
+      lo[2] = Math.min(lo[2], k);
+      hi[0] = Math.max(hi[0], i);
+      hi[1] = Math.max(hi[1], j);
+      hi[2] = Math.max(hi[2], k);
+    }
+    return {
+      lo: [Math.floor(lo[0]) - M, Math.floor(lo[1]) - M, Math.floor(lo[2]) - M],
+      hi: [Math.ceil(hi[0]) + M, Math.ceil(hi[1]) + M, Math.ceil(hi[2]) + M]
+    };
+  }
+  /** REGION-LIMITED settle-refine after a labelmap edit confined to `regionRAS` (e.g. a
+   *  per-vertebra visibility flip written via EditableSegmentation.writeLabelRegion): the full
+   *  refine quality — JFA re-flood, finalize, seam blurs — over just the region, immediately.
+   *  Small regions bake in ~ms, so stepping through per-label visibility stays real-time. */
+  rebakeShellRegion(regionRAS) {
+    if (!this.sdf) {
+      this.rebake();
+      return;
+    }
+    if (this.refineTimer !== void 0) {
+      clearTimeout(this.refineTimer);
+      this.refineTimer = void 0;
+    }
+    this.sdf.setPalette(this.palette);
+    this.sdf.setModePalette(this.modePalette);
+    this.sdf.refineRegion(this.regionToIjk(regionRAS));
+    for (const cb of this.redrawCbs) cb();
+  }
+  refreshOpacity(regionRAS) {
+    if (!this.sdf) {
+      this.rebake();
+      return;
+    }
+    this.sdf.setPalette(this.palette);
+    if (regionRAS) {
+      this.sdf.rebakeAttr(true, this.regionToIjk(regionRAS));
+      for (const cb of this.redrawCbs) cb();
+      return;
+    }
+    this.sdf.rebakeAttr(false);
+    for (const cb of this.redrawCbs) cb();
+    if (this.attrSettleTimer !== void 0) clearTimeout(this.attrSettleTimer);
+    this.attrSettleTimer = setTimeout(() => {
+      this.attrSettleTimer = void 0;
+      if (this.sdf) {
+        this.sdf.blurAttrOnly();
+        for (const cb of this.redrawCbs) cb();
+      }
+    }, 600);
+  }
   /** A SegmentField bound to the shared render texture — hand this to the SceneRenderer once; edits
    *  update it in place. Colour comes from the texture (per-label); the uniform supplies opacity. */
   field() {
@@ -3357,7 +4253,7 @@ var SegmentationLogic = class {
         mode: this.renderMode === "sdf" ? "sdf" : "surface",
         colorFromTexture: true,
         bandMm: band,
-        clippable: false,
+        clippable: this.clippable,
         attrTexture: this.sdf ? this.sdf.attrTexture() : void 0,
         // per-segment opacity (sdf)
         interfaceMode
@@ -3415,7 +4311,13 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
   const dims = ct.dims;
   const data = ct.vol instanceof Float32Array ? ct.vol : Float32Array.from(ct.vol);
   const clim = [ct.lev - ct.win / 2, ct.lev + ct.win / 2];
-  const baseVolLut = modalityLUT(ct.modality);
+  const grayLut = modalityLUT(ct.modality);
+  const grayClim = [clim[0], clim[1]];
+  const grayShade = [0.25, 0.7, 0.45, 20];
+  let baseVolLut = grayLut;
+  let baseClim = [clim[0], clim[1]];
+  let baseShade = [grayShade[0], grayShade[1], grayShade[2], grayShade[3]];
+  let volShift = 0;
   const scaledVolLut = (o) => {
     const l = baseVolLut.slice();
     for (let i = 0; i < 256; i++) l[i * 4 + 3] = Math.round(l[i * 4 + 3] * o);
@@ -3424,7 +4326,7 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
   const volumeField = new ImageField(dev, data, dims, [1, 1, 1], baseVolLut, {
     clim,
     ijkToRAS: ct.ijkToRAS,
-    shade: [0.25, 0.7, 0.45, 20]
+    shade: baseShade
   });
   const segments = [];
   const palette = new Float32Array(256 * 4);
@@ -3477,6 +4379,7 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
   let showVolume = true, showSeg = hasSeg;
   let roiEnabled = false, roiVisible = false;
   const currentSegFields = () => segLogic ? [segLogic.field()] : [];
+  let extraFields = [];
   const rebuild = () => {
     const f = [];
     if (showVolume) f.push(volumeField);
@@ -3484,6 +4387,7 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
     if (roiVisible) {
       f.push(roi.box, roi.handles);
     }
+    f.push(...extraFields);
     scene.build(f);
     scene.setBackground(0.05, 0.06, 0.09);
     if (roiEnabled) scene.setClipBox(roi.lo(), roi.hi());
@@ -3532,6 +4436,27 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
       if (was !== showVolume) rebuild();
     },
     volumeOpacity: () => volumeOpacity,
+    setVolumePreset(bake) {
+      if (bake) {
+        baseVolLut = bake.lut;
+        baseClim = [bake.clim[0], bake.clim[1]];
+        baseShade = bake.shade;
+      } else {
+        baseVolLut = grayLut;
+        baseClim = [grayClim[0], grayClim[1]];
+        baseShade = grayShade;
+      }
+      volumeField.setLUT(scaledVolLut(volumeOpacity));
+      volumeField.setClim(baseClim[0] + volShift, baseClim[1] + volShift);
+      volumeField.setShade(baseShade);
+      scene.syncUniforms();
+    },
+    setVolumeShift(hu) {
+      volShift = hu;
+      volumeField.setClim(baseClim[0] + volShift, baseClim[1] + volShift);
+      scene.syncUniforms();
+    },
+    volumeShift: () => volShift,
     setSegOpacity(o) {
       segLayerOpacity = Math.max(0, Math.min(1, o));
       const was = showSeg;
@@ -3549,6 +4474,16 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
       segLogic?.setLabelOpacity(num, o);
       segLogic?.refineNow();
     },
+    setSegmentOpacities(entries) {
+      for (const [num, opacity] of entries) {
+        const o = Math.max(0, Math.min(1, opacity));
+        if (o >= 1) segOpacity.delete(num);
+        else segOpacity.set(num, o);
+        segLogic?.setLabelOpacity(num, o);
+      }
+      rebakeColorized();
+      segLogic?.refineNow();
+    },
     segmentOpacity: (num) => opacityOf(num),
     setSegmentVisible(num, visible) {
       this.setSegmentOpacity(num, visible ? 1 : 0);
@@ -3564,6 +4499,10 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
     },
     roiEnabled: () => roiEnabled,
     roiVisible: () => roiVisible,
+    setExtraFields(fields) {
+      extraFields = fields;
+      rebuild();
+    },
     reclip() {
       if (roiEnabled) scene.setClipBox(roi.lo(), roi.hi());
       else scene.clearClip();
@@ -3582,8 +4521,6 @@ var SegBudget = class _SegBudget {
     this.tier = tier;
     this.refineMsAt64 = refineMsAt64;
   }
-  tier;
-  refineMsAt64;
   /** Measure the device by timing an SDF refine at `probeDim`³ (default 64), then classify. Cheap:
    *  one warm bake + a few refines behind a single GPU sync. */
   static async probe(device, probeDim = 64) {
@@ -3922,8 +4859,8 @@ var VtkCamera = class _VtkCamera {
     const aspect = w / h;
     const ndcx = x / w * 2 - 1;
     const ndcy = 1 - y / h * 2;
-    const offset = add(scale(right, ndcx * halfH * aspect), scale(up, ndcy * halfH));
-    return add(add(this.position, scale(dop, depth)), offset);
+    const offset2 = add(scale(right, ndcx * halfH * aspect), scale(up, ndcy * halfH));
+    return add(add(this.position, scale(dop, depth)), offset2);
   }
   /** vtkCamera-comparable snapshot for the harness. */
   state() {
@@ -4059,12 +4996,24 @@ function attachCameraControls(canvas, camera, opts = {}) {
   canvas.addEventListener("touchmove", (e) => e.preventDefault(), { passive: false });
   const pointers = /* @__PURE__ */ new Map();
   let pinch = null;
+  let triple = null;
+  const centroid = () => {
+    let mx = 0, my = 0;
+    for (const p of pointers.values()) {
+      mx += p.x;
+      my += p.y;
+    }
+    const n = pointers.size || 1;
+    return { mx: mx / n, my: my / n };
+  };
   const pinchState = () => {
     const [a, b] = [...pointers.values()];
     return { dist: Math.hypot(b.x - a.x, b.y - a.y), mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 };
   };
+  const on = () => opts.enabled?.() ?? true;
   canvas.addEventListener("contextmenu", (e) => e.preventDefault());
   canvas.addEventListener("pointerdown", (e) => {
+    if (!on()) return;
     const { x, y } = local(e);
     pointers.set(e.pointerId, { x, y });
     canvas.setPointerCapture(e.pointerId);
@@ -4074,12 +5023,26 @@ function attachCameraControls(canvas, camera, opts = {}) {
     } else if (pointers.size === 2) {
       interactor.end();
       pinch = pinchState();
+    } else if (pointers.size === 3) {
+      pinch = null;
+      const c = centroid();
+      triple = { mx: c.mx, my: c.my };
+      opts.onVolumeDragStart?.();
     }
   });
   const endPointer = (e) => {
     if (!pointers.delete(e.pointerId)) return;
+    if (!on()) {
+      interactor.end();
+      pinch = null;
+      return;
+    }
     canvas.releasePointerCapture?.(e.pointerId);
     if (pointers.size < 2) pinch = null;
+    if (pointers.size < 3 && triple) {
+      triple = null;
+      opts.onVolumeDragEnd?.();
+    }
     if (pointers.size === 1) {
       const p = [...pointers.values()][0];
       interactor.start(0, p.x, p.y, canvas.clientHeight, { shift: false, ctrl: false, alt: false });
@@ -4090,10 +5053,16 @@ function attachCameraControls(canvas, camera, opts = {}) {
   canvas.addEventListener("pointerup", endPointer);
   canvas.addEventListener("pointercancel", endPointer);
   canvas.addEventListener("pointermove", (e) => {
+    if (!on()) return;
     if (!pointers.has(e.pointerId)) return;
     const { x, y } = local(e);
     pointers.set(e.pointerId, { x, y });
-    if (pointers.size >= 2) {
+    if (pointers.size >= 3) {
+      const c = centroid();
+      if (triple) opts.onVolumeDrag?.(c.mx - triple.mx, c.my - triple.my);
+      return;
+    }
+    if (pointers.size === 2) {
       const p = pinchState();
       if (pinch) {
         if (p.dist > 0 && pinch.dist > 0) camera.dolly(p.dist / pinch.dist);
@@ -4106,6 +5075,7 @@ function attachCameraControls(canvas, camera, opts = {}) {
     }
   });
   canvas.addEventListener("wheel", (e) => {
+    if (!on()) return;
     e.preventDefault();
     interactor.wheel(e.deltaY < 0);
     opts.onLog?.("cameraWheel", { deltaY: e.deltaY, distance: camera.distance });
@@ -4133,6 +5103,7 @@ function attachSliceControls(canvas, cfg) {
   let view = null;
   let scroll = null;
   let grabbed = null;
+  let wlDrag = null;
   const onContext = (e) => e.preventDefault();
   const onWheel = (e) => {
     e.preventDefault();
@@ -4153,6 +5124,12 @@ function attachSliceControls(canvas, cfg) {
       lastDown = dbl ? 0 : now;
       lastX = e.clientX;
       lastY = e.clientY;
+      if (dbl && (e.ctrlKey || e.metaKey) && cfg.wl?.enabled() && cfg.wl.reset) {
+        e.preventDefault();
+        cfg.wl.reset();
+        cfg.redraw();
+        return;
+      }
       if (dbl && h.onDoubleClick?.()) {
         e.preventDefault();
         return;
@@ -4171,8 +5148,16 @@ function attachSliceControls(canvas, cfg) {
     if (e.button !== 0) return;
     e.preventDefault();
     const { u, v, w, h: hh } = uv(e);
+    const mode = cfg.leftMode?.() ?? (cfg.wl?.enabled() ? "wl" : "scroll");
     if (h.onLeftGrab?.(u, v, w, hh)) {
       grabbed = { moved: 0 };
+    } else if (mode === "wl" && cfg.wl) {
+      const [win, lev] = cfg.wl.get();
+      wlDrag = { x: e.clientX, y: e.clientY, win, lev };
+      canvas.style.cursor = "crosshair";
+    } else if (mode === "zoom" || mode === "pan") {
+      view = { mode, x: e.clientX, y: e.clientY, pu: u, pv: v };
+      canvas.style.cursor = mode === "zoom" ? "ns-resize" : "grabbing";
     } else scroll = { x: e.clientX, y: e.clientY, acc: 0 };
     canvas.setPointerCapture(e.pointerId);
   };
@@ -4181,7 +5166,7 @@ function attachSliceControls(canvas, cfg) {
       const dx = e.clientX - view.x, dy = e.clientY - view.y;
       const r = canvas.getBoundingClientRect();
       if (view.mode === "pan") cfg.getSlice().panByPixels(cfg.orient, dx, dy, r.width, r.height);
-      else cfg.getSlice().zoomAbout(cfg.orient, Math.exp(dy * 6e-3), view.pu, view.pv, r.width, r.height);
+      else cfg.getSlice().zoomAbout(cfg.orient, Math.exp(dy * 6e-3), 0.5, 0.5, r.width, r.height);
       view.x = e.clientX;
       view.y = e.clientY;
       cfg.redraw();
@@ -4191,6 +5176,20 @@ function attachSliceControls(canvas, cfg) {
       grabbed.moved += Math.abs(e.movementX) + Math.abs(e.movementY);
       const { u, v, w, h: hh } = uv(e);
       h.onLeftDrag?.(u, v, w, hh);
+      return;
+    }
+    if (wlDrag && cfg.wl) {
+      const [lo, hi] = cfg.wl.range();
+      const r = canvas.getBoundingClientRect();
+      const gain = (hi - lo) / Math.max(1, Math.min(r.width, r.height));
+      let win = wlDrag.win + gain * (e.clientX - wlDrag.x);
+      if (win < 0) win = 0;
+      let lev = wlDrag.lev + gain * (wlDrag.y - e.clientY);
+      if (lev < lo - win / 2) lev = lo - win / 2;
+      if (lev > hi + win / 2) lev = hi + win / 2;
+      cfg.wl.set(win, lev);
+      wlDrag = { x: e.clientX, y: e.clientY, win, lev };
+      cfg.redraw();
       return;
     }
     if (scroll) {
@@ -4224,6 +5223,11 @@ function attachSliceControls(canvas, cfg) {
       const m = grabbed.moved;
       grabbed = null;
       h.onLeftDrop?.(m);
+      return;
+    }
+    if (wlDrag) {
+      wlDrag = null;
+      canvas.style.cursor = "default";
       return;
     }
     scroll = null;
@@ -4324,11 +5328,13 @@ function attachWidgetControls(canvas, camera, opts) {
     const { x, y, rw, rh } = cursorCss(e);
     const { w, h } = opts.getSize();
     const { vp } = camMatrices(camera, w, h);
+    const touch = e.pointerType === "touch";
     let best = null, bestD = Infinity;
     for (const hnd of opts.getHandles()) {
       const s = project(vp, hnd.world, rw, rh);
       if (!s) continue;
-      const d = Math.hypot(s.x - x, s.y - y), r = hnd.pickPx ?? 16;
+      const r = (hnd.pickPx ?? 16) * (touch ? 2.75 : 1);
+      const d = Math.hypot(s.x - x, s.y - y);
       if (d < r && d < bestD) {
         bestD = d;
         best = hnd;
@@ -4336,22 +5342,44 @@ function attachWidgetControls(canvas, camera, opts) {
     }
     return best;
   };
-  let grabbed = null, hovered = null;
+  let grabbed = null, hovered = null, grabbedId = -1;
+  const release = (pointerId) => {
+    if (!grabbed) return;
+    const g = grabbed;
+    grabbed = null;
+    grabbedId = -1;
+    try {
+      canvas.releasePointerCapture(pointerId);
+    } catch {
+    }
+    window.removeEventListener("pointermove", onMove, true);
+    window.removeEventListener("pointerup", onUp, true);
+    window.removeEventListener("pointercancel", onCancel, true);
+    canvas.style.cursor = "";
+    opts.onDragEnd?.(g);
+  };
   const onDown = (e) => {
     if (e.button !== 0) return;
+    if (grabbed) {
+      release(e.pointerId);
+      return;
+    }
+    if (e.isPrimary === false) return;
     const h = pick(e);
     if (!h) return;
     e.stopPropagation();
     e.preventDefault();
     grabbed = h;
+    grabbedId = e.pointerId;
     canvas.setPointerCapture(e.pointerId);
     canvas.style.cursor = h.cursor ? h.cursor : "grabbing";
     opts.onDragStart?.(h);
     window.addEventListener("pointermove", onMove, true);
     window.addEventListener("pointerup", onUp, true);
+    window.addEventListener("pointercancel", onCancel, true);
   };
   const onMove = (e) => {
-    if (!grabbed) return;
+    if (!grabbed || e.pointerId !== grabbedId) return;
     e.stopPropagation();
     const { x, y, rw, rh } = cursorCss(e);
     const { w, h } = opts.getSize();
@@ -4361,17 +5389,12 @@ function attachWidgetControls(canvas, camera, opts) {
     opts.onChange?.();
   };
   const onUp = (e) => {
-    if (!grabbed) return;
+    if (!grabbed || e.pointerId !== grabbedId) return;
     e.stopPropagation();
-    const g = grabbed;
-    grabbed = null;
-    try {
-      canvas.releasePointerCapture(e.pointerId);
-    } catch {
-    }
-    window.removeEventListener("pointermove", onMove, true);
-    window.removeEventListener("pointerup", onUp, true);
-    opts.onDragEnd?.(g);
+    release(e.pointerId);
+  };
+  const onCancel = (e) => {
+    if (grabbed && e.pointerId === grabbedId) release(e.pointerId);
   };
   const onHoverMove = (e) => {
     if (grabbed) return;
@@ -4391,6 +5414,7 @@ function attachWidgetControls(canvas, camera, opts) {
       canvas.removeEventListener("pointermove", onHoverMove);
       window.removeEventListener("pointermove", onMove, true);
       window.removeEventListener("pointerup", onUp, true);
+      window.removeEventListener("pointercancel", onCancel, true);
     }
   };
 }
@@ -4540,6 +5564,1021 @@ function mountAdaptive3d(opts) {
   return { draw, budget, renderSettled, renderMoving, loop };
 }
 
+// render/sdf-text.ts
+function layoutText(font, text, opts = {}) {
+  const pxSize = opts.pxSize ?? font.sizePx;
+  const s = pxSize / font.sizePx;
+  const maxW = opts.maxWidthPx ?? Infinity;
+  const lineH = (font.lineHeight + (opts.lineGap ?? 0)) * s;
+  const space = (font.glyphs.get(" ")?.advance ?? font.sizePx * 0.3) * s;
+  const quads = [];
+  let maxLineW = 0, lineIdx = 0;
+  const paragraphs = text.split("\n");
+  for (const para of paragraphs) {
+    const words = para.split(" ").filter((w, _i, a) => w.length > 0 || a.length === 1);
+    let penX = 0;
+    const baseline = () => lineIdx * lineH + font.ascent * s;
+    const wordWidth = (w) => {
+      let x = 0;
+      for (const ch of w) x += (font.glyphs.get(ch)?.advance ?? space / s) * s;
+      return x;
+    };
+    const emit = (w) => {
+      for (const ch of w) {
+        const g = font.glyphs.get(ch);
+        if (g) {
+          if (g.aw > 0 && g.ah > 0) quads.push({
+            x: penX + g.offX * s,
+            y: baseline() + g.offY * s,
+            w: g.aw * s,
+            h: g.ah * s,
+            u0: g.ax / font.atlasW,
+            v0: g.ay / font.atlasH,
+            u1: (g.ax + g.aw) / font.atlasW,
+            v1: (g.ay + g.ah) / font.atlasH
+          });
+          penX += g.advance * s;
+        } else penX += space;
+      }
+    };
+    for (let wi = 0; wi < words.length; wi++) {
+      const w = words[wi];
+      const need = (penX > 0 ? space : 0) + wordWidth(w);
+      if (penX > 0 && penX + need > maxW) {
+        maxLineW = Math.max(maxLineW, penX);
+        lineIdx++;
+        penX = 0;
+      } else if (penX > 0) penX += space;
+      emit(w);
+    }
+    maxLineW = Math.max(maxLineW, penX);
+    lineIdx++;
+  }
+  return { quads, width: maxLineW, height: lineIdx * lineH, lines: lineIdx };
+}
+var INF = 1e20;
+function edt1d(f, n, d, v, z) {
+  let k = 0;
+  v[0] = 0;
+  z[0] = -INF;
+  z[1] = INF;
+  for (let q = 1; q < n; q++) {
+    let s = (f[q] + q * q - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
+    while (s <= z[k]) {
+      k--;
+      s = (f[q] + q * q - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
+    }
+    k++;
+    v[k] = q;
+    z[k] = s;
+    z[k + 1] = INF;
+  }
+  k = 0;
+  for (let q = 0; q < n; q++) {
+    while (z[k + 1] < q) k++;
+    const dv = q - v[k];
+    d[q] = dv * dv + f[v[k]];
+  }
+}
+function edt2d(mask, w, h) {
+  const g = new Float64Array(w * h);
+  for (let i = 0; i < w * h; i++) g[i] = mask[i] ? 0 : INF;
+  const maxn = Math.max(w, h);
+  const f = new Float64Array(maxn), d = new Float64Array(maxn), z = new Float64Array(maxn + 1);
+  const v = new Int32Array(maxn);
+  for (let x = 0; x < w; x++) {
+    for (let y = 0; y < h; y++) f[y] = g[y * w + x];
+    edt1d(f, h, d, v, z);
+    for (let y = 0; y < h; y++) g[y * w + x] = d[y];
+  }
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) f[x] = g[y * w + x];
+    edt1d(f, w, d, v, z);
+    for (let x = 0; x < w; x++) g[y * w + x] = d[x];
+  }
+  return g;
+}
+function sdfFromMask(alpha, w, h, spread) {
+  const inside = new Uint8Array(w * h), outside = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) {
+    const on = alpha[i] >= 128 ? 1 : 0;
+    inside[i] = on;
+    outside[i] = on ? 0 : 1;
+  }
+  const dOut = edt2d(inside, w, h);
+  const dIn = edt2d(outside, w, h);
+  const out = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) {
+    const signed = inside[i] ? Math.sqrt(dIn[i]) : -Math.sqrt(dOut[i]);
+    out[i] = Math.max(0, Math.min(255, Math.round((0.5 + signed / (2 * spread)) * 255)));
+  }
+  return out;
+}
+function makeCanvas(w, h) {
+  const g = globalThis;
+  if (g.OffscreenCanvas) return new g.OffscreenCanvas(w, h);
+  if (g.document) {
+    const c = g.document.createElement("canvas");
+    c.width = w;
+    c.height = h;
+    return c;
+  }
+  throw new Error("sdf-text: no canvas available (browser only)");
+}
+var DEFAULT_CHARS = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~\xB0\xB1\xD7\xB5\u2013\u2014";
+function buildFontAtlas(opts = {}) {
+  const sizePx = opts.sizePx ?? 44;
+  const spread = opts.spread ?? 6;
+  const chars = [...opts.chars ?? DEFAULT_CHARS];
+  const fontStr = `${opts.weight ?? "normal"} ${sizePx}px ${opts.fontFamily ?? "system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif"}`;
+  const cell = Math.ceil(sizePx * 1.6) + spread * 2;
+  const atlasW = opts.atlasW ?? 1024;
+  const cols = Math.max(1, Math.floor(atlasW / cell));
+  const rows = Math.ceil(chars.length / cols);
+  const atlasH = rows * cell;
+  const cv = makeCanvas(atlasW, atlasH);
+  const ctx = cv.getContext("2d");
+  if (!ctx) throw new Error("sdf-text: no 2d context");
+  ctx.font = fontStr;
+  ctx.textBaseline = "alphabetic";
+  ctx.fillStyle = "#fff";
+  const glyphs = /* @__PURE__ */ new Map();
+  let ascent = 0, descent = 0;
+  const placed = [];
+  chars.forEach((ch, i) => {
+    const m = ctx.measureText(ch);
+    const asc = m.actualBoundingBoxAscent ?? sizePx * 0.75, desc = m.actualBoundingBoxDescent ?? sizePx * 0.2;
+    const left = m.actualBoundingBoxLeft ?? 0, right = m.actualBoundingBoxRight ?? m.width;
+    ascent = Math.max(ascent, asc);
+    descent = Math.max(descent, desc);
+    const cx = i % cols * cell, cy = Math.floor(i / cols) * cell;
+    const inkW = Math.max(0, left + right), inkH = Math.max(0, asc + desc);
+    const drawX = cx + spread + left, drawY = cy + spread + asc;
+    if (ch !== " " && inkW > 0 && inkH > 0) ctx.fillText(ch, drawX, drawY);
+    placed.push({ ch, cx, cy, iw: inkW, ih: inkH, offX: -(spread + left), offY: -(spread + asc), advance: m.width });
+  });
+  const img = ctx.getImageData(0, 0, atlasW, atlasH).data;
+  const alpha = new Uint8Array(atlasW * atlasH);
+  for (let i = 0; i < atlasW * atlasH; i++) alpha[i] = img[i * 4 + 3];
+  const data = new Uint8Array(atlasW * atlasH);
+  data.fill(0);
+  for (const p of placed) {
+    const cw = Math.min(cell, atlasW - p.cx), chh = Math.min(cell, atlasH - p.cy);
+    if (p.iw <= 0 || p.ih <= 0) {
+      glyphs.set(p.ch, { advance: p.advance, ax: p.cx, ay: p.cy, aw: 0, ah: 0, offX: 0, offY: 0 });
+      continue;
+    }
+    const sub3 = new Uint8Array(cw * chh);
+    for (let y = 0; y < chh; y++) for (let x = 0; x < cw; x++) sub3[y * cw + x] = alpha[(p.cy + y) * atlasW + (p.cx + x)];
+    const sdf = sdfFromMask(sub3, cw, chh, spread);
+    for (let y = 0; y < chh; y++) for (let x = 0; x < cw; x++) data[(p.cy + y) * atlasW + (p.cx + x)] = sdf[y * cw + x];
+    const aw = Math.ceil(p.iw) + spread * 2, ah = Math.ceil(p.ih) + spread * 2;
+    glyphs.set(p.ch, { advance: p.advance, ax: p.cx, ay: p.cy, aw: Math.min(aw, cw), ah: Math.min(ah, chh), offX: p.offX, offY: p.offY });
+  }
+  return { sizePx, spread, atlasW, atlasH, data, glyphs, ascent, descent, lineHeight: ascent + descent };
+}
+
+// render/label-layout.ts
+var DEFAULTS = {
+  anchorSpring: 26,
+  repulsion: 200,
+  damping: 0.86,
+  maxSpeed: 1600,
+  margin: 8,
+  gap: 10,
+  standoff: 96,
+  ringGap: 14,
+  keepOutForce: 40
+};
+function seedCards(anchorsPx, sizes, standoff = DEFAULTS.standoff) {
+  const GA = 2.399963229728653;
+  return anchorsPx.map((a, i) => {
+    const ang = i * GA;
+    return { x: a.x + Math.cos(ang) * standoff, y: a.y + Math.sin(ang) * standoff, vx: 0, vy: 0, w: sizes[i].w, h: sizes[i].h };
+  });
+}
+function layoutStep(cards, anchorsPx, viewport, dtSec, opts = {}) {
+  const o = { ...DEFAULTS, ...opts };
+  const dt = Math.min(Math.max(dtSec, 0), 0.05);
+  if (dt === 0) return;
+  const n = cards.length;
+  const fx = new Float64Array(n), fy = new Float64Array(n);
+  const kos = o.keepOuts;
+  const GA = 2.399963229728653;
+  let gx = 0, gy = 0;
+  if (kos && kos.length) {
+    for (const k of kos) {
+      gx += k.x;
+      gy += k.y;
+    }
+    gx /= kos.length;
+    gy /= kos.length;
+  }
+  let slotArc = null;
+  let slotRX = 0, slotRY = 0;
+  if (o.boundary && n > 8) {
+    const bnd = o.boundary, bcx = (bnd.minX + bnd.maxX) / 2, bcy = (bnd.minY + bnd.maxY) / 2;
+    slotRX = (bnd.maxX - bnd.minX) / 2 + o.ringGap;
+    slotRY = (bnd.maxY - bnd.minY) / 2 + o.ringGap;
+    const P = 2 * (2 * slotRX + 2 * slotRY);
+    const order = Array.from({ length: n }, (_, i) => i).sort((i, j) => Math.atan2(anchorsPx[i].y - bcy, anchorsPx[i].x - bcx) - Math.atan2(anchorsPx[j].y - bcy, anchorsPx[j].x - bcx));
+    const foot = order.map((idx) => Math.max(cards[idx].w, cards[idx].h) + o.gap);
+    let total = 0;
+    for (const f of foot) total += f;
+    const extra = Math.max(0, P - total) / n;
+    slotArc = new Float64Array(n);
+    let acc = 0;
+    for (let k = 0; k < n; k++) {
+      acc += (foot[k] + extra) / 2;
+      slotArc[order[k]] = acc % P;
+      acc += (foot[k] + extra) / 2;
+    }
+  }
+  for (let i = 0; i < n; i++) {
+    const a = anchorsPx[i], c = cards[i];
+    const halfDiag = 0.5 * Math.hypot(c.w, c.h);
+    const bnd = o.boundary;
+    const own = kos && kos[i];
+    let tx, ty;
+    if (bnd) {
+      const bcx = (bnd.minX + bnd.maxX) / 2, bcy = (bnd.minY + bnd.maxY) / 2;
+      const bhx = (bnd.maxX - bnd.minX) / 2, bhy = (bnd.maxY - bnd.minY) / 2;
+      if (slotArc) {
+        const RX = slotRX, RY = slotRY, W = 2 * RX, H = 2 * RY;
+        let s = slotArc[i];
+        let rx, ry, nx, ny;
+        if (s < W) {
+          rx = -RX + s;
+          ry = -RY;
+          nx = 0;
+          ny = -1;
+        } else if ((s -= W) < H) {
+          rx = RX;
+          ry = -RY + s;
+          nx = 1;
+          ny = 0;
+        } else if ((s -= H) < W) {
+          rx = RX - s;
+          ry = RY;
+          nx = 0;
+          ny = 1;
+        } else {
+          s -= W;
+          rx = -RX;
+          ry = RY - s;
+          nx = -1;
+          ny = 0;
+        }
+        tx = bcx + rx + nx * halfDiag;
+        ty = bcy + ry + ny * halfDiag;
+      } else {
+        let dirx = a.x - bcx, diry = a.y - bcy;
+        let dl = Math.hypot(dirx, diry);
+        if (dl < 0.01) {
+          dirx = Math.cos(i * GA);
+          diry = Math.sin(i * GA);
+          dl = 1;
+        }
+        dirx /= dl;
+        diry /= dl;
+        const tEdge = Math.min(bhx / Math.max(Math.abs(dirx), 1e-4), bhy / Math.max(Math.abs(diry), 1e-4));
+        const Rr = tEdge + halfDiag + o.ringGap;
+        tx = bcx + dirx * Rr;
+        ty = bcy + diry * Rr;
+      }
+    } else if (own) {
+      let dirx = own.x - gx, diry = own.y - gy;
+      let dl = Math.hypot(dirx, diry);
+      if (dl < 0.01) {
+        dirx = Math.cos(i * GA);
+        diry = Math.sin(i * GA);
+        dl = 1;
+      }
+      dirx /= dl;
+      diry /= dl;
+      const R = own.radius + halfDiag + o.ringGap;
+      tx = own.x + dirx * R;
+      ty = own.y + diry * R;
+    } else {
+      const dx = c.x - a.x, dy = c.y - a.y, d = Math.hypot(dx, dy) || 1;
+      tx = a.x + dx / d * o.standoff;
+      ty = a.y + dy / d * o.standoff;
+    }
+    fx[i] += (tx - c.x) * o.anchorSpring;
+    fy[i] += (ty - c.y) * o.anchorSpring;
+    if (o.boundary) {
+      const k = o.boundary;
+      const bcx = (k.minX + k.maxX) / 2, bcy = (k.minY + k.maxY) / 2;
+      const bhx = (k.maxX - k.minX) / 2 + halfDiag, bhy = (k.maxY - k.minY) / 2 + halfDiag;
+      const penx = bhx - Math.abs(c.x - bcx), peny = bhy - Math.abs(c.y - bcy);
+      if (penx > 0 && peny > 0) {
+        if (penx < peny) fx[i] += Math.sign(c.x - bcx || 1) * penx * o.keepOutForce;
+        else fy[i] += Math.sign(c.y - bcy || 1) * peny * o.keepOutForce;
+      }
+    }
+    if (o.reserved) for (const r of o.reserved) {
+      const rcx = r.x + r.w / 2, rcy = r.y + r.h / 2;
+      const px = (c.w + r.w) / 2 + o.gap - Math.abs(c.x - rcx);
+      const py = (c.h + r.h) / 2 + o.gap - Math.abs(c.y - rcy);
+      if (px > 0 && py > 0) {
+        const F = o.keepOutForce * 2.5;
+        if (px < py) fx[i] += Math.sign(c.x - rcx || 1) * px * F;
+        else fy[i] += Math.sign(c.y - rcy || 1) * py * F;
+      }
+    }
+    if (kos) for (const k of kos) {
+      let dx = c.x - k.x, dy = c.y - k.y;
+      let d = Math.hypot(dx, dy);
+      if (d < 1e-3) {
+        dx = Math.cos(i * GA);
+        dy = Math.sin(i * GA);
+        d = 1;
+      }
+      const need = k.radius + halfDiag;
+      if (d < need) {
+        const push = (need - d) * o.keepOutForce;
+        fx[i] += dx / d * push;
+        fy[i] += dy / d * push;
+      }
+    }
+  }
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      const a = cards[i], b = cards[j];
+      const ox = (a.w + b.w) / 2 + o.gap - Math.abs(a.x - b.x);
+      const oy = (a.h + b.h) / 2 + o.gap - Math.abs(a.y - b.y);
+      if (ox <= 0 || oy <= 0) continue;
+      if (ox <= oy) {
+        const s = Math.sign(a.x - b.x || i - j || 1), f = o.repulsion * ox;
+        fx[i] += s * f;
+        fx[j] -= s * f;
+      } else {
+        const s = Math.sign(a.y - b.y || i - j || 1), f = o.repulsion * oy;
+        fy[i] += s * f;
+        fy[j] -= s * f;
+      }
+    }
+  }
+  for (let i = 0; i < n; i++) {
+    const c = cards[i];
+    c.vx = (c.vx + fx[i] * dt) * Math.pow(o.damping, dt / (1 / 60));
+    c.vy = (c.vy + fy[i] * dt) * Math.pow(o.damping, dt / (1 / 60));
+    const sp = Math.hypot(c.vx, c.vy);
+    if (sp > o.maxSpeed) {
+      c.vx = c.vx / sp * o.maxSpeed;
+      c.vy = c.vy / sp * o.maxSpeed;
+    }
+    c.x += c.vx * dt;
+    c.y += c.vy * dt;
+    const hw = c.w / 2 + o.margin, hh = c.h / 2 + o.margin;
+    if (c.x < hw) {
+      c.x = hw;
+      if (c.vx < 0) c.vx = 0;
+    } else if (c.x > viewport.w - hw) {
+      c.x = viewport.w - hw;
+      if (c.vx > 0) c.vx = 0;
+    }
+    if (c.y < hh) {
+      c.y = hh;
+      if (c.vy < 0) c.vy = 0;
+    } else if (c.y > viewport.h - hh) {
+      c.y = viewport.h - hh;
+      if (c.vy > 0) c.vy = 0;
+    }
+  }
+  for (let iter = 0; iter < 4; iter++) {
+    let moved = false;
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        const a = cards[i], b = cards[j];
+        const ox = (a.w + b.w) / 2 + o.gap - Math.abs(a.x - b.x);
+        const oy = (a.h + b.h) / 2 + o.gap - Math.abs(a.y - b.y);
+        if (ox <= 0 || oy <= 0) continue;
+        moved = true;
+        if (ox <= oy) {
+          const m = Math.sign(a.x - b.x || i - j || 1) * ox / 2;
+          a.x += m;
+          b.x -= m;
+        } else {
+          const m = Math.sign(a.y - b.y || i - j || 1) * oy / 2;
+          a.y += m;
+          b.y -= m;
+        }
+      }
+    }
+    if (o.reserved) for (let i = 0; i < n; i++) {
+      const c = cards[i];
+      for (const r of o.reserved) {
+        const rcx = r.x + r.w / 2, rcy = r.y + r.h / 2;
+        const px = (c.w + r.w) / 2 + o.gap - Math.abs(c.x - rcx);
+        const py = (c.h + r.h) / 2 + o.gap - Math.abs(c.y - rcy);
+        if (px > 0 && py > 0) {
+          moved = true;
+          if (px < py) c.x += Math.sign(c.x - rcx || 1) * px;
+          else c.y += Math.sign(c.y - rcy || 1) * py;
+        }
+      }
+    }
+    for (let i = 0; i < n; i++) {
+      const c = cards[i], hw = c.w / 2 + o.margin, hh = c.h / 2 + o.margin;
+      c.x = Math.min(Math.max(c.x, hw), viewport.w - hw);
+      c.y = Math.min(Math.max(c.y, hh), viewport.h - hh);
+    }
+    if (!moved) break;
+  }
+}
+
+// render/label-cards.ts
+var BUTTONS = [
+  { label: "Isolate", part: "isolate" },
+  { label: "Hide", part: "hide" },
+  { label: "Reset opacities", part: "reset" }
+];
+var BLACK = [0, 0, 0, 1];
+var GREY = [0.32, 0.32, 0.36, 1];
+var SHAPE_WGSL = (
+  /* wgsl */
+  `
+struct VP { size : vec4<f32> };
+@group(0) @binding(0) var<uniform> u : VP;
+struct VO { @builtin(position) pos : vec4<f32>, @location(0) p : vec2<f32>, @location(1) center : vec2<f32>,
+            @location(2) half : vec2<f32>, @location(3) params : vec4<f32>, @location(4) fill : vec4<f32>, @location(5) border : vec4<f32> };
+@vertex fn vs(@location(0) posPx : vec2<f32>, @location(1) center : vec2<f32>, @location(2) half : vec2<f32>,
+              @location(3) params : vec4<f32>, @location(4) fill : vec4<f32>, @location(5) border : vec4<f32>) -> VO {
+  var o : VO;
+  o.pos = vec4<f32>(posPx.x / u.size.x * 2.0 - 1.0, 1.0 - posPx.y / u.size.y * 2.0, 0.0, 1.0);
+  o.p = posPx; o.center = center; o.half = half; o.params = params; o.fill = fill; o.border = border;
+  return o;
+}
+fn sdRoundBox(p : vec2<f32>, b : vec2<f32>, r : f32) -> f32 {
+  let q = abs(p) - b + vec2<f32>(r);
+  return min(max(q.x, q.y), 0.0) + length(max(q, vec2<f32>(0.0))) - r;
+}
+@fragment fn fs(i : VO) -> @location(0) vec4<f32> {
+  if (i.params.z > 0.5) { return vec4<f32>(i.fill.rgb * i.fill.a, i.fill.a); }   // plain (leader lines)
+  let d = sdRoundBox(i.p - i.center, i.half, i.params.x);
+  let cov = 1.0 - smoothstep(0.0, 1.0, d);
+  if (cov <= 0.0) { discard; }
+  let inner = 1.0 - smoothstep(0.0, 1.0, d + i.params.y);
+  var col = mix(i.border, i.fill, inner);
+  col.a = col.a * cov;
+  return vec4<f32>(col.rgb * col.a, col.a);
+}`
+);
+var TEXT_WGSL = (
+  /* wgsl */
+  `
+struct VP { size : vec4<f32> };
+@group(0) @binding(0) var<uniform> u : VP;
+@group(0) @binding(1) var atlas : texture_2d<f32>;
+@group(0) @binding(2) var samp : sampler;
+struct TO { @builtin(position) pos : vec4<f32>, @location(0) uv : vec2<f32>, @location(1) color : vec4<f32> };
+@vertex fn vs(@location(0) posPx : vec2<f32>, @location(1) uv : vec2<f32>, @location(2) color : vec4<f32>) -> TO {
+  var o : TO;
+  o.pos = vec4<f32>(posPx.x / u.size.x * 2.0 - 1.0, 1.0 - posPx.y / u.size.y * 2.0, 0.0, 1.0);
+  o.uv = uv; o.color = color; return o;
+}
+@fragment fn fs(i : TO) -> @location(0) vec4<f32> {
+  let d = textureSample(atlas, samp, i.uv).r;
+  let aa = fwidth(d) + 1e-4;
+  let a = smoothstep(0.5 - aa, 0.5 + aa, d) * i.color.a;
+  if (a <= 0.001) { discard; }
+  return vec4<f32>(i.color.rgb * a, a);
+}`
+);
+var PREMUL_BLEND = {
+  color: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+  alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" }
+};
+var CardOverlay = class {
+  dev;
+  shapePipe;
+  textPipe;
+  vpBuf;
+  shapeBind;
+  textBind;
+  atlasTex;
+  font;
+  st;
+  dpr = 1;
+  compact = false;
+  // many segments → cards collapse to a mini card (swatch + name), full card on click
+  shapeBuf;
+  shapeCap = 0;
+  textBuf;
+  textCap = 0;
+  cards = [];
+  bodies = [];
+  seeded = false;
+  lastVisible = [];
+  perf = { layoutMs: 0, buildMs: 0, submitMs: 0 };
+  maxSpeed = 0;
+  /** True when every card is at rest — lets the host stop rendering (dormant) until the next change. */
+  settled() {
+    return this.maxSpeed < 1.5;
+  }
+  constructor(gpu, format, font, style = {}) {
+    this.dev = gpu.device;
+    this.font = font;
+    const sc = style.scale ?? 1;
+    this.st = {
+      titlePx: (style.titlePx ?? 15) * sc,
+      bodyPx: (style.bodyPx ?? 12) * sc,
+      padPx: (style.padPx ?? 10) * sc,
+      gapPx: (style.gapPx ?? 5) * sc,
+      maxTextPx: (style.maxTextPx ?? 240) * sc,
+      radiusPx: (style.radiusPx ?? 6) * sc,
+      borderPx: (style.borderPx ?? 1.25) * sc,
+      glassRGBA: style.glassRGBA ?? [1, 1, 1, 0.82],
+      borderRGBA: style.borderRGBA ?? [0, 0, 0, 0.92],
+      leaderRGBA: style.leaderRGBA ?? [0.05, 0.05, 0.05, 0.85],
+      leaderPx: (style.leaderPx ?? 1.5) * sc,
+      buttonRGBA: style.buttonRGBA ?? [0.9, 0.91, 0.95, 1]
+    };
+    this.atlasTex = this.dev.createTexture({ size: [font.atlasW, font.atlasH], format: "r8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+    this.dev.queue.writeTexture({ texture: this.atlasTex }, font.data, { bytesPerRow: font.atlasW, rowsPerImage: font.atlasH }, [font.atlasW, font.atlasH]);
+    const sampler = this.dev.createSampler({ magFilter: "linear", minFilter: "linear", addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge" });
+    this.vpBuf = this.dev.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const shapeMod = this.dev.createShaderModule({ code: SHAPE_WGSL });
+    this.shapePipe = this.dev.createRenderPipeline({
+      layout: "auto",
+      vertex: { module: shapeMod, entryPoint: "vs", buffers: [{ arrayStride: 72, attributes: [
+        { shaderLocation: 0, offset: 0, format: "float32x2" },
+        { shaderLocation: 1, offset: 8, format: "float32x2" },
+        { shaderLocation: 2, offset: 16, format: "float32x2" },
+        { shaderLocation: 3, offset: 24, format: "float32x4" },
+        { shaderLocation: 4, offset: 40, format: "float32x4" },
+        { shaderLocation: 5, offset: 56, format: "float32x4" }
+      ] }] },
+      fragment: { module: shapeMod, entryPoint: "fs", targets: [{ format, blend: PREMUL_BLEND }] },
+      primitive: { topology: "triangle-list" }
+    });
+    const textMod = this.dev.createShaderModule({ code: TEXT_WGSL });
+    this.textPipe = this.dev.createRenderPipeline({
+      layout: "auto",
+      vertex: { module: textMod, entryPoint: "vs", buffers: [{ arrayStride: 32, attributes: [
+        { shaderLocation: 0, offset: 0, format: "float32x2" },
+        { shaderLocation: 1, offset: 8, format: "float32x2" },
+        { shaderLocation: 2, offset: 16, format: "float32x4" }
+      ] }] },
+      fragment: { module: textMod, entryPoint: "fs", targets: [{ format, blend: PREMUL_BLEND }] },
+      primitive: { topology: "triangle-list" }
+    });
+    this.shapeBind = this.dev.createBindGroup({ layout: this.shapePipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: this.vpBuf } }] });
+    this.textBind = this.dev.createBindGroup({ layout: this.textPipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: this.vpBuf } }, { binding: 1, resource: this.atlasTex.createView() }, { binding: 2, resource: sampler }] });
+  }
+  setCards(specs, dpr = 1, compact = false) {
+    this.dpr = dpr;
+    this.compact = compact;
+    const s = this.st, titlePx = s.titlePx * dpr, bodyPx = s.bodyPx * dpr, pad = s.padPx * dpr, gap = s.gapPx * dpr, maxT = s.maxTextPx * dpr;
+    const sw = Math.round(titlePx), btnH = Math.round(bodyPx + 10 * dpr), btnGap = 4 * dpr, btnInnerPad = 8 * dpr;
+    const miniPx = Math.max(9 * dpr, Math.round(titlePx * 0.72)), miniSw = Math.round(miniPx);
+    const miniPad = Math.round(pad * 0.55), miniGap = Math.round(gap * 0.7);
+    const num = (n) => n.toLocaleString("en-US");
+    this.cards = specs.map((spec) => {
+      const titleL = layoutText(this.font, spec.title, { pxSize: titlePx, maxWidthPx: maxT - sw - gap });
+      const subL = spec.subtitle ? layoutText(this.font, spec.subtitle, { pxSize: bodyPx, maxWidthPx: maxT }) : null;
+      const titleX = pad + (spec.swatch ? sw + gap : 0);
+      const row1H = Math.max(titleL.height, spec.swatch ? sw : 0);
+      const headBottom = pad + row1H + (subL ? gap + subL.height : 0);
+      const headContentW = Math.max(titleX - pad + titleL.width, subL ? subL.width : 0);
+      const head = {
+        runs: [{ quads: offset(titleL.quads, titleX, pad), color: BLACK }],
+        swatch: spec.swatch ? { x: pad, y: pad, w: sw, h: sw, color: [spec.swatch[0], spec.swatch[1], spec.swatch[2], 1] } : void 0
+      };
+      if (subL) head.runs.push({ quads: offset(subL.quads, pad, pad + row1H + gap), color: GREY });
+      const cw = Math.ceil(headContentW + pad * 2), ch = Math.ceil(headBottom + pad);
+      const nameL = layoutText(this.font, spec.title, { pxSize: miniPx, maxWidthPx: maxT });
+      const mRow = Math.max(nameL.height, spec.swatch ? miniSw : 0);
+      const mTitleX = miniPad + (spec.swatch ? miniSw + miniGap : 0);
+      const miniHead = {
+        runs: [{ quads: offset(nameL.quads, mTitleX, miniPad + (mRow - nameL.height) / 2), color: BLACK }],
+        swatch: spec.swatch ? { x: miniPad, y: miniPad + (mRow - miniSw) / 2, w: miniSw, h: miniSw, color: [spec.swatch[0], spec.swatch[1], spec.swatch[2], 1] } : void 0
+      };
+      const mw = Math.ceil(mTitleX + nameL.width + miniPad), mh = Math.ceil(mRow + miniPad * 2);
+      const lines = [];
+      if (spec.stat) {
+        lines.push(`${num(spec.stat.voxels)} voxels`);
+        lines.push(`${spec.stat.volumeCc.toFixed(1)} cc`);
+        if (spec.stat.hu) lines.push(`${spec.stat.hu.mean.toFixed(0)} \xB1 ${spec.stat.hu.std.toFixed(0)} HU`);
+      }
+      const lineLs = lines.map((t) => layoutText(this.font, t, { pxSize: bodyPx, maxWidthPx: maxT }));
+      const btnLabels = BUTTONS.map((b) => layoutText(this.font, b.label, { pxSize: bodyPx, maxWidthPx: maxT }));
+      const contentW = Math.max(headContentW, ...lineLs.map((l) => l.width), ...btnLabels.map((l) => l.width + btnInnerPad * 2));
+      const ew = Math.ceil(contentW + pad * 2), btnW = ew - pad * 2;
+      const extra = { runs: [], buttons: [] };
+      let y = headBottom + gap;
+      for (const l of lineLs) {
+        extra.runs.push({ quads: offset(l.quads, pad, y), color: BLACK });
+        y += l.height + gap * 0.6;
+      }
+      y += gap * 0.4;
+      for (let k = 0; k < BUTTONS.length; k++) {
+        const lab = btnLabels[k], lx = pad + (btnW - lab.width) / 2, ly = y + (btnH - lab.height) / 2;
+        extra.buttons.push({ x: pad, y, w: btnW, h: btnH, part: BUTTONS[k].part, label: { quads: offset(lab.quads, lx, ly), color: BLACK } });
+        y += btnH + btnGap;
+      }
+      const eh = Math.ceil(y - btnGap + pad);
+      return { spec, cw, ch, ew, eh: Math.max(eh, ch), mw, mh, miniHead, head, extra, expanded: false };
+    });
+    this.seeded = false;
+  }
+  size(c) {
+    if (c.expanded) return { w: c.ew, h: c.eh };
+    if (this.compact) return { w: c.mw, h: c.mh };
+    return { w: c.cw, h: c.ch };
+  }
+  hitTest(px, py) {
+    for (let i = this.cards.length - 1; i >= 0; i--) {
+      if (!this.lastVisible[i]) continue;
+      const b = this.bodies[i], c = this.cards[i], sz = this.size(c);
+      if (px < b.x - sz.w / 2 || px > b.x + sz.w / 2 || py < b.y - sz.h / 2 || py > b.y + sz.h / 2) continue;
+      if (c.expanded) {
+        const lx = px - (b.x - sz.w / 2), ly = py - (b.y - sz.h / 2);
+        for (const bt of c.extra.buttons) if (lx >= bt.x && lx <= bt.x + bt.w && ly >= bt.y && ly <= bt.y + bt.h) return { index: i, action: bt.part };
+      }
+      return { index: i, action: "toggle" };
+    }
+    return null;
+  }
+  toggle(index) {
+    const c = this.cards[index];
+    if (c) c.expanded = !c.expanded;
+  }
+  spec(index) {
+    return this.cards[index]?.spec;
+  }
+  cardCenter(index) {
+    const b = this.bodies[index];
+    return b ? { x: b.x, y: b.y } : null;
+  }
+  buttonCenter(index, part) {
+    const b = this.bodies[index], c = this.cards[index];
+    if (!b || !c) return null;
+    const bt = c.extra.buttons.find((x) => x.part === part);
+    if (!bt) return null;
+    const sz = this.size(c);
+    return { x: b.x - sz.w / 2 + bt.x + bt.w / 2, y: b.y - sz.h / 2 + bt.y + bt.h / 2 };
+  }
+  /** Run the force layout for one frame WITHOUT drawing (the CardField path renders via the ray-march).
+   *  Updates card body positions + visibility. Returns true while still moving. */
+  layout(camera, vp, dtSec, keepOuts, extra) {
+    if (!this.cards.length) return false;
+    const anchors = this.cards.map((c) => camera.worldToDisplay(c.spec.anchorRAS, vp.w, vp.h));
+    this.lastVisible = anchors.map((a) => a.depth > 0);
+    const anchorsPx = anchors.map((a) => ({ x: a.x, y: a.y }));
+    const sizes = this.cards.map((c) => this.size(c));
+    if (!this.seeded || this.bodies.length !== this.cards.length) {
+      this.bodies = seedCards(anchorsPx, sizes);
+      this.seeded = true;
+    } else for (let i = 0; i < this.bodies.length; i++) {
+      this.bodies[i].w = sizes[i].w;
+      this.bodies[i].h = sizes[i].h;
+    }
+    layoutStep(this.bodies, anchorsPx, { w: vp.w, h: vp.h }, dtSec, { keepOuts, boundary: extra?.boundary, reserved: extra?.reserved, ringGap: extra?.ringGap });
+    return !this.settled();
+  }
+  /** Card body (screen centre + size) for index — for the CardField billboard. */
+  body(index) {
+    const b = this.bodies[index];
+    return b ? { x: b.x, y: b.y, w: b.w, h: b.h } : null;
+  }
+  visible(index) {
+    return !!this.lastVisible[index];
+  }
+  count() {
+    return this.cards.length;
+  }
+  expanded(index) {
+    return !!this.cards[index]?.expanded;
+  }
+  render(view, camera, vp, dtSec, keepOuts, extra) {
+    if (!this.cards.length) return;
+    const shown = extra?.shown;
+    const anchors = this.cards.map((c) => camera.worldToDisplay(c.spec.anchorRAS, vp.w, vp.h));
+    this.lastVisible = anchors.map((a, i) => a.depth > 0 && (shown ? shown[i] : true));
+    const anchorsPx = anchors.map((a) => ({ x: a.x, y: a.y }));
+    const sizes = this.cards.map((c) => this.size(c));
+    if (!this.seeded || this.bodies.length !== this.cards.length) {
+      this.bodies = seedCards(anchorsPx, sizes);
+      this.seeded = true;
+    } else for (let i = 0; i < this.bodies.length; i++) {
+      this.bodies[i].w = sizes[i].w;
+      this.bodies[i].h = sizes[i].h;
+    }
+    const _t0 = performance.now();
+    const active = [];
+    for (let i = 0; i < this.cards.length; i++) if (this.lastVisible[i]) active.push(i);
+    const ab = active.map((i) => this.bodies[i]), aa = active.map((i) => anchorsPx[i]);
+    const ako = keepOuts ? active.map((i) => keepOuts[i]) : void 0;
+    layoutStep(ab, aa, { w: vp.w, h: vp.h }, dtSec, { keepOuts: ako, boundary: extra?.boundary, reserved: extra?.reserved, ringGap: extra?.ringGap });
+    this.perf.layoutMs = performance.now() - _t0;
+    let ms = 0;
+    for (const b of ab) ms = Math.max(ms, Math.hypot(b.vx, b.vy));
+    this.maxSpeed = ms;
+    const _t1 = performance.now();
+    const shape = [], text = [];
+    const rect = (cx, cy, hw, hh, radius, border, fill, brd) => {
+      const x0 = cx - hw, x1 = cx + hw, y0 = cy - hh, y1 = cy + hh;
+      for (const [px, py] of [[x0, y0], [x1, y0], [x1, y1], [x0, y0], [x1, y1], [x0, y1]]) shape.push(px, py, cx, cy, hw, hh, radius, border, 0, 0, ...fill, ...brd);
+    };
+    const line = (ax, ay, bx, by, width, col) => {
+      let dx = bx - ax, dy = by - ay;
+      const L = Math.hypot(dx, dy) || 1;
+      dx /= L;
+      dy /= L;
+      const nx = -dy * width / 2, ny = dx * width / 2;
+      for (const [px, py] of [[ax + nx, ay + ny], [bx + nx, by + ny], [bx - nx, by - ny], [ax + nx, ay + ny], [bx - nx, by - ny], [ax - nx, ay - ny]]) shape.push(px, py, 0, 0, -1, -1, 0, 0, 1, 0, ...col, 0, 0, 0, 0);
+    };
+    const glyphs = (runs, ox, oy) => {
+      for (const run of runs) for (const q of run.quads) {
+        const x0 = ox + q.x, x1 = ox + q.x + q.w, y0 = oy + q.y, y1 = oy + q.y + q.h, co = run.color;
+        for (const [px, py, uu, vv] of [[x0, y0, q.u0, q.v0], [x1, y0, q.u1, q.v0], [x1, y1, q.u1, q.v1], [x0, y0, q.u0, q.v0], [x1, y1, q.u1, q.v1], [x0, y1, q.u0, q.v1]]) text.push(px, py, uu, vv, ...co);
+      }
+    };
+    for (let i = 0; i < this.cards.length; i++) {
+      if (!this.lastVisible[i]) continue;
+      const c = this.cards[i], b = this.bodies[i], a = anchorsPx[i], sz = this.size(c);
+      const hw = sz.w / 2, hh = sz.h / 2, ox = b.x - hw, oy = b.y - hh;
+      const edge = boxEdgeToward(b.x, b.y, hw, hh, a.x, a.y);
+      line(edge.x, edge.y, a.x, a.y, this.st.leaderPx * this.dpr, this.st.leaderRGBA);
+      if (this.compact && !c.expanded) {
+        rect(b.x, b.y, hw, hh, this.st.radiusPx * this.dpr, this.st.borderPx * this.dpr, this.st.glassRGBA, this.st.borderRGBA);
+        if (c.miniHead.swatch) {
+          const w2 = c.miniHead.swatch;
+          rect(ox + w2.x + w2.w / 2, oy + w2.y + w2.h / 2, w2.w / 2, w2.h / 2, 2 * this.dpr, 1.25 * this.dpr, w2.color, BLACK);
+        }
+        glyphs(c.miniHead.runs, ox, oy);
+        continue;
+      }
+      rect(b.x, b.y, hw, hh, this.st.radiusPx * this.dpr, this.st.borderPx * this.dpr, this.st.glassRGBA, this.st.borderRGBA);
+      if (c.head.swatch) {
+        const w2 = c.head.swatch;
+        rect(ox + w2.x + w2.w / 2, oy + w2.y + w2.h / 2, w2.w / 2, w2.h / 2, 2 * this.dpr, 1.5 * this.dpr, w2.color, BLACK);
+      }
+      glyphs(c.head.runs, ox, oy);
+      if (c.expanded) {
+        for (const bt of c.extra.buttons) rect(ox + bt.x + bt.w / 2, oy + bt.y + bt.h / 2, bt.w / 2, bt.h / 2, 4 * this.dpr, 1 * this.dpr, this.st.buttonRGBA, BLACK);
+        glyphs(c.extra.runs, ox, oy);
+        glyphs(c.extra.buttons.map((bt) => bt.label), ox, oy);
+      }
+    }
+    this.perf.buildMs = performance.now() - _t1;
+    const _t2 = performance.now();
+    this.dev.queue.writeBuffer(this.vpBuf, 0, new Float32Array([vp.w, vp.h, vp.dpr, 0]));
+    const shapeArr = new Float32Array(shape), textArr = new Float32Array(text);
+    this.shapeBuf = this.ensure(this.shapeBuf, shapeArr.byteLength, "shape");
+    if (shapeArr.length) this.dev.queue.writeBuffer(this.shapeBuf, 0, shapeArr);
+    this.textBuf = this.ensure(this.textBuf, textArr.byteLength, "text");
+    if (textArr.length) this.dev.queue.writeBuffer(this.textBuf, 0, textArr);
+    const enc = this.dev.createCommandEncoder();
+    const pass = enc.beginRenderPass({ colorAttachments: [{ view, loadOp: "load", storeOp: "store" }] });
+    if (shapeArr.length) {
+      pass.setPipeline(this.shapePipe);
+      pass.setBindGroup(0, this.shapeBind);
+      pass.setVertexBuffer(0, this.shapeBuf);
+      pass.draw(shapeArr.length / 18);
+    }
+    if (textArr.length) {
+      pass.setPipeline(this.textPipe);
+      pass.setBindGroup(0, this.textBind);
+      pass.setVertexBuffer(0, this.textBuf);
+      pass.draw(textArr.length / 8);
+    }
+    pass.end();
+    this.dev.queue.submit([enc.finish()]);
+    this.perf.submitMs = performance.now() - _t2;
+  }
+  ensure(buf, bytes, tag) {
+    const need = Math.max(64, bytes);
+    if (buf && (tag === "shape" ? this.shapeCap : this.textCap) >= need) return buf;
+    buf?.destroy();
+    const nb = this.dev.createBuffer({ size: need, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+    if (tag === "shape") this.shapeCap = need;
+    else this.textCap = need;
+    return nb;
+  }
+  /** Current card size (device px) for the given index. */
+  cardSize(index) {
+    const c = this.cards[index];
+    return c ? this.size(c) : null;
+  }
+  /** Bake ONE card's INK (border + swatch + buttons + text; NO glass fill) into an RGBA texture in
+   *  card-local coordinates, for use as a CardField's front-face content. Glass transparent (a=0). */
+  bakeCard(index, ss = 2) {
+    const c = this.cards[index];
+    if (!c) return null;
+    const sz = this.size(c), w = Math.max(2, Math.ceil(sz.w * ss)), h = Math.max(2, Math.ceil(sz.h * ss));
+    const dpr = this.dpr;
+    const tex = this.dev.createTexture({ size: [w, h], format: "rgba8unorm", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+    const shape = [], text = [];
+    const rect = (cx, cy, hw, hh, radius, border, fill, brd) => {
+      const x0 = cx - hw, x1 = cx + hw, y0 = cy - hh, y1 = cy + hh;
+      for (const [px, py] of [[x0, y0], [x1, y0], [x1, y1], [x0, y0], [x1, y1], [x0, y1]]) shape.push(px, py, cx, cy, hw, hh, radius, border, 0, 0, ...fill, ...brd);
+    };
+    const glyphs = (runs, ox, oy) => {
+      for (const run of runs) for (const q of run.quads) {
+        const x0 = ox + q.x * ss, x1 = ox + (q.x + q.w) * ss, y0 = oy + q.y * ss, y1 = oy + (q.y + q.h) * ss, co = run.color;
+        for (const [px, py, uu, vv] of [[x0, y0, q.u0, q.v0], [x1, y0, q.u1, q.v0], [x1, y1, q.u1, q.v1], [x0, y0, q.u0, q.v0], [x1, y1, q.u1, q.v1], [x0, y1, q.u0, q.v1]]) text.push(px, py, uu, vv, ...co);
+      }
+    };
+    const transparent = [0, 0, 0, 0];
+    rect(sz.w / 2 * ss, sz.h / 2 * ss, sz.w / 2 * ss, sz.h / 2 * ss, this.st.radiusPx * dpr * ss, this.st.borderPx * dpr * ss, transparent, this.st.borderRGBA);
+    if (c.head.swatch) {
+      const w2 = c.head.swatch;
+      rect((w2.x + w2.w / 2) * ss, (w2.y + w2.h / 2) * ss, w2.w / 2 * ss, w2.h / 2 * ss, 2 * dpr * ss, 1.5 * dpr * ss, w2.color, BLACK);
+    }
+    glyphs(c.head.runs, 0, 0);
+    if (c.expanded) {
+      for (const bt of c.extra.buttons) rect((bt.x + bt.w / 2) * ss, (bt.y + bt.h / 2) * ss, bt.w / 2 * ss, bt.h / 2 * ss, 4 * dpr * ss, 1 * dpr * ss, this.st.buttonRGBA, BLACK);
+      glyphs(c.extra.runs, 0, 0);
+      glyphs(c.extra.buttons.map((bt) => bt.label), 0, 0);
+    }
+    this.dev.queue.writeBuffer(this.vpBuf, 0, new Float32Array([w, h, dpr, 0]));
+    const sArr = new Float32Array(shape), tArr = new Float32Array(text);
+    const sBuf = this.dev.createBuffer({ size: Math.max(64, sArr.byteLength), usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+    const tBuf = this.dev.createBuffer({ size: Math.max(64, tArr.byteLength), usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+    if (sArr.length) this.dev.queue.writeBuffer(sBuf, 0, sArr);
+    if (tArr.length) this.dev.queue.writeBuffer(tBuf, 0, tArr);
+    const enc = this.dev.createCommandEncoder();
+    const pass = enc.beginRenderPass({ colorAttachments: [{ view: tex.createView(), loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
+    if (sArr.length) {
+      pass.setPipeline(this.shapePipe);
+      pass.setBindGroup(0, this.shapeBind);
+      pass.setVertexBuffer(0, sBuf);
+      pass.draw(sArr.length / 18);
+    }
+    if (tArr.length) {
+      pass.setPipeline(this.textPipe);
+      pass.setBindGroup(0, this.textBind);
+      pass.setVertexBuffer(0, tBuf);
+      pass.draw(tArr.length / 8);
+    }
+    pass.end();
+    this.dev.queue.submit([enc.finish()]);
+    sBuf.destroy();
+    tBuf.destroy();
+    return { tex, w, h };
+  }
+  dispose() {
+    this.atlasTex.destroy();
+    this.vpBuf.destroy();
+    this.shapeBuf?.destroy();
+    this.textBuf?.destroy();
+  }
+};
+function offset(quads, dx, dy) {
+  return quads.map((q) => ({ ...q, x: q.x + dx, y: q.y + dy }));
+}
+function boxEdgeToward(cx, cy, hw, hh, tx, ty) {
+  const dx = tx - cx, dy = ty - cy;
+  if (dx === 0 && dy === 0) return { x: cx, y: cy + hh };
+  const sx = dx !== 0 ? hw / Math.abs(dx) : Infinity, sy = dy !== 0 ? hh / Math.abs(dy) : Infinity;
+  const t = Math.min(sx, sy);
+  return { x: cx + dx * t, y: cy + dy * t };
+}
+
+// render/segment-cards.ts
+function bodyText(term, name) {
+  if (!term || !term.type && !term.region) return void 0;
+  const norm2 = (t) => (t ?? "").trim().toLowerCase();
+  const parts = [];
+  if (term.type?.meaning && norm2(term.type.meaning) !== norm2(name)) parts.push(term.type.meaning);
+  if (term.region?.meaning && norm2(term.region.meaning) !== norm2(name) && norm2(term.region.meaning) !== norm2(term.type?.meaning)) parts.push(term.region.meaning);
+  if (!parts.length && term.type) parts.push(`${term.type.scheme} ${term.type.value}`.trim());
+  return parts.length ? parts.join(" \xB7 ") : void 0;
+}
+function build(ct, seg, segments, maxCards) {
+  const [nx, ny, nz] = ct.dims, M = ct.ijkToRAS;
+  const isCT = (ct.modality ?? "CT") === "CT";
+  const wanted = new Set([...segments].sort((a, b) => b.voxels - a.voxels).slice(0, maxCards).map((s) => s.num));
+  const acc = /* @__PURE__ */ new Map();
+  for (let k = 0; k < nz; k++) for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+    const idx = (k * ny + j) * nx + i, v = seg.lab[idx];
+    if (!v || !wanted.has(v)) continue;
+    let e = acc.get(v);
+    if (!e) {
+      e = { n: 0, x: 0, y: 0, z: 0, s: 0, s2: 0, lo: [i, j, k], hi: [i, j, k] };
+      acc.set(v, e);
+    }
+    e.n++;
+    e.x += i;
+    e.y += j;
+    e.z += k;
+    if (i < e.lo[0]) e.lo[0] = i;
+    if (j < e.lo[1]) e.lo[1] = j;
+    if (k < e.lo[2]) e.lo[2] = k;
+    if (i > e.hi[0]) e.hi[0] = i;
+    if (j > e.hi[1]) e.hi[1] = j;
+    if (k > e.hi[2]) e.hi[2] = k;
+    if (isCT) {
+      const hu = ct.vol[idx];
+      e.s += hu;
+      e.s2 += hu * hu;
+    }
+  }
+  const voxMm3 = Math.abs(M[0] * (M[5] * M[10] - M[6] * M[9]) - M[1] * (M[4] * M[10] - M[6] * M[8]) + M[2] * (M[4] * M[9] - M[5] * M[8]));
+  const ras = (i, j, k) => [M[0] * i + M[1] * j + M[2] * k + M[3], M[4] * i + M[5] * j + M[6] * k + M[7], M[8] * i + M[9] * j + M[10] * k + M[11]];
+  const term = seg.terminology ?? {};
+  const specs = [], geom = [];
+  for (const s of segments) {
+    const e = acc.get(s.num);
+    if (!e) continue;
+    const c = ras(e.x / e.n, e.y / e.n, e.z / e.n);
+    const hu = isCT ? { mean: e.s / e.n, std: Math.sqrt(Math.max(0, e.s2 / e.n - (e.s / e.n) ** 2)) } : void 0;
+    specs.push({ anchorRAS: c, id: s.num, title: s.name, subtitle: bodyText(term[s.num], s.name), swatch: s.color, stat: { voxels: e.n, volumeCc: e.n * voxMm3 / 1e3, hu } });
+    const [lx, ly, lz] = e.lo, [hx, hy, hz] = e.hi;
+    geom.push({ corners: [[lx, ly, lz], [hx, ly, lz], [lx, hy, lz], [hx, hy, lz], [lx, ly, hz], [hx, ly, hz], [lx, hy, hz], [hx, hy, hz]].map(([i, j, k]) => ras(i, j, k)) });
+  }
+  return { specs, geom };
+}
+function mountSegmentCards(gpu, format, font, canvas, camera, hooks) {
+  const overlay = new CardOverlay(gpu, format, font, hooks.style);
+  const dpr = globalThis.devicePixelRatio || 1;
+  let geom = [];
+  let segs = [];
+  let sceneBox = [];
+  const px = (e) => {
+    const r = canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left) * dpr, y: (e.clientY - r.top) * dpr };
+  };
+  let down = null;
+  canvas.addEventListener("pointerdown", (e) => {
+    const p = px(e);
+    if (overlay.hitTest(p.x, p.y)) {
+      down = { x: e.clientX, y: e.clientY, hit: true };
+      e.stopPropagation();
+      canvas.setPointerCapture(e.pointerId);
+    } else down = { x: e.clientX, y: e.clientY, hit: false };
+  }, true);
+  canvas.addEventListener("pointerup", (e) => {
+    if (down?.hit && Math.hypot(e.clientX - down.x, e.clientY - down.y) < 5) {
+      const p = px(e), h = overlay.hitTest(p.x, p.y);
+      if (h) {
+        if (h.action === "toggle") overlay.toggle(h.index);
+        else {
+          const spec = overlay.spec(h.index);
+          if (spec?.id != null) hooks.apply(spec.id, h.action, segs);
+        }
+        hooks.redraw();
+      }
+    }
+    down = null;
+  }, true);
+  return {
+    setScene(ct, seg, segments) {
+      segs = segments;
+      if (!ct || !seg) {
+        geom = [];
+        sceneBox = [];
+        overlay.setCards([], dpr);
+        return;
+      }
+      const compact = segments.length > (hooks.compactThreshold ?? 10);
+      const cap = compact ? hooks.maxCardsCompact ?? 15 : hooks.maxCards ?? 12;
+      const r = build(ct, seg, segments, cap);
+      geom = r.geom;
+      overlay.setCards(r.specs, dpr, compact);
+      const [nx, ny, nz] = ct.dims, M = ct.ijkToRAS;
+      const ras = (i, j, k) => [M[0] * i + M[1] * j + M[2] * k + M[3], M[4] * i + M[5] * j + M[6] * k + M[7], M[8] * i + M[9] * j + M[10] * k + M[11]];
+      sceneBox = [[0, 0, 0], [nx, 0, 0], [0, ny, 0], [nx, ny, 0], [0, 0, nz], [nx, 0, nz], [0, ny, nz], [nx, ny, nz]].map(([i, j, k]) => ras(i, j, k));
+    },
+    draw(view, w, h, _dpr, dt) {
+      if (!geom.length) return false;
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const c of sceneBox) {
+        const p = camera.worldToDisplay(c, w, h);
+        if (p.depth <= 0) continue;
+        minX = Math.min(minX, p.x);
+        maxX = Math.max(maxX, p.x);
+        minY = Math.min(minY, p.y);
+        maxY = Math.max(maxY, p.y);
+      }
+      const reserved = hooks.reserved?.();
+      const sv = hooks.segVisible;
+      const shown = sv ? geom.map((_, i) => {
+        const id = overlay.spec(i)?.id;
+        return id == null ? true : sv(id);
+      }) : void 0;
+      const extra = Number.isFinite(minX) ? { boundary: { minX: Math.max(minX, 0), minY: Math.max(minY, 0), maxX: Math.min(maxX, w), maxY: Math.min(maxY, h) }, reserved, shown, ringGap: 22 * dpr } : { reserved, shown };
+      overlay.render(view, camera, { w, h, dpr }, dt, void 0, extra);
+      return !overlay.settled();
+    },
+    clear() {
+      geom = [];
+      sceneBox = [];
+      overlay.setCards([], dpr);
+    },
+    count() {
+      return geom.length;
+    },
+    bodyCss(i) {
+      const b = overlay.body(i);
+      return b ? { x: b.x / dpr, y: b.y / dpr } : null;
+    }
+  };
+}
+
 // render/demos/sl-logo.ts
 var SL_LOGO = "data:image/png;base64,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";
 
@@ -4552,6 +6591,18 @@ var DEFAULT_HELP = [
     ["Wheel / two-finger", "Zoom (dolly)"],
     ["Double-click", "Maximize / restore"],
     ["Shift + move", "Pick \u2192 jump slices to the point"]
+  ] },
+  { title: "Endovascular flight (fly-inside / endo demo)", rows: [
+    ["Up / Down", "Move in / out along the view axis"],
+    ["Left / Right", "Yaw"],
+    ["Shift + Left/Right", "Pitch"],
+    ["Ctrl + Left/Right", "Roll"],
+    ["Space", "Toggle forward cruise"],
+    ["Shift + Space", "Toggle reverse cruise"],
+    ["Escape", "Stop"],
+    ["Left-drag", "Look around"],
+    ["Shift + click", "Autopilot target"],
+    ["Speed slider", "Travel speed in mm/s (live, applies mid-flight)"]
   ] },
   { title: "Slice views", rows: [
     ["Wheel / Left-drag", "Scroll through slices"],
@@ -4567,14 +6618,18 @@ function glass(el2, extra = "") {
 }
 function installChrome(opts) {
   const controls = opts.controls ?? [];
-  const help = opts.help ?? DEFAULT_HELP;
-  const helpBtn = document.createElement("button");
-  helpBtn.textContent = "?";
-  helpBtn.title = "Controls & key bindings";
-  helpBtn.style.cssText = "position:fixed;top:12px;left:12px;z-index:74;width:32px;height:32px;padding:0;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;border-radius:50%;color:#cfe6ff;font:700 15px -apple-system,system-ui,sans-serif;";
-  glass(helpBtn);
-  helpBtn.onclick = openHelp;
-  document.body.appendChild(helpBtn);
+  const host = opts.container ?? document.body;
+  const help = (opts.help === false ? [] : opts.help) ?? DEFAULT_HELP;
+  let helpBtn = null;
+  if (opts.help !== false) {
+    helpBtn = document.createElement("button");
+    helpBtn.textContent = "?";
+    helpBtn.title = "Controls & key bindings";
+    helpBtn.style.cssText = "position:fixed;top:12px;left:12px;z-index:74;width:32px;height:32px;padding:0;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;border-radius:50%;color:#cfe6ff;font:700 15px -apple-system,system-ui,sans-serif;";
+    glass(helpBtn);
+    helpBtn.onclick = openHelp;
+    host.appendChild(helpBtn);
+  }
   let helpEl = null;
   function openHelp() {
     if (helpEl) return;
@@ -4593,7 +6648,7 @@ function installChrome(opts) {
     }
     panel.innerHTML += `<div style="margin-top:16px;font-size:12px;color:rgba(232,238,255,.55)">Press <b style="color:#fff5d6">esc</b> or click outside to dismiss.</div>`;
     helpEl.appendChild(panel);
-    document.body.appendChild(helpEl);
+    host.appendChild(helpEl);
     document.addEventListener("keydown", escClose, true);
   }
   function escClose(e) {
@@ -4607,6 +6662,7 @@ function installChrome(opts) {
     }
   }
   const logo = document.createElement("div");
+  logo.id = "sl-badge";
   logo.title = "SlicerLive \u2014 visualization";
   logo.style.cssText = "position:fixed;z-index:74;cursor:pointer;user-select:none;display:flex;flex-direction:column;align-items:center;gap:4px;padding:7px 12px 6px;border-radius:14px;background:#121826;border:1px solid rgba(255,255,255,.12);box-shadow:0 10px 30px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.06);transition:transform 120ms ease-out;";
   const mark = document.createElement("img");
@@ -4618,13 +6674,13 @@ function installChrome(opts) {
   word.style.cssText = "font:800 12px/1 -apple-system,system-ui,sans-serif;letter-spacing:.5px;color:#eef7ff;text-shadow:0 0 14px rgba(255,210,90,.4);";
   logo.appendChild(mark);
   logo.appendChild(word);
-  document.body.appendChild(logo);
+  host.appendChild(logo);
   const place = () => {
     const a = opts.anchor;
     const r = a && a.getClientRects().length ? a.getBoundingClientRect() : null;
     if (r && r.width > 2 && r.height > 2) {
       logo.style.top = Math.round(r.top + 8) + "px";
-      logo.style.right = Math.round(window.innerWidth - r.right + 8) + "px";
+      logo.style.right = Math.round(globalThis.innerWidth - r.right + 8) + "px";
     } else {
       logo.style.top = "10px";
       logo.style.right = "12px";
@@ -4633,11 +6689,13 @@ function installChrome(opts) {
   place();
   requestAnimationFrame(place);
   globalThis.addEventListener("resize", place);
-  if (opts.anchor && "ResizeObserver" in globalThis) new ResizeObserver(place).observe(opts.anchor);
+  const anchorRO = opts.anchor && "ResizeObserver" in globalThis ? new ResizeObserver(place) : null;
+  anchorRO?.observe(opts.anchor);
   const pop = document.createElement("div");
+  pop.id = "sl-popup";
   pop.style.cssText = "position:fixed;z-index:73;min-width:210px;max-width:300px;max-height:84vh;overflow-y:auto;padding:10px 12px;border-radius:12px;color:#eaf0ff;font:13px -apple-system,system-ui,sans-serif;opacity:0;pointer-events:none;transform:translateY(-6px);transition:opacity 120ms ease-out,transform 120ms ease-out;";
   glass(pop);
-  document.body.appendChild(pop);
+  host.appendChild(pop);
   const paintSw = (sw, on) => {
     sw.style.background = on ? "linear-gradient(180deg,#9fe9ff,#54c6f0)" : "rgba(255,255,255,.18)";
     sw.innerHTML = `<span style="position:absolute;top:2px;left:${on ? 17 : 2}px;width:15px;height:15px;border-radius:50%;background:#fff;transition:left 120ms;box-shadow:0 1px 3px rgba(0,0,0,.4)"></span>`;
@@ -4696,18 +6754,115 @@ function installChrome(opts) {
     return paint;
   };
   const OPBOX_CSS = "width:44px;height:18px;border-radius:6px;position:relative;overflow:hidden;flex:0 0 auto;background:rgba(255,255,255,.14);box-shadow:inset 0 0 0 1px rgba(255,255,255,.18);touch-action:none;";
+  const heading = (text, first) => {
+    const h = document.createElement("div");
+    h.textContent = text;
+    h.style.cssText = "font:700 10px -apple-system,system-ui,sans-serif;letter-spacing:1.1px;text-transform:uppercase;color:#9fe9ff;margin:" + (first ? "0 0 8px" : "12px 0 6px") + ";" + (first ? "" : "border-top:1px solid rgba(255,255,255,.12);padding-top:10px;");
+    pop.appendChild(h);
+  };
+  const selects = opts.selects ?? [];
+  const selEls = [];
+  let sectionSeen = null;
+  let firstHead = true;
+  for (const c of selects) {
+    const sec = c.section ?? "Visualization";
+    if (sec !== sectionSeen) {
+      heading(sec, firstHead);
+      sectionSeen = sec;
+      firstHead = false;
+    }
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:12px;padding:5px 0;";
+    const lab = document.createElement("span");
+    lab.textContent = c.label;
+    const sel = document.createElement("select");
+    sel.style.cssText = "flex:1 1 auto;max-width:60%;border-radius:7px;padding:4px 6px;cursor:pointer;font:500 12px -apple-system,system-ui,sans-serif;color:#e8eeff;background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.20);";
+    for (const o of c.options) {
+      const op = document.createElement("option");
+      op.value = o.value;
+      op.textContent = o.label;
+      op.style.cssText = "background:#1b2030;color:#e8eeff;";
+      sel.appendChild(op);
+    }
+    sel.value = c.get();
+    sel.onclick = (e) => e.stopPropagation();
+    sel.onchange = () => {
+      c.set(sel.value);
+      opts.onChange?.();
+      refresh();
+    };
+    row.appendChild(lab);
+    row.appendChild(sel);
+    pop.appendChild(row);
+    selEls.push({ c, el: sel });
+  }
   const rows = [];
   if (controls.length) {
-    const head = document.createElement("div");
-    head.textContent = "Visualization";
-    head.style.cssText = "font:700 10px -apple-system,system-ui,sans-serif;letter-spacing:1.1px;text-transform:uppercase;color:#9fe9ff;margin:0 0 8px;";
-    pop.appendChild(head);
     for (const c of controls) {
+      const sec = c.section ?? "Visualization";
+      if (sec !== sectionSeen) {
+        heading(sec, firstHead);
+        sectionSeen = sec;
+        firstHead = false;
+      }
       const row = document.createElement("div");
       row.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:14px;padding:5px 0;";
+      if (c.slider) {
+        row.style.cssText = "display:flex;flex-direction:column;gap:4px;padding:6px 0;";
+        const top = document.createElement("div");
+        top.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:12px;";
+        const lab2 = document.createElement("span");
+        lab2.textContent = c.label;
+        const val = document.createElement("span");
+        val.style.cssText = "font:600 11px ui-monospace,Menlo,monospace;color:#9fe9ff;font-variant-numeric:tabular-nums;";
+        top.appendChild(lab2);
+        top.appendChild(val);
+        const inp = document.createElement("input");
+        inp.type = "range";
+        inp.min = String(c.slider.min);
+        inp.max = String(c.slider.max);
+        inp.step = String(c.slider.step ?? 1);
+        inp.value = String(c.slider.get());
+        inp.style.cssText = "width:100%;accent-color:#54c6f0;cursor:pointer;";
+        const fmt = c.slider.format ?? ((v) => String(Math.round(v)));
+        const paint = () => {
+          val.textContent = fmt(c.slider.get());
+        };
+        inp.oninput = () => {
+          c.slider.set(parseFloat(inp.value));
+          paint();
+          opts.onChange?.();
+        };
+        inp.onpointerdown = (e) => e.stopPropagation();
+        paint();
+        row.appendChild(top);
+        row.appendChild(inp);
+        pop.appendChild(row);
+        rows.push({ c, row, repaint: () => {
+          inp.value = String(c.slider.get());
+          paint();
+        } });
+        continue;
+      }
       const lab = document.createElement("span");
       lab.textContent = c.label;
       row.appendChild(lab);
+      if (c.button) {
+        const pill = document.createElement("span");
+        pill.style.cssText = "max-width:60%;border-radius:7px;padding:4px 10px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font:600 12px -apple-system,system-ui,sans-serif;color:#eaf0ff;background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.20);";
+        pill.textContent = c.button.text();
+        pill.onclick = (e) => {
+          e.stopPropagation();
+          c.button.run();
+        };
+        pill.onpointerdown = (e) => e.stopPropagation();
+        row.appendChild(pill);
+        pop.appendChild(row);
+        rows.push({ c, row, repaint: () => {
+          pill.textContent = c.button.text();
+        } });
+        continue;
+      }
       if (c.getOpacity && c.setOpacity) {
         const box = document.createElement("span");
         box.style.cssText = OPBOX_CSS;
@@ -4733,7 +6888,7 @@ function installChrome(opts) {
       }
       pop.appendChild(row);
     }
-  } else if (opts.about === false && !opts.segments) {
+  } else if (opts.about === false && !opts.segments && !selects.length) {
     pop.textContent = "SlicerLive \u2014 WebGPU renderer";
   }
   const segHost = document.createElement("div");
@@ -4799,6 +6954,10 @@ function installChrome(opts) {
     pop.appendChild(about);
   }
   function refresh() {
+    for (const { c, el: el2 } of selEls) {
+      const v = c.get();
+      if (el2.value !== v) el2.value = v;
+    }
     for (const { c, row, sw, repaint } of rows) {
       const dis = c.disabled?.() ?? false;
       row.style.opacity = dis ? "0.4" : "1";
@@ -4819,7 +6978,7 @@ function installChrome(opts) {
     refresh();
     const b = logo.getBoundingClientRect();
     pop.style.top = Math.round(b.bottom + 6) + "px";
-    pop.style.right = Math.round(window.innerWidth - b.right) + "px";
+    pop.style.right = Math.round(globalThis.innerWidth - b.right) + "px";
     pop.style.opacity = "1";
     pop.style.pointerEvents = "auto";
     pop.style.transform = "translateY(0)";
@@ -4847,7 +7006,16 @@ function installChrome(opts) {
   pop.onmouseleave = () => {
     if (!pinned) hide();
   };
-  return { refresh };
+  const destroy = () => {
+    globalThis.removeEventListener("resize", place);
+    anchorRO?.disconnect();
+    document.removeEventListener("keydown", escClose, true);
+    helpBtn?.remove();
+    helpEl?.remove();
+    logo.remove();
+    pop.remove();
+  };
+  return { refresh, destroy };
 }
 
 // render/demos/idc-info.ts
@@ -5076,7 +7244,7 @@ function runWorker(ctKeys, segKeys, ctBucket, segBucket, modality, handlers, opt
           break;
         }
         case "labelmap": {
-          seg = { lab: new Uint8Array(m.lab), colors: m.colors, names: m.names };
+          seg = { lab: new Uint8Array(m.lab), colors: m.colors, names: m.names, terminology: m.terminology };
           chain = chain.then(() => handlers.onLabelmap?.(seg)).catch((err) => console.error("[idc_tools] onLabelmap", err));
           break;
         }
@@ -5165,15 +7333,59 @@ async function main() {
     rs.slice.renderToView(cx[p.cell].getCurrentTexture().createView({ format: srgb }), cv[p.cell].width, cv[p.cell].height);
   };
   let xhair = null;
+  const dpr3 = Math.min(2, globalThis.devicePixelRatio || 1);
+  const cardFont = buildFontAtlas({ sizePx: 44, spread: 6, fontFamily: 'Helvetica, "Helvetica Neue", Arial, sans-serif' });
+  let cardDt = performance.now();
+  let labelsOn = true;
   const a3d = mountAdaptive3d({
     scene: () => rs?.scene ?? null,
     view: () => cx.threeD.getCurrentTexture().createView({ format: srgb }),
     size: () => ({ w: cv.threeD.width, h: cv.threeD.height }),
     setCamera: (sc, w, h) => sc.setCamera(camera.position, camera.focalPoint, camera.viewUp, camera.viewAngle, w, h),
     gpu,
-    onFrame: () => xhair?.redraw()
+    onFrame: () => {
+      xhair?.redraw();
+      const now = performance.now(), dt = (now - cardDt) / 1e3;
+      cardDt = now;
+      if (!labelsOn) return;
+      const moving = segCards.draw(cx.threeD.getCurrentTexture().createView({ format: srgb }), cv.threeD.width, cv.threeD.height, dpr3, dt);
+      if (moving) a3d.draw();
+    }
   });
   const draw3d = () => a3d.draw();
+  const segCards = mountSegmentCards(gpu, srgb, cardFont, cv.threeD, camera, {
+    apply: (id, action) => {
+      if (!rs) return;
+      if (action === "reset") rs.setSegmentOpacities(rs.segments.map((s) => [s.num, 1]));
+      else if (action === "hide") rs.setSegmentOpacity(id, 0);
+      else rs.setSegmentOpacities(rs.segments.map((s) => [s.num, s.num === id ? 1 : 0.4]));
+      redrawSlices();
+      draw3d();
+    },
+    redraw: () => draw3d(),
+    maxCards: 12,
+    // Keep cards clear of the on-screen chrome over the 3D cell: the SlicerLive logo badge (top-right)
+    // and the "3D · …" cell label (top-left). Rects are canvas-relative DEVICE px, clipped to the cell.
+    reserved: () => {
+      const cr = cv.threeD.getBoundingClientRect();
+      if (!cr.width || !cr.height) return [];
+      const sx = cv.threeD.width / cr.width, sy = cv.threeD.height / cr.height, pad = 6;
+      const out = [];
+      for (const sel of ["#sl-badge", "#lab-threeD"]) {
+        const el2 = document.querySelector(sel);
+        if (!el2) continue;
+        const r = el2.getBoundingClientRect();
+        const x0 = Math.max(r.left, cr.left), y0 = Math.max(r.top, cr.top), x1 = Math.min(r.right, cr.right), y1 = Math.min(r.bottom, cr.bottom);
+        if (x1 <= x0 || y1 <= y0) continue;
+        out.push({ x: (x0 - cr.left) * sx - pad, y: (y0 - cr.top) * sy - pad, w: (x1 - x0) * sx + 2 * pad, h: (y1 - y0) * sy + 2 * pad });
+      }
+      return out;
+    },
+    segVisible: (num) => rs?.isSegmentVisible(num) ?? true
+    // hide a segment's card when it's hidden
+  });
+  globalThis.__segCards = segCards;
+  globalThis.__rs = () => rs;
   const drawAll = () => {
     for (const p of planes) drawSlice(p);
     draw3d();
@@ -5224,6 +7436,10 @@ async function main() {
       draw3d();
       xhair?.redraw();
     }, disabled: () => !rs?.hasSeg, color: [0.62, 0.9, 1] },
+    { label: "Segment labels", get: () => labelsOn, set: (on) => {
+      labelsOn = on;
+      draw3d();
+    }, disabled: () => !rs?.hasSeg },
     { label: "Slice outline", get: () => sliceOutline, set: (on) => {
       sliceOutline = on;
       rs?.slice.setOverlayOutline(on);
@@ -5293,6 +7509,7 @@ async function main() {
   async function spin() {
     spinBtn.disabled = true;
     mosaic.reset();
+    segCards.clear();
     status(SEG_PARAM ? "loading the requested SEG series\u2026" : COL_PARAM ? `spinning within ${COL_PARAM}\u2026` : "spinning\u2026 picking a random IDC series");
     try {
       const res = await pickAndLoad();
@@ -5314,6 +7531,7 @@ async function main() {
       showMeta(res.entry, rs);
       const d3 = document.querySelector(".lab.d3");
       if (d3) d3.textContent = rs.mode === "sdf" ? "3D \xB7 SDF surface" : "3D \xB7 volume";
+      segCards.setScene(res.ct, res.seg ?? null, rs.segments);
       resize();
       mosaic.done();
       status(`${res.entry?.col ?? "IDC"} \xB7 ${res.entry?.m ?? ""} \xB7 ${rs.segments.length} segment${rs.segments.length === 1 ? "" : "s"} \xB7 scroll a slice, drag 3D to orbit \xB7 Spin for another`);
