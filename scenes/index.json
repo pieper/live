@@ -161,5 +161,12 @@
     "thumb": "remote.png",
     "desc": "Volume rendering that runs on a transient cloud GPU (an NVIDIA L4 on Modal) and streams to this page, while all interaction \u2014 orbit, pinch-zoom, and a transform gizmo \u2014 stays local for instant response. Pick a specimen from the menu: the built-in cardiac CTA + abdomen selftest, or large single-file MorphoDepot / SlicerMorph micro-CT scans (bumblebee diceCT at 1159\u00d71663\u00d71482, salamander and frog limbs, a fossil marsupial, a cow eye, a flying-squirrel skull, Daphnia) shaded with @muratmaga's published SlicerMorph transfer functions. Each menu entry shows its GPU-memory footprint and is disabled if it won't fit, so you know before anything downloads. The GPU sleeps when idle and wakes on demand (~11 s cold start); a meter shows cost so far and the current rate, with a spend cap. Frames are AV1-encoded on the GPU (NVENC, with a gzip fallback for older browsers) and only changed pixels are re-sent, so 4K stays responsive. Works on a phone: two-finger pan/zoom, three fingers to move the picked volume.",
     "wip": true
+  },
+  {
+    "name": "fiber tracts \u2014 capsule tubes + lava lamp",
+    "page": "webgpu/fibers.html",
+    "thumb": "fibers.png",
+    "wip": true,
+    "desc": "About 1,500 synthetic streamlines shaped like SlicerDMRI fiber bundles \u2014 a helix, a U-arc, a fan and a diagonal, 96,500 capsule segments in all \u2014 drawn as piecewise-linear tubes inside the SAME ray-march as an animated volume of three breathing glow blobs and four markup fiducials, so tubes, volume and glyphs interleave in correct depth order in one pass. A port of the SlicerWGPU \u201clava lamp\u201d field-compositing test (SceneRendering test_vtk_FieldCompositing). Where SlicerWGPU rasterizes the strands into a per-pixel A-buffer of 64 fragments, this keeps the capsules in a GPU uniform grid and intersects them exactly once per ray interval: memory scales with the fibers rather than the viewport, tubes far thinner than the ray step are never stepped over, and the same tubes appear in every render path \u2014 budget-scaled interaction frames, temporal accumulation, picking and remote streaming \u2014 with no extra pass. Drag the yellow attractor and the blobs chase it; the SlicerLive badge sets each bundle\u2019s opacity. Next step: real tractography from SlicerDMRI."
   }
 ]
