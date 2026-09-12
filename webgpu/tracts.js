@@ -3243,7 +3243,7 @@ async function main() {
     a3d.draw();
   };
   let offTex;
-  const settleOffscreen = async (samples = 24) => {
+  const offscreenView = () => {
     const w = canvas.width, h = canvas.height;
     if (!offTex || offTex.width !== w || offTex.height !== h) {
       offTex?.destroy();
@@ -3253,7 +3253,11 @@ async function main() {
         usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
       });
     }
-    const off = offTex.createView();
+    return offTex.createView();
+  };
+  const settleOffscreen = async (samples = 24) => {
+    const w = canvas.width, h = canvas.height;
+    const off = offscreenView();
     const aim = () => scene.setCamera(camera.position, camera.focalPoint, camera.viewUp, camera.viewAngle, w, h);
     aim();
     scene.renderAccum(off, w, h, true);
@@ -3267,6 +3271,7 @@ async function main() {
     await gpu.device.queue.onSubmittedWorkDone();
   };
   let tuned = null;
+  let booting = true;
   const showStatus = () => status(
     `${sc.manifest.bundles.length} bundles \xB7 ${sc.strandCount.toLocaleString()} streamlines (${Math.round(sc.fraction * 100)}%${tuned ? ` auto, ${tuned.ms.toFixed(0)} ms probe, fits ${tuned.capPct}%` : ""}) \xB7 ${sc.capsuleCount.toLocaleString()} capsules \xB7 ${(sc.bytesFetched / 1e6).toFixed(1)} MB \xB7 ${canvas.width}\xD7${canvas.height} \xB7 drag to rotate`
   );
@@ -3312,7 +3317,7 @@ async function main() {
     canvas.height = h;
     if (!userMoved) frameCamera(w, h);
     showStatus();
-    bake();
+    if (!booting) bake();
   };
   globalThis.addEventListener("resize", resize);
   new ResizeObserver(resize).observe(canvas);
@@ -3466,6 +3471,8 @@ async function main() {
     }
   };
   resize();
+  a3d.renderSettled(true);
+  await settleOffscreen();
   showStatus();
   const PROBE_W = 640, PROBE_H = 360;
   const PROBE_PX = PROBE_W * PROBE_H;
@@ -3473,7 +3480,7 @@ async function main() {
   const measureFrame = async () => {
     const vw = canvas.width, vh = canvas.height;
     scene.setCamera(camera.position, camera.focalPoint, camera.viewUp, camera.viewAngle, PROBE_W, PROBE_H);
-    const view = () => ctx.getCurrentTexture().createView({ format: srgb });
+    const view = offscreenView;
     scene.renderUpscaled(view(), PROBE_W, PROBE_H, vw, vh);
     await gpu.device.queue.onSubmittedWorkDone();
     const t = performance.now();
@@ -3491,7 +3498,6 @@ async function main() {
     try {
       const cap = fractionCapForLimits(sc.manifest, gpu.adapter.limits);
       const budget = probeBudgetMs();
-      await settleOffscreen();
       let ms = await measureFrame();
       for (let step = 0; step < 20 && ms < budget && sc.fraction + 0.05 <= cap + 1e-6; step++) {
         const next = Math.min(cap, sc.fraction + 0.05);
@@ -3512,12 +3518,13 @@ async function main() {
       target = Math.round(sc.fraction * 100);
       tuned = { capPct: Math.round(cap * 100), ms };
       chromeUi.refresh();
-      bake();
+      await settleOffscreen();
       showStatus();
     } catch (e) {
       status(`could not tune density \u2014 ${e.message}`, true);
     }
   }
   await tuneDensity();
+  booting = false;
 }
 main().catch((e) => status("error: " + (e?.message ?? e), true));
