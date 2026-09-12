@@ -1883,12 +1883,12 @@ var TractScene = class _TractScene {
    *  and these have to survive that. AO sits at 0.4 rather than the 0.7 it wants alone, because the
    *  halos below carry the local separation and stacking both at full strength goes muddy; AO's job
    *  here is the regional sense of depth into the mass. (Past ~0.025 density it erases thin strands.) */
-  aoSettings = { strength: 0.4, radiusMm: 2, densityScale: 0.012 };
+  aoSettings = { strength: 0.7, radiusMm: 2, densityScale: 0.012 };
   /** Same story: the field is rebuilt on every density change, so halo settings live here too. Halos
    *  are the strongest depth cue here — close up, strands separate instead of matting together — but
    *  they work by darkening, so a light touch is enough once the shading is bright and the groups are
    *  colour-coded. Dial it up on the slider to separate a dense region. */
-  haloSettings = { strength: 0.1, widthMm: 0.5 };
+  haloSettings = { strength: 0.4, widthMm: 0.5 };
   /** Brighter than FiberField's own default (0.20/0.65/0.20/96). A brain-sized mass of sub-pixel
    *  tubes under a headlight reads dark and flat: nearly every ray hits a tube at a grazing angle, so
    *  the diffuse term rarely gets near its peak, and the halos and occlusion above take more light
@@ -1934,7 +1934,7 @@ var TractScene = class _TractScene {
   }
   static async create(dev, base, opts = {}) {
     const manifest = await fetchManifest(base);
-    const sc = new _TractScene(dev, rootUrl(base), manifest, opts.radius ?? 0.175);
+    const sc = new _TractScene(dev, rootUrl(base), manifest, opts.radius ?? 0.0875);
     if (opts.ao) Object.assign(sc.aoSettings, opts.ao);
     if (opts.halo) Object.assign(sc.haloSettings, opts.halo);
     if (opts.shade) sc.shadeSettings = [...opts.shade];
@@ -3238,8 +3238,35 @@ async function main() {
     // The Target fps slider below moves this at runtime.
     targetMs: 100
   });
+  const bake = () => {
+    a3d.renderSettled(true);
+    a3d.draw();
+  };
+  let offTex;
+  const settleOffscreen = async (samples = 24) => {
+    const w = canvas.width, h = canvas.height;
+    if (!offTex || offTex.width !== w || offTex.height !== h) {
+      offTex?.destroy();
+      offTex = gpu.device.createTexture({
+        size: [w, h],
+        format: srgb,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
+      });
+    }
+    const off = offTex.createView();
+    const aim = () => scene.setCamera(camera.position, camera.focalPoint, camera.viewUp, camera.viewAngle, w, h);
+    aim();
+    scene.renderAccum(off, w, h, true);
+    for (let i = 0; i < samples * 2 && scene.accumCount() < samples; i++) {
+      aim();
+      scene.renderAccum(off, w, h, false);
+      await gpu.device.queue.onSubmittedWorkDone();
+    }
+    aim();
+    scene.renderAccum(ctx.getCurrentTexture().createView({ format: srgb }), w, h, false);
+    await gpu.device.queue.onSubmittedWorkDone();
+  };
   let tuned = null;
-  let retuning = false, retuneTimer = 0;
   const showStatus = () => status(
     `${sc.manifest.bundles.length} bundles \xB7 ${sc.strandCount.toLocaleString()} streamlines (${Math.round(sc.fraction * 100)}%${tuned ? ` auto, ${tuned.ms.toFixed(0)} ms probe, fits ${tuned.capPct}%` : ""}) \xB7 ${sc.capsuleCount.toLocaleString()} capsules \xB7 ${(sc.bytesFetched / 1e6).toFixed(1)} MB \xB7 ${canvas.width}\xD7${canvas.height} \xB7 drag to rotate`
   );
@@ -3255,7 +3282,7 @@ async function main() {
       await sc.setFraction(p / 100, (done, total, name) => status(`loading ${p}% \xB7 chunk ${done}/${total} \xB7 ${name}`));
       scene.build([sc.fibers]);
       scene.setBackground(0.05, 0.06, 0.09);
-      a3d.renderSettled(true);
+      bake();
       status(`${sc.strandCount.toLocaleString()} streamlines (${Math.round(sc.fraction * 100)}%) \xB7 ${sc.capsuleCount.toLocaleString()} capsules \xB7 rebuilt in ${((performance.now() - t) / 1e3).toFixed(1)}s`);
     } catch (e) {
       status(`could not load more streamlines \u2014 ${e.message}`, true);
@@ -3285,9 +3312,7 @@ async function main() {
     canvas.height = h;
     if (!userMoved) frameCamera(w, h);
     showStatus();
-    a3d.renderSettled(true);
-    clearTimeout(retuneTimer);
-    retuneTimer = setTimeout(() => void retune(), 400);
+    bake();
   };
   globalThis.addEventListener("resize", resize);
   new ResizeObserver(resize).observe(canvas);
@@ -3295,7 +3320,7 @@ async function main() {
     userMoved = true;
     a3d.draw();
   } });
-  installChrome({
+  const chromeUi = installChrome({
     controls: [
       {
         label: "Streamlines",
@@ -3333,10 +3358,10 @@ async function main() {
           get: () => Math.round(1e3 / a3d.budget.targetMs),
           // Lower target = more time per frame = a bigger share of the native resolution kept while
           // rotating. The budget loop re-converges within a few frames either way.
+          // Resolution only: this moves how much of the window is traced per frame, never how many
+          // streamlines are loaded. Density is measured once at startup and then left alone.
           set: (v) => {
             a3d.budget.targetMs = 1e3 / Math.max(1, Math.min(60, v));
-            clearTimeout(retuneTimer);
-            retuneTimer = setTimeout(() => void retune(), 400);
           },
           format: (v) => `${Math.round(v)} fps`
         }
@@ -3441,7 +3466,6 @@ async function main() {
     }
   };
   resize();
-  a3d.renderSettled(true);
   showStatus();
   const PROBE_W = 640, PROBE_H = 360;
   const PROBE_PX = PROBE_W * PROBE_H;
@@ -3457,9 +3481,9 @@ async function main() {
     await gpu.device.queue.onSubmittedWorkDone();
     return performance.now() - t;
   };
-  async function retune() {
-    if (fraction !== void 0 || retuning || applying) return;
-    retuning = true;
+  async function tuneDensity() {
+    if (fraction !== void 0) return;
+    a3d.loop.stop();
     const rebuild = () => {
       scene.build([sc.fibers]);
       scene.setBackground(0.05, 0.06, 0.09);
@@ -3467,34 +3491,33 @@ async function main() {
     try {
       const cap = fractionCapForLimits(sc.manifest, gpu.adapter.limits);
       const budget = probeBudgetMs();
+      await settleOffscreen();
       let ms = await measureFrame();
-      for (let step = 0; step < 20; step++) {
-        const up = ms < budget && sc.fraction + 0.05 <= cap + 1e-6;
-        const down = ms > budget * 1.35 && sc.fraction > 0.05 + 1e-6;
-        if (!up && !down) break;
-        const next = Math.max(0.05, Math.min(cap, sc.fraction + (up ? 0.05 : -0.05)));
+      for (let step = 0; step < 20 && ms < budget && sc.fraction + 0.05 <= cap + 1e-6; step++) {
+        const next = Math.min(cap, sc.fraction + 0.05);
         if (Math.abs(next - sc.fraction) < 1e-6) break;
         status(`tuning density for this GPU\u2026 trying ${Math.round(next * 100)}% (${ms.toFixed(0)} ms probe, ${budget.toFixed(0)} ms budget)`);
         await sc.setFraction(next);
         rebuild();
+        await settleOffscreen();
         ms = await measureFrame();
-        if (up && ms > budget * 1.35) {
+        if (ms > budget * 1.35) {
           await sc.setFraction(Math.max(0.05, sc.fraction - 0.05));
           rebuild();
+          await settleOffscreen();
           ms = await measureFrame();
           break;
         }
       }
       target = Math.round(sc.fraction * 100);
       tuned = { capPct: Math.round(cap * 100), ms };
-      a3d.renderSettled(true);
+      chromeUi.refresh();
+      bake();
       showStatus();
     } catch (e) {
       status(`could not tune density \u2014 ${e.message}`, true);
-    } finally {
-      retuning = false;
     }
   }
-  await retune();
+  await tuneDensity();
 }
 main().catch((e) => status("error: " + (e?.message ?? e), true));
