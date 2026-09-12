@@ -1805,6 +1805,22 @@ fn sample_field_fib${s}(wp_world : vec3<f32>, rd : vec3<f32>, seg : f32) -> vec4
 };
 
 // render/demos/tracts-scene.ts
+var HUMAN_EXPANDED = [
+  "AF",
+  "SLF-II",
+  "SLF-III",
+  "MdLF",
+  "IOFF",
+  "CPC",
+  "TF",
+  "SF",
+  "CR-F",
+  "Sup-F"
+];
+function abbrevOf(bundleName) {
+  const m = /\(([^)]+)\)\s*$/.exec(bundleName.trim());
+  return m ? m[1] : bundleName.trim();
+}
 function meanColor(colors) {
   const n = Math.max(1, colors.length);
   return [0, 1, 2].map((k) => colors.reduce((s, c) => s + c[k], 0) / n);
@@ -1875,6 +1891,14 @@ var TractScene = class _TractScene {
    *  — the colours are the bundle identity in the group list, so they are not boosted. */
   shadeSettings = [0.45, 1.1, 0.3, 48];
   colorBy = "group";
+  /** HIGHLIGHT MODE: a named subset of bundles stays opaque while the rest drop to `dimOpacity`,
+   *  keeping their group colours so the context is still readable. Membership is by abbreviation
+   *  (the parenthesised code in each ORG tract name, e.g. "arcuate fasciculus (AF)" → AF). */
+  highlight = {
+    active: false,
+    abbrevs: new Set(HUMAN_EXPANDED),
+    dimOpacity: 0.1
+  };
   /** Starting opacity per group. Superficial U-fibres form the brain's outer shell, so at full
    *  opacity they hide the commissural and projection tracts from every exterior angle and the whole
    *  view goes violet. Starting them semi-transparent lets the deep groups read through; the group's
@@ -2023,7 +2047,17 @@ var TractScene = class _TractScene {
   colorFor(i) {
     const b = this.manifest.bundles[i];
     const rgb = this.colorBy === "group" ? groupColor(b.group, Math.max(0, this.manifest.groups.indexOf(b.group))) : b.color;
-    return [rgb[0], rgb[1], rgb[2], b.opacity * (this.opacity[b.group] ?? 1)];
+    const emphasis = !this.highlight.active || this.highlight.abbrevs.has(abbrevOf(b.name)) ? 1 : this.highlight.dimOpacity;
+    return [rgb[0], rgb[1], rgb[2], b.opacity * (this.opacity[b.group] ?? 1) * emphasis];
+  }
+  /** Turn the highlight subset on or off. Uniform-resident — caller does scene.syncUniforms(). */
+  setHighlight(active) {
+    this.highlight.active = active;
+    for (let i = 0; i < this.manifest.bundles.length; i++) this.fibers.setBundleColor(i + 1, this.colorFor(i));
+  }
+  /** Bundles currently in the highlight subset (by full ORG name), for the UI to report. */
+  highlightedBundles() {
+    return this.manifest.bundles.filter((b) => this.highlight.abbrevs.has(abbrevOf(b.name))).map((b) => b.name);
   }
   groupOpacity(group) {
     return this.opacity[group] ?? 1;
@@ -3264,6 +3298,17 @@ async function main() {
         }
       },
       {
+        label: "Human-expanded tracts",
+        section: "Tracts",
+        get: () => sc.highlight.active,
+        set: (on) => {
+          sc.setHighlight(on);
+          scene.syncUniforms();
+          a3d.draw();
+          showStatus();
+        }
+      },
+      {
         label: "Target fps",
         section: "Rendering",
         slider: {
@@ -3326,7 +3371,8 @@ async function main() {
       ["Left-drag", "Rotate"],
       ["Right-drag / wheel", "Zoom"],
       ["Middle / Shift+Left-drag", "Pan"],
-      ["SlicerLive badge", "Streamline % + target fps + depth cues + per-group opacity"]
+      ["SlicerLive badge", "Streamline % + target fps + depth cues + per-group opacity"],
+      ["Human-expanded tracts", "Holds 10 tracts at full opacity and drops the rest to 10%, keeping their group colours as context: the dorsal language stream (arcuate, SLF II/III), the ventral semantic pathways (IOFF/IFOF, MdLF), the frontal projection systems that grew with prefrontal cortex (thalamo-frontal, striato-frontal, frontal corona radiata), the prefrontal arm of the cerebro-cerebellar loop (cortico-ponto-cerebellar), and frontal short-association fibres. This is prior knowledge from the comparative literature, not anything measured in this scan. NO tract is unique to humans \u2014 every one has a primate homologue, and the claim is expansion relative to chimpanzee and macaque, clearest for the arcuate's temporal projection (found in 10/10 humans, 1/4 chimpanzees, 0/3 macaques; Rilling 2008). Some inclusions are contested, notably whether macaques have an IFOF at all. Shown bilaterally, though the language evidence is strongest on the left."]
     ] }],
     onChange: () => a3d.draw()
   });
@@ -3362,6 +3408,13 @@ async function main() {
     loadMs: () => loadMs,
     bytes: () => sc.bytesFetched,
     fraction: () => sc.fraction,
+    highlight: () => ({ active: sc.highlight.active, bundles: sc.highlightedBundles(), dim: sc.highlight.dimOpacity }),
+    setHighlight: (on) => {
+      sc.setHighlight(on);
+      scene.syncUniforms();
+      a3d.renderSettled(true);
+      return sc.highlightedBundles().length;
+    },
     setFraction: async (p) => {
       target = p;
       await applyFraction(p);
