@@ -1425,6 +1425,11 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
   resetAccumulation() {
     this.accumN = 0;
   }
+  /** ROLLING accumulation for scenes whose content keeps changing (an animation): each frame blends
+   *  in with weight 1/min(n, accumWindow) — an exponential window of ~accumWindow frames instead of
+   *  the running mean — so static content still converges toward jittered temporal AA while moving
+   *  content keeps a short trail rather than smearing. Infinity (default) = the running mean. */
+  accumWindow = Infinity;
   /** Frames accumulated since the last reset (0 before the first accumulated frame). */
   accumCount() {
     return this.accumN;
@@ -1457,7 +1462,7 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
     }
     this.dev.queue.writeBuffer(this.camBuf, 76, new Float32Array([n - 1]));
     this.flush();
-    this.dev.queue.writeBuffer(this.accumUniformBuf, 0, new Float32Array([this.mat[12], this.mat[13], this.mat[14], 1 / n]));
+    this.dev.queue.writeBuffer(this.accumUniformBuf, 0, new Float32Array([this.mat[12], this.mat[13], this.mat[14], 1 / Math.min(n, this.accumWindow)]));
     const prev = this.accumPing, next = 1 - this.accumPing;
     const enc = this.dev.createCommandEncoder();
     const mb = this.meshPass(enc, width, height);
@@ -1554,21 +1559,25 @@ fn skip_${p.field.kind}${p.slot}(wp : vec3<f32>) -> f32 {
     const ghostFields = receivers.filter((p) => p.field.ghost);
     const normalReceivers = receivers.filter((p) => !p.field.ghost);
     const clipGuard = (p, expr) => p.field.clippable === false ? expr : `if (!clipped) { ${expr} }`;
-    const sampleInto = (nm, ghost) => ghost ? `let c = sample_field_${nm}(wp, rd); if (c.a > g_op) { g_op = c.a; g_col = c.rgb / max(c.a, 1e-4); }` : `let c = sample_field_${nm}(wp, rd); sum += c;`;
+    const args = (p) => p.field.intervalSampling ? `wp, rd, s_here - last_${p.field.kind}${p.slot}` : "wp, rd";
+    const advance = (p) => p.field.intervalSampling ? ` last_${p.field.kind}${p.slot} = s_here;` : "";
+    const sampleInto = (p, ghost) => {
+      const call = `sample_field_${p.field.kind}${p.slot}(${args(p)})`;
+      return ghost ? `let c = ${call}; if (c.a > g_op) { g_op = c.a; g_col = c.rgb / max(c.a, 1e-4); }` : `let c = ${call}; sum += c;`;
+    };
     const skipBranch = (p, clip, ghost = false) => {
       const nm = `${p.field.kind}${p.slot}`;
-      const smp = sampleInto(nm, ghost);
+      const smp = sampleInto(p, ghost);
       return `    if (t >= resume_${nm}) {
       let d_${nm} = max(skip_${nm}(wp) - step, 0.0);
       if (d_${nm} > 0.0) { resume_${nm} = t + d_${nm}; }
-      else { ${clip ? clipGuard(p, smp) : smp} }
+      else { ${clip ? clipGuard(p, smp) : smp}${advance(p)} }
     }
     if (t < resume_${nm}) { jump_t = min(jump_t, resume_${nm}); } else { all_defer = false; }`;
     };
     const plainBranch = (p, clip, ghost = false) => {
-      const nm = `${p.field.kind}${p.slot}`;
-      const smp = sampleInto(nm, ghost);
-      return `    { ${clip ? clipGuard(p, smp) : smp} all_defer = false; }`;
+      const smp = sampleInto(p, ghost);
+      return `    { ${clip ? clipGuard(p, smp) : smp}${advance(p)} all_defer = false; }`;
     };
     const normalSkippers = normalReceivers.filter((p) => !p.field.transform).filter((p) => _SceneRenderer.boxSkip || p.field.providesSkip && p.field.skipWGSL);
     const ghostSkippers = ghostFields.filter((p) => p.field.providesSkip && p.field.skipWGSL);
@@ -1580,6 +1589,7 @@ fn skip_${p.field.kind}${p.slot}(wp : vec3<f32>) -> f32 {
     ].join("\n");
     const fns = [modFns, tpFns, fieldFns, skipFns].filter((s) => s.trim()).join("\n");
     const skipInit = [...normalSkippers, ...ghostSkippers].map((p) => `  var resume_${p.field.kind}${p.slot} : f32 = -1.0e30;`).join("\n");
+    const intervalInit = receivers.filter((p) => p.field.intervalSampling).map((p) => `  var last_${p.field.kind}${p.slot} : f32 = max(t_near - step, 0.0);`).join("\n");
     const dispatch = normalReceivers.map(
       (p) => canSkip.has(p.field) ? skipBranch(p, true) : plainBranch(p, true)
     ).join("\n");
@@ -1588,7 +1598,7 @@ fn skip_${p.field.kind}${p.slot}(wp : vec3<f32>) -> f32 {
     ).join("\n");
     const hasGhost = ghostFields.length > 0;
     const pickDispatch = normalReceivers.map(
-      (p) => `    ${clipGuard(p, `{ let c = sample_field_${p.field.kind}${p.slot}(wp, rd); sum += c; }`)}`
+      (p) => `    ${clipGuard(p, `{ let c = sample_field_${p.field.kind}${p.slot}(wp, rd${p.field.intervalSampling ? ", step" : ""}); sum += c; }`)}`
     ).join("\n");
     return (
       /* wgsl */
@@ -1673,6 +1683,7 @@ fn fs_trace(v : Varyings) -> @location(0) vec4<f32> {
   var g_op = 0.0;          // ghost (handle) surface: max opacity along the ray (0.5 inactive /
   var g_col = vec3<f32>(0.0);  // 1.0 active) and its colour \u2014 tracked, never accumulated.
 ${skipInit}
+${intervalInit}
   loop {
     if (t >= t_far || safety >= 5000${hasGhost ? "" : " || integrated.a >= 0.99"}) { break; }
     // Per-(pixel, step, ACCUM FRAME) ray-offset jitter. The frame term (u_cam.size.w, the
@@ -1696,7 +1707,8 @@ ${skipInit}
       integrated = integrated + (1.0 - integrated.a) * mesh_c;
       mesh_done = true;
     }
-    let wp = ro + rd * (t + js * step);
+    let s_here = t + js * step;   // ray distance of this (jittered) sample
+    let wp = ro + rd * s_here;
     var sum = vec4<f32>(0.0);
     var all_defer = true;        // every field guarantees emptiness here -> we may leap
     var jump_t = 1.0e30;         // nearest field horizon
@@ -1871,7 +1883,7 @@ ${pickDispatch}
    *  anyway fails validation and the whole view silently renders nothing. Emit the sampler
    *  declaration and its bind entry under the SAME condition so the two can't drift. */
   usesSampler() {
-    return this.placed.some((p) => p.field.bindingCount > 0);
+    return this.placed.some((p) => p.field.usesSampler ?? p.field.bindingCount > 0);
   }
   bindGroupEntries() {
     const entries = [
@@ -2145,12 +2157,15 @@ var ImageField = class {
       const bytesPerRow = dims[0] * bpe, rowsPerImage = dims[1], sliceBytes = bytesPerRow * rowsPerImage;
       const CHUNK = 256 * 1024 * 1024;
       const slab = Math.max(1, Math.min(dims[2], Math.floor(CHUNK / Math.max(1, sliceBytes))));
+      const u8 = new Uint8Array(src.buffer, src.byteOffset, src.byteLength);
       for (let z = 0; z < dims[2]; z += slab) {
         const depth = Math.min(slab, dims[2] - z);
+        const slabBytes = depth * sliceBytes;
+        const slabData = u8.slice(z * sliceBytes, z * sliceBytes + slabBytes);
         dev.queue.writeTexture(
           { texture: this.volTex, origin: { x: 0, y: 0, z } },
-          src,
-          { offset: z * sliceBytes, bytesPerRow, rowsPerImage },
+          slabData,
+          { offset: 0, bytesPerRow, rowsPerImage },
           [dims[0], dims[1], depth]
         );
       }
@@ -2210,6 +2225,12 @@ var ImageField = class {
    *  texture must use the same factor. 1 for f32 volumes. */
   normScaleOf() {
     return this.normScale;
+  }
+  /** Free this field's GPU textures (call when replacing it, e.g. a low-res proxy upgraded to full,
+   *  or an LRU-evicted specimen) so VRAM isn't leaked across a menu of large volumes. */
+  destroy() {
+    this.volTex.destroy();
+    this.lutTex.destroy();
   }
   /** Centre of the volume in world (RAS) at identity — a natural pivot for a transform widget. */
   worldCenter() {
@@ -5422,6 +5443,9 @@ function attachWidgetControls(canvas, camera, opts) {
 // render/budget-controller.ts
 var BudgetController = class {
   budgetPx;
+  /** Mutable so a demo can expose it: a viewer who would rather have detail than frame rate raises
+   *  the target frame time, and the loop then keeps a bigger fraction of the native resolution while
+   *  interacting instead of downsampling into aliasing. */
   targetMs;
   minPx;
   maxPx;
@@ -6989,24 +7013,42 @@ function installChrome(opts) {
     pop.style.transform = "translateY(-6px)";
   };
   let pinned = false;
+  let startOpen = false;
   logo.onmouseenter = () => {
     logo.style.transform = "scale(1.08)";
     show();
   };
   logo.onclick = () => {
+    startOpen = false;
     pinned = !pinned;
     pinned ? show() : hide();
   };
   logo.onmouseleave = () => {
     logo.style.transform = "scale(1)";
-    if (!pinned) setTimeout(() => {
+    if (!pinned && !startOpen) setTimeout(() => {
       if (!pop.matches(":hover") && !pinned) hide();
     }, 120);
   };
   pop.onmouseleave = () => {
+    startOpen = false;
     if (!pinned) hide();
   };
+  const onDocDown = (e) => {
+    const t = e.target;
+    if (logo.contains(t) || pop.contains(t)) return;
+    if (startOpen) return;
+    pinned = false;
+    hide();
+  };
+  document.addEventListener("pointerdown", onDocDown, true);
+  if (opts.openOnLoad ?? true) {
+    startOpen = true;
+    requestAnimationFrame(() => {
+      if (startOpen) show();
+    });
+  }
   const destroy = () => {
+    document.removeEventListener("pointerdown", onDocDown, true);
     globalThis.removeEventListener("resize", place);
     anchorRO?.disconnect();
     document.removeEventListener("keydown", escClose, true);

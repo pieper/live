@@ -4,7 +4,7 @@ async function initDevice() {
   if (!gpu) throw new Error("WebGPU not available (need Chrome/Edge/Safari or Deno --unstable-webgpu)");
   const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
   if (!adapter) throw new Error("no WebGPU adapter");
-  const want = ["float32-filterable", "timestamp-query"].filter((f) => adapter.features.has(f));
+  const want = ["float32-filterable", "timestamp-query", "shader-f16"].filter((f) => adapter.features.has(f));
   const lim = adapter.limits;
   const requiredLimits = {};
   const raise = (k) => {
@@ -42,6 +42,21 @@ function perspectiveZO(fovy, aspect, near, far) {
   m[5] = f;
   m[11] = -1;
   m[10] = far / (near - far);
+  m[14] = far * near / (near - far);
+  return m;
+}
+function perspectiveZOTile(fovy, viewW, viewH, x, y, w, h, near, far) {
+  const t = near * Math.tan(fovy / 2), b = -t;
+  const r = t * (viewW / viewH), l = -r;
+  const l2 = l + (r - l) * x / viewW, r2 = l + (r - l) * (x + w) / viewW;
+  const t2 = t - (t - b) * y / viewH, b2 = t - (t - b) * (y + h) / viewH;
+  const m = new Float32Array(16);
+  m[0] = 2 * near / (r2 - l2);
+  m[5] = 2 * near / (t2 - b2);
+  m[8] = (r2 + l2) / (r2 - l2);
+  m[9] = (t2 + b2) / (t2 - b2);
+  m[10] = far / (near - far);
+  m[11] = -1;
   m[14] = far * near / (near - far);
   return m;
 }
@@ -167,7 +182,121 @@ function spacingFromIjkToRAS(ijkToRAS) {
 var DEFAULT_FORMAT = "rgba8unorm-srgb";
 var SCENE_FLOATS = 16;
 var CLIP_FLOATS = 36;
+var MESH_WGSL = (
+  /* wgsl */
+  `
+struct MU { view_proj : mat4x4<f32>, eye : vec4<f32>, color : vec4<f32> };
+@group(0) @binding(0) var<uniform> mu : MU;
+struct VO { @builtin(position) pos : vec4<f32>, @location(0) wp : vec3<f32> };
+@vertex fn vs_mesh(@location(0) p : vec3<f32>) -> VO { var o : VO; o.pos = mu.view_proj * vec4<f32>(p, 1.0); o.wp = p; return o; }
+struct FO { @location(0) col : vec4<f32>, @location(1) depth : vec4<f32> };
+@fragment fn fs_mesh(i : VO) -> FO {
+  let n = normalize(cross(dpdx(i.wp), dpdy(i.wp)));       // flat face normal (no normals on the wire)
+  let l = normalize(mu.eye.xyz - i.wp);                   // headlight
+  let lam = 0.25 + 0.75 * abs(dot(n, l));
+  let a = mu.color.a;
+  var o : FO;
+  o.col = vec4<f32>(mu.color.rgb * lam * a, a);           // premultiplied
+  o.depth = vec4<f32>(distance(mu.eye.xyz, i.wp), 0.0, 0.0, 1.0);
+  return o;
+}`
+);
 var SceneRenderer = class _SceneRenderer {
+  // ── surface meshes (models): rasterised before each trace into colour+depth targets the march composites ──
+  meshPipeline;
+  gpuMeshes = [];
+  meshTargetsBySize = /* @__PURE__ */ new Map();
+  viewProj = new Float32Array(16);
+  eyePos = [0, 0, 0];
+  /** Replace the surface meshes (world/RAS float32 xyz + uint32 triangles, colour, opacity). */
+  setMeshes(meshes) {
+    for (const m of this.gpuMeshes) {
+      m.vbuf.destroy();
+      m.ibuf.destroy();
+      m.ubuf.destroy();
+    }
+    this.gpuMeshes = meshes.filter((m) => m.indices.length >= 3).map((m) => {
+      const vbuf = this.dev.createBuffer({ size: Math.ceil(m.positions.byteLength / 4) * 4, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+      this.dev.queue.writeBuffer(vbuf, 0, m.positions);
+      const ibuf = this.dev.createBuffer({ size: Math.ceil(m.indices.byteLength / 4) * 4, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
+      this.dev.queue.writeBuffer(ibuf, 0, m.indices);
+      const ubuf = this.dev.createBuffer({ size: 24 * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      return { vbuf, ibuf, count: m.indices.length, ubuf, color: m.color, opacity: m.opacity };
+    });
+  }
+  hasMeshes() {
+    return this.gpuMeshes.length > 0;
+  }
+  ensureMeshPipeline() {
+    if (this.meshPipeline) return;
+    const mod = this.dev.createShaderModule({ code: MESH_WGSL });
+    this.meshPipeline = this.dev.createRenderPipeline({
+      layout: "auto",
+      vertex: { module: mod, entryPoint: "vs_mesh", buffers: [{ arrayStride: 12, attributes: [{ shaderLocation: 0, offset: 0, format: "float32x3" }] }] },
+      fragment: { module: mod, entryPoint: "fs_mesh", targets: [{ format: "rgba16float" }, { format: "r32float" }] },
+      primitive: { topology: "triangle-list", cullMode: "none" },
+      depthStencil: { format: "depth24plus", depthWriteEnabled: true, depthCompare: "less" }
+    });
+  }
+  /** Colour/depth targets (+ the group-1 bind group of the trace pipeline) for a given trace size. */
+  meshTargets(w, h) {
+    const key = w + "x" + h;
+    let t = this.meshTargetsBySize.get(key);
+    if (!t) {
+      if (this.meshTargetsBySize.size > 4) {
+        for (const old of this.meshTargetsBySize.values()) {
+          old.col.destroy();
+          old.depth.destroy();
+          old.z.destroy();
+        }
+        this.meshTargetsBySize.clear();
+      }
+      t = {
+        w,
+        h,
+        col: this.dev.createTexture({ size: [w, h], format: "rgba16float", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING }),
+        depth: this.dev.createTexture({ size: [w, h], format: "r32float", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING }),
+        z: this.dev.createTexture({ size: [w, h], format: "depth24plus", usage: GPUTextureUsage.RENDER_ATTACHMENT })
+      };
+      this.meshTargetsBySize.set(key, t);
+    }
+    if (!t.bind) t.bind = this.dev.createBindGroup({ layout: this.pipeline.getBindGroupLayout(1), entries: [{ binding: 0, resource: t.col.createView() }, { binding: 1, resource: t.depth.createView() }] });
+    return t;
+  }
+  /** Rasterise the meshes for this frame's trace size; returns the bind group the trace pass needs. */
+  meshPass(enc, w, h) {
+    const t = this.meshTargets(w, h);
+    const pass = enc.beginRenderPass({
+      colorAttachments: [
+        { view: t.col.createView(), loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } },
+        { view: t.depth.createView(), loadOp: "clear", storeOp: "store", clearValue: { r: 1e30, g: 0, b: 0, a: 1 } }
+      ],
+      depthStencilAttachment: { view: t.z.createView(), depthClearValue: 1, depthLoadOp: "clear", depthStoreOp: "store" }
+    });
+    if (this.gpuMeshes.length) {
+      this.ensureMeshPipeline();
+      pass.setPipeline(this.meshPipeline);
+      for (const m of this.gpuMeshes) {
+        const u = new Float32Array(24);
+        u.set(this.viewProj, 0);
+        u[16] = this.eyePos[0];
+        u[17] = this.eyePos[1];
+        u[18] = this.eyePos[2];
+        u[19] = 1;
+        u[20] = m.color[0];
+        u[21] = m.color[1];
+        u[22] = m.color[2];
+        u[23] = m.opacity;
+        this.dev.queue.writeBuffer(m.ubuf, 0, u);
+        pass.setBindGroup(0, this.dev.createBindGroup({ layout: this.meshPipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: m.ubuf } }] }));
+        pass.setVertexBuffer(0, m.vbuf);
+        pass.setIndexBuffer(m.ibuf, "uint32");
+        pass.drawIndexed(m.count);
+      }
+    }
+    pass.end();
+    return t.bind;
+  }
   dev;
   format;
   placed = [];
@@ -465,9 +594,11 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
     this.dev.queue.writeBuffer(this.superresBuf, 0, new Float32Array([renderW, renderH, viewW, viewH]));
     this.dev.queue.writeBuffer(this.resolveBgBuf, 0, this.mat.subarray(12, 16));
     const enc = this.dev.createCommandEncoder();
+    const mb = this.meshPass(enc, renderW, renderH);
     const tp = enc.beginRenderPass({ colorAttachments: [{ view: this.lowView, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
     tp.setPipeline(this.pipeline);
     tp.setBindGroup(0, this.bind);
+    tp.setBindGroup(1, mb);
     tp.draw(3);
     tp.end();
     const sp = enc.beginRenderPass({ colorAttachments: [{ view, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }] });
@@ -479,9 +610,11 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
   }
   /** Encode trace (producer) + resolve (reconstructor) into `enc`, output to `outView`. */
   encodeFrame(enc, outView) {
+    const mb = this.meshPass(enc, this.traceW, this.traceH);
     const tp = enc.beginRenderPass({ colorAttachments: [{ view: this.traceView, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
     tp.setPipeline(this.pipeline);
     tp.setBindGroup(0, this.bind);
+    tp.setBindGroup(1, mb);
     tp.draw(3);
     tp.end();
     const rp = enc.beginRenderPass({ colorAttachments: [{ view: outView, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }] });
@@ -519,6 +652,11 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
   resetAccumulation() {
     this.accumN = 0;
   }
+  /** ROLLING accumulation for scenes whose content keeps changing (an animation): each frame blends
+   *  in with weight 1/min(n, accumWindow) — an exponential window of ~accumWindow frames instead of
+   *  the running mean — so static content still converges toward jittered temporal AA while moving
+   *  content keeps a short trail rather than smearing. Infinity (default) = the running mean. */
+  accumWindow = Infinity;
   /** Frames accumulated since the last reset (0 before the first accumulated frame). */
   accumCount() {
     return this.accumN;
@@ -549,13 +687,16 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
     } else {
       this.dev.queue.writeBuffer(this.camBuf, 0, this.baseInvVP);
     }
+    this.dev.queue.writeBuffer(this.camBuf, 76, new Float32Array([n - 1]));
     this.flush();
-    this.dev.queue.writeBuffer(this.accumUniformBuf, 0, new Float32Array([this.mat[12], this.mat[13], this.mat[14], 1 / n]));
+    this.dev.queue.writeBuffer(this.accumUniformBuf, 0, new Float32Array([this.mat[12], this.mat[13], this.mat[14], 1 / Math.min(n, this.accumWindow)]));
     const prev = this.accumPing, next = 1 - this.accumPing;
     const enc = this.dev.createCommandEncoder();
+    const mb = this.meshPass(enc, width, height);
     const tp = enc.beginRenderPass({ colorAttachments: [{ view: this.traceView, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
     tp.setPipeline(this.pipeline);
     tp.setBindGroup(0, this.bind);
+    tp.setBindGroup(1, mb);
     tp.draw(3);
     tp.end();
     const ap = enc.beginRenderPass({ colorAttachments: [
@@ -583,8 +724,9 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
     });
     this.clipOff = uoff;
     this.pickOff = uoff + CLIP_FLOATS;
-    this.mat = new Float32Array(uoff + CLIP_FLOATS + 4);
-    this.matBuf = this.dev.createBuffer({ size: (uoff + CLIP_FLOATS + 4) * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.mat = new Float32Array(uoff + CLIP_FLOATS + 12);
+    this.matBuf = this.dev.createBuffer({ size: (uoff + CLIP_FLOATS + 12) * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    for (const t of this.meshTargetsBySize.values()) t.bind = void 0;
     const module = this.dev.createShaderModule({ code: this.wgsl() });
     this.pipeline = this.dev.createRenderPipeline({
       layout: "auto",
@@ -644,21 +786,25 @@ fn skip_${p.field.kind}${p.slot}(wp : vec3<f32>) -> f32 {
     const ghostFields = receivers.filter((p) => p.field.ghost);
     const normalReceivers = receivers.filter((p) => !p.field.ghost);
     const clipGuard = (p, expr) => p.field.clippable === false ? expr : `if (!clipped) { ${expr} }`;
-    const sampleInto = (nm, ghost) => ghost ? `let c = sample_field_${nm}(wp, rd); if (c.a > g_op) { g_op = c.a; g_col = c.rgb / max(c.a, 1e-4); }` : `let c = sample_field_${nm}(wp, rd); sum += c;`;
+    const args = (p) => p.field.intervalSampling ? `wp, rd, s_here - last_${p.field.kind}${p.slot}` : "wp, rd";
+    const advance = (p) => p.field.intervalSampling ? ` last_${p.field.kind}${p.slot} = s_here;` : "";
+    const sampleInto = (p, ghost) => {
+      const call = `sample_field_${p.field.kind}${p.slot}(${args(p)})`;
+      return ghost ? `let c = ${call}; if (c.a > g_op) { g_op = c.a; g_col = c.rgb / max(c.a, 1e-4); }` : `let c = ${call}; sum += c;`;
+    };
     const skipBranch = (p, clip, ghost = false) => {
       const nm = `${p.field.kind}${p.slot}`;
-      const smp = sampleInto(nm, ghost);
+      const smp = sampleInto(p, ghost);
       return `    if (t >= resume_${nm}) {
       let d_${nm} = max(skip_${nm}(wp) - step, 0.0);
       if (d_${nm} > 0.0) { resume_${nm} = t + d_${nm}; }
-      else { ${clip ? clipGuard(p, smp) : smp} }
+      else { ${clip ? clipGuard(p, smp) : smp}${advance(p)} }
     }
     if (t < resume_${nm}) { jump_t = min(jump_t, resume_${nm}); } else { all_defer = false; }`;
     };
     const plainBranch = (p, clip, ghost = false) => {
-      const nm = `${p.field.kind}${p.slot}`;
-      const smp = sampleInto(nm, ghost);
-      return `    { ${clip ? clipGuard(p, smp) : smp} all_defer = false; }`;
+      const smp = sampleInto(p, ghost);
+      return `    { ${clip ? clipGuard(p, smp) : smp}${advance(p)} all_defer = false; }`;
     };
     const normalSkippers = normalReceivers.filter((p) => !p.field.transform).filter((p) => _SceneRenderer.boxSkip || p.field.providesSkip && p.field.skipWGSL);
     const ghostSkippers = ghostFields.filter((p) => p.field.providesSkip && p.field.skipWGSL);
@@ -670,6 +816,7 @@ fn skip_${p.field.kind}${p.slot}(wp : vec3<f32>) -> f32 {
     ].join("\n");
     const fns = [modFns, tpFns, fieldFns, skipFns].filter((s) => s.trim()).join("\n");
     const skipInit = [...normalSkippers, ...ghostSkippers].map((p) => `  var resume_${p.field.kind}${p.slot} : f32 = -1.0e30;`).join("\n");
+    const intervalInit = receivers.filter((p) => p.field.intervalSampling).map((p) => `  var last_${p.field.kind}${p.slot} : f32 = max(t_near - step, 0.0);`).join("\n");
     const dispatch = normalReceivers.map(
       (p) => canSkip.has(p.field) ? skipBranch(p, true) : plainBranch(p, true)
     ).join("\n");
@@ -678,7 +825,7 @@ fn skip_${p.field.kind}${p.slot}(wp : vec3<f32>) -> f32 {
     ).join("\n");
     const hasGhost = ghostFields.length > 0;
     const pickDispatch = normalReceivers.map(
-      (p) => `    ${clipGuard(p, `{ let c = sample_field_${p.field.kind}${p.slot}(wp, rd); sum += c; }`)}`
+      (p) => `    ${clipGuard(p, `{ let c = sample_field_${p.field.kind}${p.slot}(wp, rd${p.field.intervalSampling ? ", step" : ""}); sum += c; }`)}`
     ).join("\n");
     return (
       /* wgsl */
@@ -693,9 +840,16 @@ ${members}
   clip_planes : array<vec4<f32>, 8>,   // (nx, ny, nz, offset) inward; tail so field offsets are stable
   clip_count : vec4<f32>,              // (count, _, _, _)
   pick_cursor : vec4<f32>,             // (ndc_x, ndc_y, _, _) \u2014 the ray for fs_pick
+  probe_origin : vec4<f32>,            // explicit-ray probe: world origin
+  probe_dir : vec4<f32>,               // (dx, dy, dz, enabled) \u2014 w>0 uses this ray instead of the cursor
 };
 @group(0) @binding(0) var<uniform> u_cam : Camera;
 @group(0) @binding(1) var<uniform> u_material : Material;
+// Rasterised surface meshes (models): nearest-surface colour (premultiplied) + its distance along the
+// ray, produced by the mesh pass before each trace. The march composites the surface at that depth,
+// so volumes in front occlude it and it occludes what is behind \u2014 the depth-composite seam.
+@group(1) @binding(0) var t_mesh_col : texture_2d<f32>;
+@group(1) @binding(1) var t_mesh_depth : texture_2d<f32>;
 ${this.usesSampler() ? "@group(0) @binding(2) var s_lin : sampler;" : ""}
 ${decls}
 
@@ -729,18 +883,23 @@ fn fs_trace(v : Varyings) -> @location(0) vec4<f32> {
   let ro = ndc_to_world(vec4<f32>(ndc_x, ndc_y, 0.0, 1.0));
   let rd = normalize(ndc_to_world(vec4<f32>(ndc_x, ndc_y, 1.0, 1.0)) - ro);
 
+  let mpix = vec2<i32>(v.position.xy);
+  let mesh_c = textureLoad(t_mesh_col, mpix, 0);          // premultiplied surface colour (0 = no mesh)
+  let mesh_t = textureLoad(t_mesh_depth, mpix, 0).r;      // distance along the ray (1e30 = none)
+  var mesh_done = mesh_c.a <= 0.0;
+
   let inv = vec3<f32>(1.0) / rd;
   let tb = (u_material.bmin.xyz - ro) * inv;
   let tt = (u_material.bmax.xyz - ro) * inv;
   let tmn = min(tt, tb); let tmx = max(tt, tb);
   var t_near = max(max(tmn.x, tmn.y), tmn.z);
   var t_far  = min(min(tmx.x, tmx.y), tmx.z);
-  if (t_far <= t_near || t_far <= 0.0) { return vec4<f32>(0.0); }
+  if (t_far <= t_near || t_far <= 0.0) { return mesh_c; }
 
   let step = max(u_material.scene.x, 1e-3);
   t_near = max(t_near + step, 0.0);
   t_far  = t_far - step;
-  if (t_far <= t_near) { return vec4<f32>(0.0); }
+  if (t_far <= t_near) { return mesh_c; }
   let seed = ign(v.position.xy);
   var t = t_near;
   var integrated = vec4<f32>(0.0);
@@ -751,10 +910,32 @@ fn fs_trace(v : Varyings) -> @location(0) vec4<f32> {
   var g_op = 0.0;          // ghost (handle) surface: max opacity along the ray (0.5 inactive /
   var g_col = vec3<f32>(0.0);  // 1.0 active) and its colour \u2014 tracked, never accumulated.
 ${skipInit}
+${intervalInit}
   loop {
     if (t >= t_far || safety >= 5000${hasGhost ? "" : " || integrated.a >= 0.99"}) { break; }
-    let js = fract(sin(dot(v.position.xy + vec2<f32>(f32(safety) * 0.7548, f32(safety) * 0.5698), vec2<f32>(12.9898, 78.233))) * 43758.5453) - 0.5; // per-(pixel,sample) jitter \u2014 frame-invariant; temporal AA rides on the sub-pixel NDC jitter (frame.xy), which is exact identity at 0
-    let wp = ro + rd * (t + js * step);
+    // Per-(pixel, step, ACCUM FRAME) ray-offset jitter. The frame term (u_cam.size.w, the
+    // accumulation index) is what makes temporal AA actually converge: with a frame-invariant
+    // offset the jitter turns banding into FIXED-PATTERN noise that averaging can never remove
+    // (measured: 32 samples was as grainy as 1). Varying it per frame decorrelates the samples
+    // so the mean approaches the true integral \u2014 no banding AND no noise. size.w is 0 for every
+    // non-accumulating path, so frame 1 stays byte-identical to a plain renderToView.
+    // Base offset: decorrelated per (pixel, step) so a single frame shows noise, not banding.
+    let jbase = fract(sin(dot(v.position.xy + vec2<f32>(f32(safety) * 0.7548, f32(safety) * 0.5698), vec2<f32>(12.9898, 78.233))) * 43758.5453);
+    // Advance it across accumulation frames by the golden-ratio additive recurrence
+    // (Cranley-Patterson rotation). MEASURED: this converges at the same 1/sqrt(n) rate as an
+    // independent random offset per frame (high-freq energy 1.36 vs 1.31 at n=64) \u2014 the low-
+    // discrepancy walk is NOT faster here, because the variance is dominated by the step size
+    // against a sharp transfer function, not by the sequence. Kept because it is deterministic
+    // and costs nothing; reduce sampleStep if you need less residual speckle.
+    // At size.w = 0 this is exactly jbase, so the first accumulated frame stays byte-identical
+    // to a plain renderToView \u2014 the property render/test baselines depend on.
+    let js = fract(jbase + u_cam.size.w * 0.6180339887) - 0.5;
+    if (!mesh_done && t + 0.5 * step >= mesh_t) {         // the ray reaches the surface: composite it here
+      integrated = integrated + (1.0 - integrated.a) * mesh_c;
+      mesh_done = true;
+    }
+    let s_here = t + js * step;   // ray distance of this (jittered) sample
+    let wp = ro + rd * s_here;
     var sum = vec4<f32>(0.0);
     var all_defer = true;        // every field guarantees emptiness here -> we may leap
     var jump_t = 1.0e30;         // nearest field horizon
@@ -775,6 +956,7 @@ ${ghostDispatch}
     if (all_defer && jump_t > t + step) { t = jump_t; } else { t = t + step; }
     safety = safety + 1;
   }
+  if (!mesh_done) { integrated = integrated + (1.0 - integrated.a) * mesh_c; }   // surface beyond the slab
   // GHOST x-ray, applied ONCE (never compounding): the volume IN FRONT of a handle is shown
   // at residual = 1 - handle_opacity (50% for an inactive handle at opacity 0.5, 0% for an
   // active/hovered handle at opacity 1.0), then the handle (colour g_col at opacity g_op)
@@ -793,8 +975,16 @@ ${ghostDispatch}
 // Output: (wp.x, wp.y, wp.z, hit). hit=0 means the ray never reached 50% (empty/miss).
 @fragment
 fn fs_pick() -> @location(0) vec4<f32> {
-  let ro = ndc_to_world(vec4<f32>(u_material.pick_cursor.x, u_material.pick_cursor.y, 0.0, 1.0));
-  let rd = normalize(ndc_to_world(vec4<f32>(u_material.pick_cursor.x, u_material.pick_cursor.y, 1.0, 1.0)) - ro);
+  // Two ray sources: the screen cursor (pick) or an explicit world ray (probe). The explicit
+  // form exists because the cursor ray can only ever probe what is ON SCREEN \u2014 useless for
+  // "how much room is BEHIND me?", which endovascular navigation needs for reverse and for
+  // lateral clearance.
+  var ro = ndc_to_world(vec4<f32>(u_material.pick_cursor.x, u_material.pick_cursor.y, 0.0, 1.0));
+  var rd = normalize(ndc_to_world(vec4<f32>(u_material.pick_cursor.x, u_material.pick_cursor.y, 1.0, 1.0)) - ro);
+  if (u_material.probe_dir.w > 0.5) {
+    ro = u_material.probe_origin.xyz;
+    rd = normalize(u_material.probe_dir.xyz);
+  }
   let inv = vec3<f32>(1.0) / rd;
   let tb = (u_material.bmin.xyz - ro) * inv;
   let tt = (u_material.bmax.xyz - ro) * inv;
@@ -920,7 +1110,7 @@ ${pickDispatch}
    *  anyway fails validation and the whole view silently renders nothing. Emit the sampler
    *  declaration and its bind entry under the SAME condition so the two can't drift. */
   usesSampler() {
-    return this.placed.some((p) => p.field.bindingCount > 0);
+    return this.placed.some((p) => p.field.usesSampler ?? p.field.bindingCount > 0);
   }
   bindGroupEntries() {
     const entries = [
@@ -936,12 +1126,38 @@ ${pickDispatch}
     const proj = perspectiveZO(fovyDeg * Math.PI / 180, width / height, 1, 1e5);
     const invVP = invert(multiply(proj, view));
     this.baseInvVP = invVP;
+    this.viewProj = multiply(proj, view);
+    this.eyePos = eye;
     const cam = new Float32Array(24);
     cam.set(invVP, 0);
     this.focalPx = height / 2 / Math.tan(fovyDeg * Math.PI / 360);
     cam[16] = width;
     cam[17] = height;
     cam[18] = height / 2 / Math.tan(fovyDeg * Math.PI / 360);
+    cam[19] = 0;
+    cam[20] = eye[0];
+    cam[21] = eye[1];
+    cam[22] = eye[2];
+    this.dev.queue.writeBuffer(this.camBuf, 0, cam);
+  }
+  /** Camera for ONE TILE of the view: the same rays the full frame would cast for `rect`, into a
+   *  rect.w×rect.h target. Screen-space glyph sizing stays keyed to the FULL view height, so a
+   *  patch of the gizmo is drawn at exactly the size the full frame drew it. Pair with
+   *  traceSamples(rect.w, rect.h) — its focal rewrite is then a no-op. */
+  setCameraTile(eye, center, up, fovyDeg, viewW, viewH, rect) {
+    const view = lookAt(eye, center, up);
+    const proj = perspectiveZOTile(fovyDeg * Math.PI / 180, viewW, viewH, rect.x, rect.y, rect.w, rect.h, 1, 1e5);
+    const invVP = invert(multiply(proj, view));
+    this.baseInvVP = invVP;
+    this.viewProj = multiply(proj, view);
+    this.eyePos = eye;
+    const cam = new Float32Array(24);
+    cam.set(invVP, 0);
+    this.focalPx = viewH / 2 / Math.tan(fovyDeg * Math.PI / 360);
+    cam[16] = rect.w;
+    cam[17] = rect.h;
+    cam[18] = this.focalPx;
+    cam[19] = 0;
     cam[20] = eye[0];
     cam[21] = eye[1];
     cam[22] = eye[2];
@@ -956,9 +1172,50 @@ ${pickDispatch}
    *  Uses the camera set by the last setCamera(); returns null if the ray never reaches 50%. */
   async pick(u, v) {
     if (!this.pickPipeline || !this.pickBind || !this.placed.length) return null;
-    this.mat[this.pickOff] = u * 2 - 1;
-    this.mat[this.pickOff + 1] = 1 - v * 2;
-    this.flush();
+    return this.serialise(async () => {
+      this.mat[this.pickOff] = u * 2 - 1;
+      this.mat[this.pickOff + 1] = 1 - v * 2;
+      this.mat[this.pickOff + 11] = 0;
+      this.flush();
+      return await this.tracePick();
+    });
+  }
+  /** Trace an EXPLICIT world ray and return the distance (mm) to the first point where
+   *  front-to-back opacity reaches 50%, or Infinity if it never does. Unlike pick(), the ray
+   *  is independent of the camera, so it can look backwards and sideways — which is what makes
+   *  collision "rails" possible in a first-person flythrough. */
+  async probe(origin, dir) {
+    if (!this.pickPipeline || !this.pickBind || !this.placed.length) return Infinity;
+    const l = Math.hypot(dir[0], dir[1], dir[2]) || 1;
+    return this.serialise(async () => {
+      this.mat[this.pickOff + 4] = origin[0];
+      this.mat[this.pickOff + 5] = origin[1];
+      this.mat[this.pickOff + 6] = origin[2];
+      this.mat[this.pickOff + 8] = dir[0] / l;
+      this.mat[this.pickOff + 9] = dir[1] / l;
+      this.mat[this.pickOff + 10] = dir[2] / l;
+      this.mat[this.pickOff + 11] = 1;
+      this.flush();
+      const hit = await this.tracePick();
+      this.mat[this.pickOff + 11] = 0;
+      this.flush();
+      if (!hit) return Infinity;
+      return Math.hypot(hit[0] - origin[0], hit[1] - origin[1], hit[2] - origin[2]);
+    });
+  }
+  /** Serialises pick/probe. They share ONE uniform buffer and ONE readback buffer, so
+   *  concurrent calls would overwrite each other's ray and double-map the buffer — a
+   *  Promise.all of probes silently returns garbage. Callers may fire as many as they like;
+   *  they queue here. */
+  pickChain = Promise.resolve();
+  serialise(fn) {
+    const next = this.pickChain.then(fn, fn);
+    this.pickChain = next.catch(() => {
+    });
+    return next;
+  }
+  /** The shared 1x1 render + readback behind pick() and probe(). */
+  async tracePick() {
     if (!this.pickTarget) {
       this.pickTarget = this.dev.createTexture({ size: [1, 1], format: "rgba32float", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
       this.pickReadBuf = this.dev.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
@@ -999,12 +1256,14 @@ ${pickDispatch}
     const samples = [];
     for (let i = 0; i < iters; i++) {
       const enc = this.dev.createCommandEncoder();
+      const mb = this.meshPass(enc, width, height);
       const pass = enc.beginRenderPass({
         colorAttachments: [{ view, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
         timestampWrites: { querySet: qs, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 }
       });
       pass.setPipeline(this.pipeline);
       pass.setBindGroup(0, this.bind);
+      pass.setBindGroup(1, mb);
       pass.draw(3);
       pass.end();
       enc.resolveQuerySet(qs, 0, 2, resolve, 0);
@@ -1048,13 +1307,19 @@ ${pickDispatch}
    *  background) as tightly-packed rgba8 — the bytes streamed to the remote client, which runs the
    *  same reconstruction (upsample + background composite) the local resolve does. The caller sets
    *  the camera to width×height first (like renderUpscaled). Returns width*height*4 bytes. */
-  async traceSamples(width, height) {
+  async traceSamples(width, height, viewH = height) {
     this.flush();
+    this.dev.queue.writeBuffer(this.camBuf, 64, new Float32Array([width, height]));
+    this.dev.queue.writeBuffer(this.camBuf, 72, new Float32Array([this.focalPx * (viewH / height)]));
     const target = this.dev.createTexture({ size: [width, height], format: "rgba8unorm", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
     const enc = this.dev.createCommandEncoder();
+    this.meshPass(enc, width, height);
+    const smt = this.meshTargets(width, height);
+    const streamMb = this.dev.createBindGroup({ layout: this.streamPipeline.getBindGroupLayout(1), entries: [{ binding: 0, resource: smt.col.createView() }, { binding: 1, resource: smt.depth.createView() }] });
     const tp = enc.beginRenderPass({ colorAttachments: [{ view: target.createView(), loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
     tp.setPipeline(this.streamPipeline);
     tp.setBindGroup(0, this.streamBind);
+    tp.setBindGroup(1, streamMb);
     tp.draw(3);
     tp.end();
     const bpr = Math.ceil(width * 4 / 256) * 256;
@@ -1485,10 +1750,41 @@ var ImageField = class {
   unit;
   stepMm;
   box;
+  normScale = 1;
+  // r8unorm samples return raw/255; clim is packed /normScale so shader math is unchanged
+  dims;
   constructor(dev, data, dims, spacing, lut, opts) {
+    this.dims = dims;
     const center = opts.center ?? [0, 0, 0];
-    this.volTex = dev.createTexture({ size: dims, dimension: "3d", format: "r32float", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
-    dev.queue.writeTexture({ texture: this.volTex }, data, { bytesPerRow: dims[0] * 4, rowsPerImage: dims[1] }, dims);
+    let src = data, fmt = "r32float", bpe = 4;
+    this.normScale = 1;
+    if (data instanceof Uint8Array) {
+      fmt = "r8unorm";
+      bpe = 1;
+      this.normScale = 255;
+    } else if (data instanceof Uint16Array) {
+      src = Float32Array.from(data);
+      fmt = "r32float";
+      bpe = 4;
+    }
+    this.volTex = dev.createTexture({ size: dims, dimension: "3d", format: fmt, usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+    {
+      const bytesPerRow = dims[0] * bpe, rowsPerImage = dims[1], sliceBytes = bytesPerRow * rowsPerImage;
+      const CHUNK = 256 * 1024 * 1024;
+      const slab = Math.max(1, Math.min(dims[2], Math.floor(CHUNK / Math.max(1, sliceBytes))));
+      const u8 = new Uint8Array(src.buffer, src.byteOffset, src.byteLength);
+      for (let z = 0; z < dims[2]; z += slab) {
+        const depth = Math.min(slab, dims[2] - z);
+        const slabBytes = depth * sliceBytes;
+        const slabData = u8.slice(z * sliceBytes, z * sliceBytes + slabBytes);
+        dev.queue.writeTexture(
+          { texture: this.volTex, origin: { x: 0, y: 0, z } },
+          slabData,
+          { offset: 0, bytesPerRow, rowsPerImage },
+          [dims[0], dims[1], depth]
+        );
+      }
+    }
     this.lutTex = dev.createTexture({ size: [256, 1], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
     dev.queue.writeTexture({ texture: this.lutTex }, lut, { bytesPerRow: 256 * 4 }, [256, 1]);
     if (opts.ijkToRAS) {
@@ -1510,6 +1806,19 @@ var ImageField = class {
   setLUT(lut) {
     this.dev.queue.writeTexture({ texture: this.lutTex }, lut, { bytesPerRow: 256 * 4 }, [256, 1]);
   }
+  /** The scalar range the LUT spans — window/level for the volume rendering. Re-packed into
+   *  the material uniform on the next syncUniforms()/render, so no pipeline rebuild. */
+  setClim(lo, hi) {
+    this.clim = [lo, hi];
+  }
+  getClim() {
+    return [this.clim[0], this.clim[1]];
+  }
+  /** Phong shading tuple [ka, kd, ks, shininess] — re-packed into the material uniform next
+   *  render (VR presets carry their own lighting). [1,0,0,1] = flat emission (no shading). */
+  setShade(shade) {
+    this.shade = [shade[0], shade[1], shade[2], shade[3]];
+  }
   origP2t;
   // sampling matrix + box at identity, for setWorldTransform
   origBox;
@@ -1526,6 +1835,17 @@ var ImageField = class {
   /** The r32float 3D scalar texture (e.g. to share with a SliceRenderer for MPR). */
   volumeTexture() {
     return this.volTex;
+  }
+  /** r8unorm volumes sample /255, so clim is packed /normScale in the shader; a slice plane sharing this
+   *  texture must use the same factor. 1 for f32 volumes. */
+  normScaleOf() {
+    return this.normScale;
+  }
+  /** Free this field's GPU textures (call when replacing it, e.g. a low-res proxy upgraded to full,
+   *  or an LRU-evicted specimen) so VRAM isn't leaked across a menu of large volumes. */
+  destroy() {
+    this.volTex.destroy();
+    this.lutTex.destroy();
   }
   /** Centre of the volume in world (RAS) at identity — a natural pivot for a transform widget. */
   worldCenter() {
@@ -1546,6 +1866,12 @@ var ImageField = class {
   /** RAS(patient) -> texture[0,1] matrix (encodes the real ijkToRAS geometry). */
   patientToTexture() {
     return this.p2t;
+  }
+  /** Re-place the volume in RAS without re-uploading voxels (a parent transform moved it). */
+  setIjkToRAS(ijkToRAS) {
+    this.p2t = patientToTextureFromIjkToRAS(ijkToRAS, this.dims);
+    this.box = volumeAABBFromIjkToRAS(ijkToRAS, this.dims);
+    this.stepMm = Math.min(...spacingFromIjkToRAS(ijkToRAS));
   }
   structMembers(s) {
     return [
@@ -1610,8 +1936,8 @@ fn sample_field_img${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
   }
   fillUniforms(out, off) {
     out.set(this.p2t, off);
-    out[off + 16] = this.clim[0];
-    out[off + 17] = this.clim[1];
+    out[off + 16] = this.clim[0] / this.normScale;
+    out[off + 17] = this.clim[1] / this.normScale;
     out[off + 20] = this.shade[0];
     out[off + 21] = this.shade[1];
     out[off + 22] = this.shade[2];
@@ -1643,13 +1969,19 @@ async function inflateDeflate(buf) {
   const ds = new DecompressionStream("deflate");
   return await new Response(new Response(buf).body.pipeThrough(ds)).arrayBuffer();
 }
+var blobFetch = (url) => fetch(url);
 async function fetchZarrVolume(blobBase, z, onBytes, concurrency = 12) {
+  const zv = await fetchZarrVolumeNative(blobBase, z, onBytes, concurrency);
+  const data = zv.data instanceof Float32Array ? zv.data : Float32Array.from(zv.data);
+  return { data, dims: zv.dims, range: zv.range };
+}
+async function fetchZarrVolumeNative(blobBase, z, onBytes, concurrency = 12) {
   const Ctor = ZDT[z.dtype] ?? Int16Array;
   const [nz, ny, nx] = z.shape, [cz, cy, cx] = z.chunks, [ncz, ncy, ncx] = z.chunkGrid;
   const hashes = z.chunkHashes;
   const posBase = blobBase + z.dir + "/" + z.dataset + "/";
   const chunkUrl = (kk, jj, ii) => hashes ? blobBase + hashes[kk + "." + jj + "." + ii] : posBase + kk + "." + jj + "." + ii;
-  const out = new Float32Array(nz * ny * nx);
+  const out = new Ctor(nz * ny * nx);
   let lo = Infinity, hi = -Infinity;
   const jobs = [];
   for (let kk = 0; kk < ncz; kk++) for (let jj = 0; jj < ncy; jj++) for (let ii = 0; ii < ncx; ii++) jobs.push([kk, jj, ii]);
@@ -1657,8 +1989,30 @@ async function fetchZarrVolume(blobBase, z, onBytes, concurrency = 12) {
   const worker = async () => {
     while (idx < jobs.length) {
       const [kk, jj, ii] = jobs[idx++];
-      const gz = await (await fetch(chunkUrl(kk, jj, ii))).arrayBuffer();
-      onBytes?.(gz.byteLength);
+      const resp = await blobFetch(chunkUrl(kk, jj, ii));
+      let gz;
+      if (resp.body && onBytes) {
+        const parts = [];
+        const rd = resp.body.getReader();
+        let total = 0;
+        for (; ; ) {
+          const { done, value } = await rd.read();
+          if (done) break;
+          parts.push(value);
+          total += value.byteLength;
+          onBytes(value.byteLength);
+        }
+        const all = new Uint8Array(total);
+        let o = 0;
+        for (const p of parts) {
+          all.set(p, o);
+          o += p.byteLength;
+        }
+        gz = all.buffer;
+      } else {
+        gz = await resp.arrayBuffer();
+        onBytes?.(gz.byteLength);
+      }
       const chunk = new Ctor(await inflateDeflate(gz));
       const z0 = kk * cz, y0 = jj * cy, x0 = ii * cx;
       const zw = Math.min(cz, nz - z0), yw = Math.min(cy, ny - y0), xw = Math.min(cx, nx - x0);
@@ -1677,7 +2031,7 @@ async function fetchZarrVolume(blobBase, z, onBytes, concurrency = 12) {
     }
   };
   await Promise.all(Array.from({ length: Math.min(concurrency, jobs.length) }, worker));
-  return { data: out, dims: [nx, ny, nz], range: [lo, hi] };
+  return { data: out, dtype: z.dtype, dims: [nx, ny, nz], range: [lo, hi] };
 }
 
 // render/mrson.ts
@@ -2216,12 +2570,24 @@ function attachCameraControls(canvas, camera, opts = {}) {
   canvas.addEventListener("touchmove", (e) => e.preventDefault(), { passive: false });
   const pointers = /* @__PURE__ */ new Map();
   let pinch = null;
+  let triple = null;
+  const centroid = () => {
+    let mx = 0, my = 0;
+    for (const p of pointers.values()) {
+      mx += p.x;
+      my += p.y;
+    }
+    const n = pointers.size || 1;
+    return { mx: mx / n, my: my / n };
+  };
   const pinchState = () => {
     const [a, b] = [...pointers.values()];
     return { dist: Math.hypot(b.x - a.x, b.y - a.y), mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 };
   };
+  const on = () => opts.enabled?.() ?? true;
   canvas.addEventListener("contextmenu", (e) => e.preventDefault());
   canvas.addEventListener("pointerdown", (e) => {
+    if (!on()) return;
     const { x, y } = local(e);
     pointers.set(e.pointerId, { x, y });
     canvas.setPointerCapture(e.pointerId);
@@ -2231,12 +2597,26 @@ function attachCameraControls(canvas, camera, opts = {}) {
     } else if (pointers.size === 2) {
       interactor.end();
       pinch = pinchState();
+    } else if (pointers.size === 3) {
+      pinch = null;
+      const c = centroid();
+      triple = { mx: c.mx, my: c.my };
+      opts.onVolumeDragStart?.();
     }
   });
   const endPointer = (e) => {
     if (!pointers.delete(e.pointerId)) return;
+    if (!on()) {
+      interactor.end();
+      pinch = null;
+      return;
+    }
     canvas.releasePointerCapture?.(e.pointerId);
     if (pointers.size < 2) pinch = null;
+    if (pointers.size < 3 && triple) {
+      triple = null;
+      opts.onVolumeDragEnd?.();
+    }
     if (pointers.size === 1) {
       const p = [...pointers.values()][0];
       interactor.start(0, p.x, p.y, canvas.clientHeight, { shift: false, ctrl: false, alt: false });
@@ -2247,10 +2627,16 @@ function attachCameraControls(canvas, camera, opts = {}) {
   canvas.addEventListener("pointerup", endPointer);
   canvas.addEventListener("pointercancel", endPointer);
   canvas.addEventListener("pointermove", (e) => {
+    if (!on()) return;
     if (!pointers.has(e.pointerId)) return;
     const { x, y } = local(e);
     pointers.set(e.pointerId, { x, y });
-    if (pointers.size >= 2) {
+    if (pointers.size >= 3) {
+      const c = centroid();
+      if (triple) opts.onVolumeDrag?.(c.mx - triple.mx, c.my - triple.my);
+      return;
+    }
+    if (pointers.size === 2) {
       const p = pinchState();
       if (pinch) {
         if (p.dist > 0 && pinch.dist > 0) camera.dolly(p.dist / pinch.dist);
@@ -2263,6 +2649,7 @@ function attachCameraControls(canvas, camera, opts = {}) {
     }
   });
   canvas.addEventListener("wheel", (e) => {
+    if (!on()) return;
     e.preventDefault();
     interactor.wheel(e.deltaY < 0);
     opts.onLog?.("cameraWheel", { deltaY: e.deltaY, distance: camera.distance });
@@ -2321,11 +2708,13 @@ function attachWidgetControls(canvas, camera, opts) {
     const { x, y, rw, rh } = cursorCss(e);
     const { w, h } = opts.getSize();
     const { vp } = camMatrices(camera, w, h);
+    const touch = e.pointerType === "touch";
     let best = null, bestD = Infinity;
     for (const hnd of opts.getHandles()) {
       const s = project(vp, hnd.world, rw, rh);
       if (!s) continue;
-      const d = Math.hypot(s.x - x, s.y - y), r = hnd.pickPx ?? 16;
+      const r = (hnd.pickPx ?? 16) * (touch ? 2.75 : 1);
+      const d = Math.hypot(s.x - x, s.y - y);
       if (d < r && d < bestD) {
         bestD = d;
         best = hnd;
@@ -2333,22 +2722,44 @@ function attachWidgetControls(canvas, camera, opts) {
     }
     return best;
   };
-  let grabbed = null, hovered = null;
+  let grabbed = null, hovered = null, grabbedId = -1;
+  const release = (pointerId) => {
+    if (!grabbed) return;
+    const g = grabbed;
+    grabbed = null;
+    grabbedId = -1;
+    try {
+      canvas.releasePointerCapture(pointerId);
+    } catch {
+    }
+    window.removeEventListener("pointermove", onMove, true);
+    window.removeEventListener("pointerup", onUp, true);
+    window.removeEventListener("pointercancel", onCancel, true);
+    canvas.style.cursor = "";
+    opts.onDragEnd?.(g);
+  };
   const onDown = (e) => {
     if (e.button !== 0) return;
+    if (grabbed) {
+      release(e.pointerId);
+      return;
+    }
+    if (e.isPrimary === false) return;
     const h = pick(e);
     if (!h) return;
     e.stopPropagation();
     e.preventDefault();
     grabbed = h;
+    grabbedId = e.pointerId;
     canvas.setPointerCapture(e.pointerId);
     canvas.style.cursor = h.cursor ? h.cursor : "grabbing";
     opts.onDragStart?.(h);
     window.addEventListener("pointermove", onMove, true);
     window.addEventListener("pointerup", onUp, true);
+    window.addEventListener("pointercancel", onCancel, true);
   };
   const onMove = (e) => {
-    if (!grabbed) return;
+    if (!grabbed || e.pointerId !== grabbedId) return;
     e.stopPropagation();
     const { x, y, rw, rh } = cursorCss(e);
     const { w, h } = opts.getSize();
@@ -2358,17 +2769,12 @@ function attachWidgetControls(canvas, camera, opts) {
     opts.onChange?.();
   };
   const onUp = (e) => {
-    if (!grabbed) return;
+    if (!grabbed || e.pointerId !== grabbedId) return;
     e.stopPropagation();
-    const g = grabbed;
-    grabbed = null;
-    try {
-      canvas.releasePointerCapture(e.pointerId);
-    } catch {
-    }
-    window.removeEventListener("pointermove", onMove, true);
-    window.removeEventListener("pointerup", onUp, true);
-    opts.onDragEnd?.(g);
+    release(e.pointerId);
+  };
+  const onCancel = (e) => {
+    if (grabbed && e.pointerId === grabbedId) release(e.pointerId);
   };
   const onHoverMove = (e) => {
     if (grabbed) return;
@@ -2388,6 +2794,7 @@ function attachWidgetControls(canvas, camera, opts) {
       canvas.removeEventListener("pointermove", onHoverMove);
       window.removeEventListener("pointermove", onMove, true);
       window.removeEventListener("pointerup", onUp, true);
+      window.removeEventListener("pointercancel", onCancel, true);
     }
   };
 }
@@ -2395,6 +2802,9 @@ function attachWidgetControls(canvas, camera, opts) {
 // render/budget-controller.ts
 var BudgetController = class {
   budgetPx;
+  /** Mutable so a demo can expose it: a viewer who would rather have detail than frame rate raises
+   *  the target frame time, and the loop then keeps a bigger fraction of the native resolution while
+   *  interacting instead of downsampling into aliasing. */
   targetMs;
   minPx;
   maxPx;
@@ -2537,13 +2947,51 @@ function mountAdaptive3d(opts) {
   return { draw, budget, renderSettled, renderMoving, loop };
 }
 
+// render/selftest.ts
+var checks = /* @__PURE__ */ new Map();
+async function runSelfTests(filter) {
+  const details = [];
+  for (const [name, fn] of checks) {
+    if (filter && !(typeof filter === "string" ? name.includes(filter) : filter.test(name))) continue;
+    const t0 = performance.now();
+    try {
+      await fn();
+      details.push({ name, ok: true, ms: Math.round(performance.now() - t0) });
+    } catch (e) {
+      details.push({ name, ok: false, ms: Math.round(performance.now() - t0), detail: String(e?.message ?? e).slice(0, 300) });
+    }
+  }
+  return { pass: details.filter((d) => d.ok).length, fail: details.filter((d) => !d.ok).length, details };
+}
+
 // render/introspect.ts
 var LOG_MAX = 500;
 function installIntrospection(api) {
   const log = [];
+  const waiters = [];
+  let usesFrames = false;
   const hook = {
     ...api,
     ready: true,
+    frameCount: 0,
+    frameRendered() {
+      usesFrames = true;
+      hook.frameCount++;
+      const w = waiters.splice(0);
+      for (const r of w) r();
+    },
+    idle(timeoutMs = 1e4) {
+      if (!usesFrames) return Promise.resolve();
+      return new Promise((resolve) => {
+        const t = setTimeout(resolve, timeoutMs);
+        waiters.push(() => waiters.push(() => {
+          clearTimeout(t);
+          resolve();
+        }));
+        api.render?.();
+      });
+    },
+    selfTest: (filter) => runSelfTests(filter),
     log,
     logEvent(kind, detail = {}) {
       log.push({ t: Math.round(performance.now()), kind, detail });

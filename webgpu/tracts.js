@@ -1344,11 +1344,6 @@ var FiberField = class {
   aoDensityScale;
   aoDirs;
   aoSteps;
-  motionAmp = 0;
-  // 0 = no band at all (the default, and what every other demo gets)
-  motionWavelength;
-  motionSpeed;
-  motionTime = 0;
   haloStrength;
   haloWidth;
   constructor(dev, strands, opts = {}) {
@@ -1360,8 +1355,6 @@ var FiberField = class {
     this.aoDensityScale = opts.aoDensityScale ?? 0.08;
     this.aoDirs = Math.max(1, Math.round(opts.aoDirections ?? 5));
     this.aoSteps = Math.max(1, Math.round(opts.aoSteps ?? 3));
-    this.motionWavelength = opts.motionWavelengthMm ?? 30;
-    this.motionSpeed = opts.motionSpeedMmPerS ?? 35;
     this.haloStrength = Math.max(0, opts.haloStrength ?? 0);
     this.haloWidth = opts.haloWidthMm ?? 0.5;
     this.clippable = opts.clippable ?? true;
@@ -1381,23 +1374,16 @@ var FiberField = class {
       if (y > hi[1]) hi[1] = y;
       if (z > hi[2]) hi[2] = z;
     };
-    let n = 0, used = 0, strandIndex = 0;
+    let n = 0, used = 0;
     for (const s of strands) {
       const P = s.points, m = Math.floor(P.length / 3);
-      strandIndex++;
       if (m < 2) continue;
       const bundle = Math.min(PAL - 1, Math.max(1, Math.round(s.bundle ?? 1)));
       const first = n;
-      const animate = s.flow === true;
-      let h = Math.imul(strandIndex ^ 2654435769, 2246822507) >>> 0;
-      h ^= h >>> 13;
-      const phase = animate ? h / 4294967296 * 997 : 0;
-      let arc = 0;
       let ax = P[0], ay = P[1], az = P[2];
       for (let i = 1; i < m; i++) {
         const bx = P[i * 3], by = P[i * 3 + 1], bz = P[i * 3 + 2];
-        const len = Math.hypot(bx - ax, by - ay, bz - az);
-        if (len < 1e-6) continue;
+        if (Math.hypot(bx - ax, by - ay, bz - az) < 1e-6) continue;
         const o = n * 8;
         seg[o] = ax;
         seg[o + 1] = ay;
@@ -1405,16 +1391,15 @@ var FiberField = class {
         seg[o + 4] = bx;
         seg[o + 5] = by;
         seg[o + 6] = bz;
-        seg[o + 7] = animate ? arc + phase : -1;
+        seg[o + 7] = bundle;
         grow(ax, ay, az);
         grow(bx, by, bz);
         ax = bx;
         ay = by;
         az = bz;
-        arc += len;
         n++;
       }
-      for (let j = first; j < n; j++) seg[j * 8 + 3] = bundle * 4 + ((j > first ? 1 : 0) | (j < n - 1 ? 2 : 0));
+      for (let j = first; j < n; j++) seg[j * 8 + 3] = (j > first ? 1 : 0) | (j < n - 1 ? 2 : 0);
       if (n > first) used++;
     }
     if (n === 0) {
@@ -1511,15 +1496,6 @@ var FiberField = class {
     if (radiusMm !== void 0) this.aoRadiusMm = radiusMm;
     if (densityScale !== void 0) this.aoDensityScale = densityScale;
   }
-  /** SCHEMATIC flow band along streamlines built with `flow: true`. `amplitude` is a peak brightening
-   *  (0 = off; ~0.12 reads as motion without competing with the shading that conveys 3D form), and
-   *  `timeS` advances it — hold it fixed for a static directional cue that survives a screenshot.
-   *  Brightness only: modulating opacity would read as travelling changes in fibre density, which is
-   *  a false data impression. */
-  setMotion(amplitude, timeS) {
-    this.motionAmp = Math.max(0, amplitude);
-    this.motionTime = timeS;
-  }
   /** Phong constants [ka, kd, ks, shininess], live (uniform-resident — no rebuild), so a demo can
    *  tune how bright the tubes read without rebuilding the grid. */
   setShade(shade) {
@@ -1544,9 +1520,9 @@ var FiberField = class {
     this.uBuf.destroy();
   }
   uniformFloats() {
-    return 28;
+    return 24;
   }
-  // lo + dims + hi + shade + params + motion + halo, 4 each
+  // lo + dims + hi + shade + params + halo, 4 each
   aabb() {
     return [this.lo, this.hi];
   }
@@ -1567,8 +1543,6 @@ var FiberField = class {
       // ka, kd, ks, shininess
       `  fib${s}_params : vec4<f32>,`,
       // opacity, ao strength, ao radius mm, ao density scale
-      `  fib${s}_motion : vec4<f32>,`,
-      // band amplitude, wavelength mm, speed mm/s, time s
       `  fib${s}_halo : vec4<f32>,`
       // halo strength, halo width mm, _, _
     ].join("\n");
@@ -1767,14 +1741,13 @@ fn sample_field_fib${s}(wp_world : vec3<f32>, rd : vec3<f32>, seg : f32) -> vec4
       let ba = B.xyz - A.xyz;
       let y = dot(q - A.xyz, ba) / dot(ba, ba);
       // Keep only crossings on the strand's capsule-UNION surface (see the header).
-      let packed = u32(A.w + 0.5);
-      let flags = packed & 3u;
+      let flags = u32(A.w + 0.5);
       if ((flags & 2u) != 0u) {
         if (y >= 1.0) { continue; }
         if (fib_dseg${s}(q, B.xyz, fib${s}_f[${PAL + 1}u + 2u * (si + 1u)].xyz) < r * 0.9999) { continue; }
       }
       if ((flags & 1u) != 0u && fib_dseg${s}(q, fib${s}_f[${PAL}u + 2u * (si - 1u)].xyz, A.xyz) < r * 0.9999) { continue; }
-      let pal = fib${s}_f[packed >> 2u];
+      let pal = fib${s}_f[u32(B.w + 0.5)];
       let op = clamp(pal.a * fop, 0.0, 1.0);
       if (op <= 0.0) { continue; }
       // Headlight Phong on the analytic tube normal.
@@ -1783,25 +1756,7 @@ fn sample_field_fib${s}(wp_world : vec3<f32>, rd : vec3<f32>, seg : f32) -> vec4
       let refl = normalize(2.0 * ldn * nrm + rd);
       let rdv = max(dot(refl, -rd), 0.0);
       let ao = fib_ao${s}(q, nrm, r);
-      // SCHEMATIC flow band: a comet-shaped brightening travelling along the tube's own arclength,
-      // only on streamlines whose tract has a real anatomical direction (B.w >= 0). Asymmetric, so a
-      // still frame still reads directionally. Faded out where the tube is thinner than a pixel \u2014 a
-      // moving band on sub-pixel geometry scintillates.
-      var band = 0.0;
-      let amp = u_material.fib${s}_motion.x;
-      if (amp > 0.0 && B.w >= 0.0) {
-        let lam = max(u_material.fib${s}_motion.y, 1e-3);
-        let sAt = B.w + dot(q - A.xyz, ba / max(length(ba), 1e-6));
-        let u = fract((sAt - u_material.fib${s}_motion.z * u_material.fib${s}_motion.w) / lam);
-        let comet = smoothstep(0.0, 0.06, u) * (1.0 - smoothstep(0.06, 0.30, u));
-        // Soften \u2014 do not erase \u2014 where the tube is thin on screen. These tubes are SUB-PIXEL at
-        // whole-brain framing (0.175 mm at ~570 mm is ~0.8 px wide), so the usual "fade out below a
-        // pixel" guard would switch the band off exactly where the demo lives. Fading to a floor
-        // instead keeps it visible, and the rolling accumulation absorbs the residual scintillation.
-        let widthPx = 2.0 * r * u_cam.size.z / max(length(u_cam.eye.xyz - q), 1e-3);
-        band = comet * amp * mix(0.4, 1.0, smoothstep(0.3, 1.2, widthPx));
-      }
-      let lit = pal.rgb * ((ka + kd * ldn) * ao + band) + vec3<f32>(ks * pow(rdv, sh));
+      let lit = pal.rgb * ((ka + kd * ldn) * ao) + vec3<f32>(ks * pow(rdv, sh));
       let col = srgb2physical(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)));
       var j = min(nh, ${MAX_HITS - 1});       // insertion, nearest first (the farthest drops off)
       loop {
@@ -1844,61 +1799,10 @@ fn sample_field_fib${s}(wp_world : vec3<f32>, rd : vec3<f32>, seg : f32) -> vec4
     out[off + 17] = this.aoStrength;
     out[off + 18] = this.aoRadiusMm;
     out[off + 19] = this.aoDensityScale;
-    out[off + 20] = this.motionAmp;
-    out[off + 21] = this.motionWavelength;
-    out[off + 22] = this.motionSpeed;
-    out[off + 23] = this.motionTime;
-    out[off + 24] = this.haloStrength;
-    out[off + 25] = this.haloWidth;
+    out[off + 20] = this.haloStrength;
+    out[off + 21] = this.haloWidth;
   }
 };
-
-// render/demos/tract-direction.ts
-var FLOW = {
-  // --- Genuinely polarized projection systems -------------------------------------------------
-  CST: { mode: "polarized", axis: [0, 0, -1], note: "descending motor output, cortex \u2192 brainstem/cord" },
-  SF: { mode: "polarized", radial: "inward", note: "corticostriatal: cortex \u2192 striatum (the name reads the other way)" },
-  SP: { mode: "polarized", radial: "inward", note: "corticostriatal: cortex \u2192 striatum" },
-  SO: { mode: "polarized", radial: "inward", note: "corticostriatal: cortex \u2192 striatum" },
-  // --- Cerebellar afferent systems ------------------------------------------------------------
-  MCP: { mode: "polarized", radial: "lateral", note: "pontocerebellar afferents, pons \u2192 cerebellum" },
-  ICP: { mode: "polarized", axis: [0, 0, 1], note: "spino-/olivo-/vestibulocerebellar afferents (carries some efferents too)" },
-  CPC: { mode: "polarized", axis: [0, 0, -1], note: "cortex \u2192 pons \u2192 cerebellum; crosses a synapse at the pontine nuclei" },
-  // --- Conventional reading, labelled as such -------------------------------------------------
-  TF: { mode: "convention", radial: "outward", note: "thalamus \u2192 cortex relay direction; corticothalamic axons outnumber it ~10:1" },
-  TP: { mode: "convention", radial: "outward", note: "thalamus \u2192 cortex relay direction; corticothalamic axons outnumber it ~10:1" },
-  TO: { mode: "convention", radial: "outward", note: "thalamus \u2192 cortex relay direction; corticothalamic axons outnumber it ~10:1" },
-  TT: { mode: "convention", radial: "outward", note: "thalamus \u2192 cortex relay direction; corticothalamic axons outnumber it ~10:1" }
-  // Everything else — association (AF, CB, EC, EmC, ILF, IOFF, MdLF, SLF-I/II/III, UF), commissural
-  // (CC1-7), corona radiata (CR-F, CR-P), PLIC, superficial U-fibres and the intracerebellar tracts
-  // — is reciprocal, mixed, or unresolvable, and is left undirected on purpose.
-};
-function flowFor(bundleName) {
-  const m = /\(([^)]+)\)\s*$/.exec(bundleName.trim());
-  const abbr = m ? m[1] : "";
-  return FLOW[abbr] ?? { mode: "none" };
-}
-function orientation(flow, first, last, centre, minSepMm = 10) {
-  if (flow.mode === "none") return 0;
-  const d = [last[0] - first[0], last[1] - first[1], last[2] - first[2]];
-  let axis;
-  if (flow.axis) {
-    axis = flow.axis;
-  } else {
-    const mid = [(first[0] + last[0]) / 2, (first[1] + last[1]) / 2, (first[2] + last[2]) / 2];
-    const out = [mid[0] - centre[0], mid[1] - centre[1], mid[2] - centre[2]];
-    if (flow.radial === "lateral") {
-      axis = [Math.sign(out[0]) || 1, 0, 0];
-    } else {
-      const l = Math.hypot(out[0], out[1], out[2]) || 1;
-      const unit = [out[0] / l, out[1] / l, out[2] / l];
-      axis = flow.radial === "inward" ? [-unit[0], -unit[1], -unit[2]] : unit;
-    }
-  }
-  const proj = d[0] * axis[0] + d[1] * axis[1] + d[2] * axis[2];
-  if (Math.abs(proj) < minSepMm) return 0;
-  return proj > 0 ? 1 : -1;
-}
 
 // render/demos/tracts-scene.ts
 function meanColor(colors) {
@@ -1947,8 +1851,6 @@ var TractScene = class _TractScene {
   bytesFetched = 0;
   strandCount = 0;
   capsuleCount = 0;
-  /** Streamlines carrying a defensible anatomical direction (the only ones ever animated). */
-  flowStrands = 0;
   dev;
   root;
   tubeRadius;
@@ -2036,14 +1938,6 @@ var TractScene = class _TractScene {
     for (let bi = 0; bi < this.chunks.length; bi++) {
       for (let ci = need; ci < this.chunks[bi].length; ci++) this.chunks[bi][ci] = void 0;
     }
-    this.flowStrands = 0;
-    for (const perBundle of this.chunks) {
-      for (const chunk of perBundle) {
-        if (chunk) {
-          for (const s of chunk) if (s.flow) this.flowStrands++;
-        }
-      }
-    }
     this.fraction = need * (this.manifest.chunkFraction || 0.05);
     this.rebuild();
   }
@@ -2067,36 +1961,10 @@ var TractScene = class _TractScene {
       pts[i * 3 + 1] = q[i * 3 + 1] * scale2 + origin[1];
       pts[i * 3 + 2] = q[i * 3 + 2] * scale2 + origin[2];
     }
-    const flow = flowFor(b.name);
     const strands = [];
     for (let l = 0; l < lineCount; l++) {
       const a = offsets[l], c = offsets[l + 1];
-      if (c - a < 2) continue;
-      let line = pts.subarray(a * 3, c * 3);
-      let animate = false;
-      if (flow.mode !== "none") {
-        const np = c - a;
-        const sign = orientation(
-          flow,
-          [line[0], line[1], line[2]],
-          [line[(np - 1) * 3], line[(np - 1) * 3 + 1], line[(np - 1) * 3 + 2]],
-          this.center
-        );
-        if (sign !== 0) {
-          animate = true;
-          if (sign < 0) {
-            const rev = new Float32Array(np * 3);
-            for (let k = 0; k < np; k++) {
-              rev[k * 3] = line[(np - 1 - k) * 3];
-              rev[k * 3 + 1] = line[(np - 1 - k) * 3 + 1];
-              rev[k * 3 + 2] = line[(np - 1 - k) * 3 + 2];
-            }
-            line = rev;
-          }
-        }
-      }
-      if (animate) this.flowStrands++;
-      strands.push({ points: line, bundle: bi + 1, flow: animate });
+      if (c - a >= 2) strands.push({ points: pts.subarray(a * 3, c * 3), bundle: bi + 1 });
     }
     this.chunks[bi][ci] = strands;
   }
@@ -2572,6 +2440,9 @@ function framedCamera(center, radius, distMul = 2.6) {
 // render/budget-controller.ts
 var BudgetController = class {
   budgetPx;
+  /** Mutable so a demo can expose it: a viewer who would rather have detail than frame rate raises
+   *  the target frame time, and the loop then keeps a bigger fraction of the native resolution while
+   *  interacting instead of downsampling into aliasing. */
   targetMs;
   minPx;
   maxPx;
@@ -3124,30 +2995,40 @@ function installChrome(opts) {
     pop.style.transform = "translateY(-6px)";
   };
   let pinned = false;
+  let startOpen = false;
   logo.onmouseenter = () => {
     logo.style.transform = "scale(1.08)";
     show();
   };
   logo.onclick = () => {
+    startOpen = false;
     pinned = !pinned;
     pinned ? show() : hide();
   };
   logo.onmouseleave = () => {
     logo.style.transform = "scale(1)";
-    if (!pinned) setTimeout(() => {
+    if (!pinned && !startOpen) setTimeout(() => {
       if (!pop.matches(":hover") && !pinned) hide();
     }, 120);
   };
   pop.onmouseleave = () => {
+    startOpen = false;
     if (!pinned) hide();
   };
   const onDocDown = (e) => {
     const t = e.target;
     if (logo.contains(t) || pop.contains(t)) return;
+    if (startOpen) return;
     pinned = false;
     hide();
   };
   document.addEventListener("pointerdown", onDocDown, true);
+  if (opts.openOnLoad ?? true) {
+    startOpen = true;
+    requestAnimationFrame(() => {
+      if (startOpen) show();
+    });
+  }
   const destroy = () => {
     document.removeEventListener("pointerdown", onDocDown, true);
     globalThis.removeEventListener("resize", place);
@@ -3311,7 +3192,11 @@ async function main() {
     view: () => ctx.getCurrentTexture().createView({ format: srgb }),
     size: () => ({ w: canvas.width, h: canvas.height }),
     setCamera: (s, w, h) => s.setCamera(camera.position, camera.focalPoint, camera.viewUp, camera.viewAngle, w, h),
-    gpu
+    gpu,
+    // 10 fps rather than the usual 60: dense tracts downsampled hard to hold a high frame rate alias
+    // badly while rotating (thin tubes scintillating), and detail matters more here than smoothness.
+    // The Target fps slider below moves this at runtime.
+    targetMs: 100
   });
   let tuned = null;
   const showStatus = () => status(
@@ -3360,56 +3245,7 @@ async function main() {
     userMoved = true;
     a3d.draw();
   } });
-  const MOTION_AMPLITUDE = 0.3;
-  const reduceMotion = globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
-  let motionMode = "off";
-  let motionRaf = 0, motionT0 = 0;
-  const badge = document.createElement("div");
-  badge.textContent = "Schematic direction \u2014 not measured";
-  badge.style.cssText = "position:absolute;left:14px;top:14px;z-index:6;display:none;padding:5px 10px;border-radius:7px;font:600 11px -apple-system,system-ui,sans-serif;letter-spacing:.2px;color:#ffe9a8;background:rgba(60,44,10,.78);border:1px solid rgba(255,210,90,.45);backdrop-filter:blur(8px);";
-  canvas.parentElement?.appendChild(badge);
-  const motionTick = () => {
-    motionRaf = requestAnimationFrame(motionTick);
-    sc.fibers.setMotion(MOTION_AMPLITUDE, (performance.now() - motionT0) / 1e3);
-    scene.syncUniforms();
-    a3d.renderSettled(false);
-  };
-  const setMotionMode = (m) => {
-    motionMode = reduceMotion && m === "animated" ? "static" : m;
-    cancelAnimationFrame(motionRaf);
-    motionRaf = 0;
-    badge.style.display = motionMode === "off" ? "none" : "block";
-    if (motionMode === "off") {
-      sc.fibers.setMotion(0, 0);
-      scene.accumWindow = Infinity;
-      scene.syncUniforms();
-      a3d.renderSettled(true);
-    } else if (motionMode === "static") {
-      sc.fibers.setMotion(MOTION_AMPLITUDE, 0);
-      scene.accumWindow = Infinity;
-      scene.syncUniforms();
-      a3d.renderSettled(true);
-    } else {
-      scene.accumWindow = 6;
-      motionT0 = performance.now();
-      scene.resetAccumulation();
-      motionTick();
-    }
-    showStatus();
-  };
-  const directional = sc.manifest.bundles.filter((b) => flowFor(b.name).mode !== "none");
   installChrome({
-    selects: [{
-      label: "Direction",
-      section: "Tracts",
-      options: [
-        { value: "off", label: "off" },
-        { value: "static", label: "static" },
-        { value: "animated", label: reduceMotion ? "animated (reduced)" : "animated" }
-      ],
-      get: () => motionMode,
-      set: (v) => setMotionMode(v)
-    }],
     controls: [
       {
         label: "Streamlines",
@@ -3425,6 +3261,22 @@ async function main() {
             timer = setTimeout(() => applyFraction(target), 350);
           },
           format: (v) => `${Math.round(v)}%`
+        }
+      },
+      {
+        label: "Target fps",
+        section: "Rendering",
+        slider: {
+          min: 1,
+          max: 60,
+          step: 1,
+          get: () => Math.round(1e3 / a3d.budget.targetMs),
+          // Lower target = more time per frame = a bigger share of the native resolution kept while
+          // rotating. The budget loop re-converges within a few frames either way.
+          set: (v) => {
+            a3d.budget.targetMs = 1e3 / Math.max(1, Math.min(60, v));
+          },
+          format: (v) => `${Math.round(v)} fps`
         }
       },
       {
@@ -3474,8 +3326,7 @@ async function main() {
       ["Left-drag", "Rotate"],
       ["Right-drag / wheel", "Zoom"],
       ["Middle / Shift+Left-drag", "Pan"],
-      ["SlicerLive badge", "Streamline % + per-group opacity + direction"],
-      ["Direction", `Schematic only \u2014 diffusion MRI measures fibre orientation, not the direction of signal travel, and cannot tell afferent from efferent. Shown for the ${directional.length} tracts with a textbook direction (corticospinal, corticostriatal, thalamic radiations, cerebellar peduncles); reciprocal tracts \u2014 association, callosal, corona radiata, PLIC, superficial \u2014 are never animated.`]
+      ["SlicerLive badge", "Streamline % + target fps + depth cues + per-group opacity"]
     ] }],
     onChange: () => a3d.draw()
   });
@@ -3511,12 +3362,6 @@ async function main() {
     loadMs: () => loadMs,
     bytes: () => sc.bytesFetched,
     fraction: () => sc.fraction,
-    motionMode: () => motionMode,
-    setMotionMode: (m) => {
-      setMotionMode(m);
-      return { mode: motionMode, flowStrands: sc.flowStrands };
-    },
-    flowStrands: () => sc.flowStrands,
     setFraction: async (p) => {
       target = p;
       await applyFraction(p);

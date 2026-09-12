@@ -45,6 +45,21 @@ function perspectiveZO(fovy, aspect, near, far) {
   m[14] = far * near / (near - far);
   return m;
 }
+function perspectiveZOTile(fovy, viewW, viewH, x, y, w, h, near, far) {
+  const t = near * Math.tan(fovy / 2), b = -t;
+  const r = t * (viewW / viewH), l = -r;
+  const l2 = l + (r - l) * x / viewW, r2 = l + (r - l) * (x + w) / viewW;
+  const t2 = t - (t - b) * y / viewH, b2 = t - (t - b) * (y + h) / viewH;
+  const m = new Float32Array(16);
+  m[0] = 2 * near / (r2 - l2);
+  m[5] = 2 * near / (t2 - b2);
+  m[8] = (r2 + l2) / (r2 - l2);
+  m[9] = (t2 + b2) / (t2 - b2);
+  m[10] = far / (near - far);
+  m[11] = -1;
+  m[14] = far * near / (near - far);
+  return m;
+}
 function lookAt(eye, center, up) {
   let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
   let zl = Math.hypot(zx, zy, zz) || 1;
@@ -167,7 +182,121 @@ function spacingFromIjkToRAS(ijkToRAS) {
 var DEFAULT_FORMAT = "rgba8unorm-srgb";
 var SCENE_FLOATS = 16;
 var CLIP_FLOATS = 36;
+var MESH_WGSL = (
+  /* wgsl */
+  `
+struct MU { view_proj : mat4x4<f32>, eye : vec4<f32>, color : vec4<f32> };
+@group(0) @binding(0) var<uniform> mu : MU;
+struct VO { @builtin(position) pos : vec4<f32>, @location(0) wp : vec3<f32> };
+@vertex fn vs_mesh(@location(0) p : vec3<f32>) -> VO { var o : VO; o.pos = mu.view_proj * vec4<f32>(p, 1.0); o.wp = p; return o; }
+struct FO { @location(0) col : vec4<f32>, @location(1) depth : vec4<f32> };
+@fragment fn fs_mesh(i : VO) -> FO {
+  let n = normalize(cross(dpdx(i.wp), dpdy(i.wp)));       // flat face normal (no normals on the wire)
+  let l = normalize(mu.eye.xyz - i.wp);                   // headlight
+  let lam = 0.25 + 0.75 * abs(dot(n, l));
+  let a = mu.color.a;
+  var o : FO;
+  o.col = vec4<f32>(mu.color.rgb * lam * a, a);           // premultiplied
+  o.depth = vec4<f32>(distance(mu.eye.xyz, i.wp), 0.0, 0.0, 1.0);
+  return o;
+}`
+);
 var SceneRenderer = class _SceneRenderer {
+  // ── surface meshes (models): rasterised before each trace into colour+depth targets the march composites ──
+  meshPipeline;
+  gpuMeshes = [];
+  meshTargetsBySize = /* @__PURE__ */ new Map();
+  viewProj = new Float32Array(16);
+  eyePos = [0, 0, 0];
+  /** Replace the surface meshes (world/RAS float32 xyz + uint32 triangles, colour, opacity). */
+  setMeshes(meshes) {
+    for (const m of this.gpuMeshes) {
+      m.vbuf.destroy();
+      m.ibuf.destroy();
+      m.ubuf.destroy();
+    }
+    this.gpuMeshes = meshes.filter((m) => m.indices.length >= 3).map((m) => {
+      const vbuf = this.dev.createBuffer({ size: Math.ceil(m.positions.byteLength / 4) * 4, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+      this.dev.queue.writeBuffer(vbuf, 0, m.positions);
+      const ibuf = this.dev.createBuffer({ size: Math.ceil(m.indices.byteLength / 4) * 4, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
+      this.dev.queue.writeBuffer(ibuf, 0, m.indices);
+      const ubuf = this.dev.createBuffer({ size: 24 * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      return { vbuf, ibuf, count: m.indices.length, ubuf, color: m.color, opacity: m.opacity };
+    });
+  }
+  hasMeshes() {
+    return this.gpuMeshes.length > 0;
+  }
+  ensureMeshPipeline() {
+    if (this.meshPipeline) return;
+    const mod = this.dev.createShaderModule({ code: MESH_WGSL });
+    this.meshPipeline = this.dev.createRenderPipeline({
+      layout: "auto",
+      vertex: { module: mod, entryPoint: "vs_mesh", buffers: [{ arrayStride: 12, attributes: [{ shaderLocation: 0, offset: 0, format: "float32x3" }] }] },
+      fragment: { module: mod, entryPoint: "fs_mesh", targets: [{ format: "rgba16float" }, { format: "r32float" }] },
+      primitive: { topology: "triangle-list", cullMode: "none" },
+      depthStencil: { format: "depth24plus", depthWriteEnabled: true, depthCompare: "less" }
+    });
+  }
+  /** Colour/depth targets (+ the group-1 bind group of the trace pipeline) for a given trace size. */
+  meshTargets(w, h) {
+    const key = w + "x" + h;
+    let t = this.meshTargetsBySize.get(key);
+    if (!t) {
+      if (this.meshTargetsBySize.size > 4) {
+        for (const old of this.meshTargetsBySize.values()) {
+          old.col.destroy();
+          old.depth.destroy();
+          old.z.destroy();
+        }
+        this.meshTargetsBySize.clear();
+      }
+      t = {
+        w,
+        h,
+        col: this.dev.createTexture({ size: [w, h], format: "rgba16float", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING }),
+        depth: this.dev.createTexture({ size: [w, h], format: "r32float", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING }),
+        z: this.dev.createTexture({ size: [w, h], format: "depth24plus", usage: GPUTextureUsage.RENDER_ATTACHMENT })
+      };
+      this.meshTargetsBySize.set(key, t);
+    }
+    if (!t.bind) t.bind = this.dev.createBindGroup({ layout: this.pipeline.getBindGroupLayout(1), entries: [{ binding: 0, resource: t.col.createView() }, { binding: 1, resource: t.depth.createView() }] });
+    return t;
+  }
+  /** Rasterise the meshes for this frame's trace size; returns the bind group the trace pass needs. */
+  meshPass(enc, w, h) {
+    const t = this.meshTargets(w, h);
+    const pass = enc.beginRenderPass({
+      colorAttachments: [
+        { view: t.col.createView(), loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } },
+        { view: t.depth.createView(), loadOp: "clear", storeOp: "store", clearValue: { r: 1e30, g: 0, b: 0, a: 1 } }
+      ],
+      depthStencilAttachment: { view: t.z.createView(), depthClearValue: 1, depthLoadOp: "clear", depthStoreOp: "store" }
+    });
+    if (this.gpuMeshes.length) {
+      this.ensureMeshPipeline();
+      pass.setPipeline(this.meshPipeline);
+      for (const m of this.gpuMeshes) {
+        const u = new Float32Array(24);
+        u.set(this.viewProj, 0);
+        u[16] = this.eyePos[0];
+        u[17] = this.eyePos[1];
+        u[18] = this.eyePos[2];
+        u[19] = 1;
+        u[20] = m.color[0];
+        u[21] = m.color[1];
+        u[22] = m.color[2];
+        u[23] = m.opacity;
+        this.dev.queue.writeBuffer(m.ubuf, 0, u);
+        pass.setBindGroup(0, this.dev.createBindGroup({ layout: this.meshPipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: m.ubuf } }] }));
+        pass.setVertexBuffer(0, m.vbuf);
+        pass.setIndexBuffer(m.ibuf, "uint32");
+        pass.drawIndexed(m.count);
+      }
+    }
+    pass.end();
+    return t.bind;
+  }
   dev;
   format;
   placed = [];
@@ -465,9 +594,11 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
     this.dev.queue.writeBuffer(this.superresBuf, 0, new Float32Array([renderW, renderH, viewW, viewH]));
     this.dev.queue.writeBuffer(this.resolveBgBuf, 0, this.mat.subarray(12, 16));
     const enc = this.dev.createCommandEncoder();
+    const mb2 = this.meshPass(enc, renderW, renderH);
     const tp = enc.beginRenderPass({ colorAttachments: [{ view: this.lowView, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
     tp.setPipeline(this.pipeline);
     tp.setBindGroup(0, this.bind);
+    tp.setBindGroup(1, mb2);
     tp.draw(3);
     tp.end();
     const sp = enc.beginRenderPass({ colorAttachments: [{ view, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }] });
@@ -479,9 +610,11 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
   }
   /** Encode trace (producer) + resolve (reconstructor) into `enc`, output to `outView`. */
   encodeFrame(enc, outView) {
+    const mb2 = this.meshPass(enc, this.traceW, this.traceH);
     const tp = enc.beginRenderPass({ colorAttachments: [{ view: this.traceView, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
     tp.setPipeline(this.pipeline);
     tp.setBindGroup(0, this.bind);
+    tp.setBindGroup(1, mb2);
     tp.draw(3);
     tp.end();
     const rp = enc.beginRenderPass({ colorAttachments: [{ view: outView, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }] });
@@ -519,6 +652,11 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
   resetAccumulation() {
     this.accumN = 0;
   }
+  /** ROLLING accumulation for scenes whose content keeps changing (an animation): each frame blends
+   *  in with weight 1/min(n, accumWindow) — an exponential window of ~accumWindow frames instead of
+   *  the running mean — so static content still converges toward jittered temporal AA while moving
+   *  content keeps a short trail rather than smearing. Infinity (default) = the running mean. */
+  accumWindow = Infinity;
   /** Frames accumulated since the last reset (0 before the first accumulated frame). */
   accumCount() {
     return this.accumN;
@@ -551,12 +689,14 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
     }
     this.dev.queue.writeBuffer(this.camBuf, 76, new Float32Array([n - 1]));
     this.flush();
-    this.dev.queue.writeBuffer(this.accumUniformBuf, 0, new Float32Array([this.mat[12], this.mat[13], this.mat[14], 1 / n]));
+    this.dev.queue.writeBuffer(this.accumUniformBuf, 0, new Float32Array([this.mat[12], this.mat[13], this.mat[14], 1 / Math.min(n, this.accumWindow)]));
     const prev = this.accumPing, next = 1 - this.accumPing;
     const enc = this.dev.createCommandEncoder();
+    const mb2 = this.meshPass(enc, width, height);
     const tp = enc.beginRenderPass({ colorAttachments: [{ view: this.traceView, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
     tp.setPipeline(this.pipeline);
     tp.setBindGroup(0, this.bind);
+    tp.setBindGroup(1, mb2);
     tp.draw(3);
     tp.end();
     const ap = enc.beginRenderPass({ colorAttachments: [
@@ -586,6 +726,7 @@ fn fs_resolve(v : RV) -> @location(0) vec4<f32> {
     this.pickOff = uoff + CLIP_FLOATS;
     this.mat = new Float32Array(uoff + CLIP_FLOATS + 12);
     this.matBuf = this.dev.createBuffer({ size: (uoff + CLIP_FLOATS + 12) * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    for (const t of this.meshTargetsBySize.values()) t.bind = void 0;
     const module = this.dev.createShaderModule({ code: this.wgsl() });
     this.pipeline = this.dev.createRenderPipeline({
       layout: "auto",
@@ -645,21 +786,25 @@ fn skip_${p.field.kind}${p.slot}(wp : vec3<f32>) -> f32 {
     const ghostFields = receivers.filter((p) => p.field.ghost);
     const normalReceivers = receivers.filter((p) => !p.field.ghost);
     const clipGuard = (p, expr) => p.field.clippable === false ? expr : `if (!clipped) { ${expr} }`;
-    const sampleInto = (nm, ghost) => ghost ? `let c = sample_field_${nm}(wp, rd); if (c.a > g_op) { g_op = c.a; g_col = c.rgb / max(c.a, 1e-4); }` : `let c = sample_field_${nm}(wp, rd); sum += c;`;
+    const args = (p) => p.field.intervalSampling ? `wp, rd, s_here - last_${p.field.kind}${p.slot}` : "wp, rd";
+    const advance = (p) => p.field.intervalSampling ? ` last_${p.field.kind}${p.slot} = s_here;` : "";
+    const sampleInto = (p, ghost) => {
+      const call = `sample_field_${p.field.kind}${p.slot}(${args(p)})`;
+      return ghost ? `let c = ${call}; if (c.a > g_op) { g_op = c.a; g_col = c.rgb / max(c.a, 1e-4); }` : `let c = ${call}; sum += c;`;
+    };
     const skipBranch = (p, clip, ghost = false) => {
       const nm = `${p.field.kind}${p.slot}`;
-      const smp = sampleInto(nm, ghost);
+      const smp = sampleInto(p, ghost);
       return `    if (t >= resume_${nm}) {
       let d_${nm} = max(skip_${nm}(wp) - step, 0.0);
       if (d_${nm} > 0.0) { resume_${nm} = t + d_${nm}; }
-      else { ${clip ? clipGuard(p, smp) : smp} }
+      else { ${clip ? clipGuard(p, smp) : smp}${advance(p)} }
     }
     if (t < resume_${nm}) { jump_t = min(jump_t, resume_${nm}); } else { all_defer = false; }`;
     };
     const plainBranch = (p, clip, ghost = false) => {
-      const nm = `${p.field.kind}${p.slot}`;
-      const smp = sampleInto(nm, ghost);
-      return `    { ${clip ? clipGuard(p, smp) : smp} all_defer = false; }`;
+      const smp = sampleInto(p, ghost);
+      return `    { ${clip ? clipGuard(p, smp) : smp}${advance(p)} all_defer = false; }`;
     };
     const normalSkippers = normalReceivers.filter((p) => !p.field.transform).filter((p) => _SceneRenderer.boxSkip || p.field.providesSkip && p.field.skipWGSL);
     const ghostSkippers = ghostFields.filter((p) => p.field.providesSkip && p.field.skipWGSL);
@@ -671,6 +816,7 @@ fn skip_${p.field.kind}${p.slot}(wp : vec3<f32>) -> f32 {
     ].join("\n");
     const fns = [modFns, tpFns, fieldFns, skipFns].filter((s) => s.trim()).join("\n");
     const skipInit = [...normalSkippers, ...ghostSkippers].map((p) => `  var resume_${p.field.kind}${p.slot} : f32 = -1.0e30;`).join("\n");
+    const intervalInit = receivers.filter((p) => p.field.intervalSampling).map((p) => `  var last_${p.field.kind}${p.slot} : f32 = max(t_near - step, 0.0);`).join("\n");
     const dispatch = normalReceivers.map(
       (p) => canSkip.has(p.field) ? skipBranch(p, true) : plainBranch(p, true)
     ).join("\n");
@@ -679,7 +825,7 @@ fn skip_${p.field.kind}${p.slot}(wp : vec3<f32>) -> f32 {
     ).join("\n");
     const hasGhost = ghostFields.length > 0;
     const pickDispatch = normalReceivers.map(
-      (p) => `    ${clipGuard(p, `{ let c = sample_field_${p.field.kind}${p.slot}(wp, rd); sum += c; }`)}`
+      (p) => `    ${clipGuard(p, `{ let c = sample_field_${p.field.kind}${p.slot}(wp, rd${p.field.intervalSampling ? ", step" : ""}); sum += c; }`)}`
     ).join("\n");
     return (
       /* wgsl */
@@ -699,6 +845,11 @@ ${members}
 };
 @group(0) @binding(0) var<uniform> u_cam : Camera;
 @group(0) @binding(1) var<uniform> u_material : Material;
+// Rasterised surface meshes (models): nearest-surface colour (premultiplied) + its distance along the
+// ray, produced by the mesh pass before each trace. The march composites the surface at that depth,
+// so volumes in front occlude it and it occludes what is behind \u2014 the depth-composite seam.
+@group(1) @binding(0) var t_mesh_col : texture_2d<f32>;
+@group(1) @binding(1) var t_mesh_depth : texture_2d<f32>;
 ${this.usesSampler() ? "@group(0) @binding(2) var s_lin : sampler;" : ""}
 ${decls}
 
@@ -732,18 +883,23 @@ fn fs_trace(v : Varyings) -> @location(0) vec4<f32> {
   let ro = ndc_to_world(vec4<f32>(ndc_x, ndc_y, 0.0, 1.0));
   let rd = normalize(ndc_to_world(vec4<f32>(ndc_x, ndc_y, 1.0, 1.0)) - ro);
 
+  let mpix = vec2<i32>(v.position.xy);
+  let mesh_c = textureLoad(t_mesh_col, mpix, 0);          // premultiplied surface colour (0 = no mesh)
+  let mesh_t = textureLoad(t_mesh_depth, mpix, 0).r;      // distance along the ray (1e30 = none)
+  var mesh_done = mesh_c.a <= 0.0;
+
   let inv = vec3<f32>(1.0) / rd;
   let tb = (u_material.bmin.xyz - ro) * inv;
   let tt = (u_material.bmax.xyz - ro) * inv;
   let tmn = min(tt, tb); let tmx = max(tt, tb);
   var t_near = max(max(tmn.x, tmn.y), tmn.z);
   var t_far  = min(min(tmx.x, tmx.y), tmx.z);
-  if (t_far <= t_near || t_far <= 0.0) { return vec4<f32>(0.0); }
+  if (t_far <= t_near || t_far <= 0.0) { return mesh_c; }
 
   let step = max(u_material.scene.x, 1e-3);
   t_near = max(t_near + step, 0.0);
   t_far  = t_far - step;
-  if (t_far <= t_near) { return vec4<f32>(0.0); }
+  if (t_far <= t_near) { return mesh_c; }
   let seed = ign(v.position.xy);
   var t = t_near;
   var integrated = vec4<f32>(0.0);
@@ -754,6 +910,7 @@ fn fs_trace(v : Varyings) -> @location(0) vec4<f32> {
   var g_op = 0.0;          // ghost (handle) surface: max opacity along the ray (0.5 inactive /
   var g_col = vec3<f32>(0.0);  // 1.0 active) and its colour \u2014 tracked, never accumulated.
 ${skipInit}
+${intervalInit}
   loop {
     if (t >= t_far || safety >= 5000${hasGhost ? "" : " || integrated.a >= 0.99"}) { break; }
     // Per-(pixel, step, ACCUM FRAME) ray-offset jitter. The frame term (u_cam.size.w, the
@@ -773,7 +930,12 @@ ${skipInit}
     // At size.w = 0 this is exactly jbase, so the first accumulated frame stays byte-identical
     // to a plain renderToView \u2014 the property render/test baselines depend on.
     let js = fract(jbase + u_cam.size.w * 0.6180339887) - 0.5;
-    let wp = ro + rd * (t + js * step);
+    if (!mesh_done && t + 0.5 * step >= mesh_t) {         // the ray reaches the surface: composite it here
+      integrated = integrated + (1.0 - integrated.a) * mesh_c;
+      mesh_done = true;
+    }
+    let s_here = t + js * step;   // ray distance of this (jittered) sample
+    let wp = ro + rd * s_here;
     var sum = vec4<f32>(0.0);
     var all_defer = true;        // every field guarantees emptiness here -> we may leap
     var jump_t = 1.0e30;         // nearest field horizon
@@ -794,6 +956,7 @@ ${ghostDispatch}
     if (all_defer && jump_t > t + step) { t = jump_t; } else { t = t + step; }
     safety = safety + 1;
   }
+  if (!mesh_done) { integrated = integrated + (1.0 - integrated.a) * mesh_c; }   // surface beyond the slab
   // GHOST x-ray, applied ONCE (never compounding): the volume IN FRONT of a handle is shown
   // at residual = 1 - handle_opacity (50% for an inactive handle at opacity 0.5, 0% for an
   // active/hovered handle at opacity 1.0), then the handle (colour g_col at opacity g_op)
@@ -947,7 +1110,7 @@ ${pickDispatch}
    *  anyway fails validation and the whole view silently renders nothing. Emit the sampler
    *  declaration and its bind entry under the SAME condition so the two can't drift. */
   usesSampler() {
-    return this.placed.some((p) => p.field.bindingCount > 0);
+    return this.placed.some((p) => p.field.usesSampler ?? p.field.bindingCount > 0);
   }
   bindGroupEntries() {
     const entries = [
@@ -963,12 +1126,37 @@ ${pickDispatch}
     const proj = perspectiveZO(fovyDeg * Math.PI / 180, width / height, 1, 1e5);
     const invVP = invert(multiply(proj, view));
     this.baseInvVP = invVP;
+    this.viewProj = multiply(proj, view);
+    this.eyePos = eye;
     const cam = new Float32Array(24);
     cam.set(invVP, 0);
     this.focalPx = height / 2 / Math.tan(fovyDeg * Math.PI / 360);
     cam[16] = width;
     cam[17] = height;
     cam[18] = height / 2 / Math.tan(fovyDeg * Math.PI / 360);
+    cam[19] = 0;
+    cam[20] = eye[0];
+    cam[21] = eye[1];
+    cam[22] = eye[2];
+    this.dev.queue.writeBuffer(this.camBuf, 0, cam);
+  }
+  /** Camera for ONE TILE of the view: the same rays the full frame would cast for `rect`, into a
+   *  rect.w×rect.h target. Screen-space glyph sizing stays keyed to the FULL view height, so a
+   *  patch of the gizmo is drawn at exactly the size the full frame drew it. Pair with
+   *  traceSamples(rect.w, rect.h) — its focal rewrite is then a no-op. */
+  setCameraTile(eye, center, up, fovyDeg, viewW, viewH, rect) {
+    const view = lookAt(eye, center, up);
+    const proj = perspectiveZOTile(fovyDeg * Math.PI / 180, viewW, viewH, rect.x, rect.y, rect.w, rect.h, 1, 1e5);
+    const invVP = invert(multiply(proj, view));
+    this.baseInvVP = invVP;
+    this.viewProj = multiply(proj, view);
+    this.eyePos = eye;
+    const cam = new Float32Array(24);
+    cam.set(invVP, 0);
+    this.focalPx = viewH / 2 / Math.tan(fovyDeg * Math.PI / 360);
+    cam[16] = rect.w;
+    cam[17] = rect.h;
+    cam[18] = this.focalPx;
     cam[19] = 0;
     cam[20] = eye[0];
     cam[21] = eye[1];
@@ -1068,12 +1256,14 @@ ${pickDispatch}
     const samples = [];
     for (let i = 0; i < iters; i++) {
       const enc = this.dev.createCommandEncoder();
+      const mb2 = this.meshPass(enc, width, height);
       const pass = enc.beginRenderPass({
         colorAttachments: [{ view, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
         timestampWrites: { querySet: qs, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 }
       });
       pass.setPipeline(this.pipeline);
       pass.setBindGroup(0, this.bind);
+      pass.setBindGroup(1, mb2);
       pass.draw(3);
       pass.end();
       enc.resolveQuerySet(qs, 0, 2, resolve, 0);
@@ -1117,13 +1307,19 @@ ${pickDispatch}
    *  background) as tightly-packed rgba8 — the bytes streamed to the remote client, which runs the
    *  same reconstruction (upsample + background composite) the local resolve does. The caller sets
    *  the camera to width×height first (like renderUpscaled). Returns width*height*4 bytes. */
-  async traceSamples(width, height) {
+  async traceSamples(width, height, viewH = height) {
     this.flush();
+    this.dev.queue.writeBuffer(this.camBuf, 64, new Float32Array([width, height]));
+    this.dev.queue.writeBuffer(this.camBuf, 72, new Float32Array([this.focalPx * (viewH / height)]));
     const target = this.dev.createTexture({ size: [width, height], format: "rgba8unorm", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
     const enc = this.dev.createCommandEncoder();
+    this.meshPass(enc, width, height);
+    const smt = this.meshTargets(width, height);
+    const streamMb = this.dev.createBindGroup({ layout: this.streamPipeline.getBindGroupLayout(1), entries: [{ binding: 0, resource: smt.col.createView() }, { binding: 1, resource: smt.depth.createView() }] });
     const tp = enc.beginRenderPass({ colorAttachments: [{ view: target.createView(), loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }] });
     tp.setPipeline(this.streamPipeline);
     tp.setBindGroup(0, this.streamBind);
+    tp.setBindGroup(1, streamMb);
     tp.draw(3);
     tp.end();
     const bpr = Math.ceil(width * 4 / 256) * 256;
@@ -1152,7 +1348,13 @@ struct U {
   uvec : vec4<f32>,      // RAS vector spanning the view width  (isotropic mm)
   vvec : vec4<f32>,      // RAS vector spanning the view height (isotropic mm)
   params : vec4<f32>,    // win, lev, fillOpacity, outlineOpacity
-  size : vec4<f32>,      // sizeX, sizeY, labelOverlayMode, _
+  size : vec4<f32>,      // sizeX, sizeY, labelOverlayMode, bgLutMode (0 gray, 1 LUT row 0)
+  // \u2500\u2500 Slicer slice-composite layers (vtkMRMLSliceCompositeNode): a FOREGROUND volume blended over the
+  //    background with its own geometry, W/L and LUT, and a LABEL volume coloured through a colour table.
+  p2tFg : mat4x4<f32>,   // RAS -> foreground texture[0,1]
+  fgParams : vec4<f32>,  // win, lev, opacity (0 = no foreground), compositing (0 alpha,1 reverse alpha,2 add,3 subtract)
+  p2tLabel : mat4x4<f32>,// RAS -> label texture[0,1]
+  labelParams : vec4<f32>, // opacity (0 = no label layer), lutEntries, fgLutMode (0 gray, 1 LUT row 1), _
 };
 @group(0) @binding(0) var<uniform> u : U;
 @group(0) @binding(1) var s_lin : sampler;
@@ -1165,6 +1367,10 @@ struct U {
 // is 55 MB and, because it shares the palette, hiding an organ group in 3D hides it here too.
 @group(0) @binding(5) var t_labels : texture_3d<u32>;
 @group(0) @binding(6) var t_palette : texture_2d<f32>;
+@group(0) @binding(7) var t_fg : texture_3d<f32>;       // foreground scalar volume
+@group(0) @binding(8) var t_lut : texture_2d<f32>;      // 256x2 colour LUTs: row 0 background, row 1 foreground (sampled over the W/L ramp)
+@group(0) @binding(9) var t_labelVol : texture_3d<f32>; // label volume (integer values stored as float)
+@group(0) @binding(10) var t_labelLut : texture_2d<f32>;// Nx1 colour table indexed by label value
 
 struct V { @builtin(position) position : vec4<f32> };
 @vertex
@@ -1204,6 +1410,36 @@ fn fs_main(v : V) -> @location(0) vec4<f32> {
   let win = max(u.params.x, 1e-6);
   let g = clamp((val - (u.params.y - win * 0.5)) / win, 0.0, 1.0);
   var col = vec3<f32>(g);
+  if (u.size.w > 0.5) { col = textureLoad(t_lut, vec2<i32>(i32(g * 255.0), 0), 0).rgb; }
+  // \u2500\u2500 foreground layer (Slicer's vtkImageBlend semantics per compositing mode) \u2500\u2500
+  if (u.fgParams.z > 0.0) {
+    let tf = (u.p2tFg * vec4<f32>(ras, 1.0)).xyz;
+    if (all(tf >= vec3<f32>(0.0)) && all(tf <= vec3<f32>(1.0))) {
+      let fv = textureSampleLevel(t_fg, s_lin, tf, 0.0).r;
+      let fwin = max(u.fgParams.x, 1e-6);
+      let fg = clamp((fv - (u.fgParams.y - fwin * 0.5)) / fwin, 0.0, 1.0);
+      var fcol = vec3<f32>(fg);
+      if (u.labelParams.z > 0.5) { fcol = textureLoad(t_lut, vec2<i32>(i32(fg * 255.0), 1), 0).rgb; }
+      let a = u.fgParams.z;
+      let mode = i32(u.fgParams.w + 0.5);
+      if (mode == 0) { col = mix(col, fcol, a); }                       // alpha: fg over bg
+      else if (mode == 1) { col = mix(fcol, col, a); }                  // reverse alpha: bg over fg
+      else if (mode == 2) { col = clamp(col + fcol * a, vec3<f32>(0.0), vec3<f32>(1.0)); }   // add
+      else { col = clamp(col - fcol * a, vec3<f32>(0.0), vec3<f32>(1.0)); }                   // subtract
+    }
+  }
+  // \u2500\u2500 label layer: integer label -> colour table entry, blended at labelOpacity (label 0 = transparent) \u2500\u2500
+  if (u.labelParams.x > 0.0) {
+    let tl = (u.p2tLabel * vec4<f32>(ras, 1.0)).xyz;
+    if (all(tl >= vec3<f32>(0.0)) && all(tl <= vec3<f32>(1.0))) {
+      let lv = i32(textureSampleLevel(t_labelVol, s_nn, tl, 0.0).r + 0.5);
+      let nEntries = i32(u.labelParams.y);
+      if (lv > 0 && lv < nEntries) {
+        let lc = textureLoad(t_labelLut, vec2<i32>(lv, 0), 0);
+        col = mix(col, lc.rgb, clamp(lc.a * u.labelParams.x, 0.0, 1.0));
+      }
+    }
+  }
   let ov = ov_tex(tex);
   // Slicer-style 2D segmentation: a semi-transparent per-voxel FILL plus a brighter boundary
   // OUTLINE, with independent opacities (params.z = fill, params.w = outline). The outline is
@@ -1226,10 +1462,11 @@ fn fs_main(v : V) -> @location(0) vec4<f32> {
 `
 );
 var BASES = {
-  axial: { uDir: [-1, 0, 0], vDir: [0, 1, 0], uAxis: 0, vAxis: 1, nAxis: 2 },
-  coronal: { uDir: [-1, 0, 0], vDir: [0, 0, 1], uAxis: 0, vAxis: 2, nAxis: 1 },
-  sagittal: { uDir: [0, -1, 0], vDir: [0, 0, 1], uAxis: 1, vAxis: 2, nAxis: 0 }
+  axial: { uDir: [-1, 0, 0], vDir: [0, 1, 0], nDir: [0, 0, 1] },
+  coronal: { uDir: [-1, 0, 0], vDir: [0, 0, 1], nDir: [0, 1, 0] },
+  sagittal: { uDir: [0, -1, 0], vDir: [0, 0, 1], nDir: [1, 0, 0] }
 };
+var dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 function ijkAxisForRasAxis(ijkToRAS, rasAxis) {
   let best = 0, bestMag = -1;
   for (let c = 0; c < 3; c++) {
@@ -1243,7 +1480,8 @@ function ijkAxisForRasAxis(ijkToRAS, rasAxis) {
 }
 function slicerDefaultOffset01(orient, dims, ijkToRAS, rasLo2, rasHi2) {
   const b = BASES[orient];
-  const n = b.nAxis;
+  const nAbs = b.nDir.map(Math.abs);
+  const n = nAbs[0] >= nAbs[1] && nAbs[0] >= nAbs[2] ? 0 : nAbs[1] >= nAbs[2] ? 1 : 2;
   const a = ijkAxisForRasAxis(ijkToRAS, n);
   const m = Math.floor((dims[a] - 1) / 2);
   const ijk = [(dims[0] - 1) / 2, (dims[1] - 1) / 2, (dims[2] - 1) / 2];
@@ -1259,13 +1497,27 @@ var SliceRenderer = class {
   sampler;
   nnSampler;
   ubuf;
-  u = new Float32Array(36);
-  // p2t(16) + origin(4) + uvec(4) + vvec(4) + params(4) + size(4)
+  u = new Float32Array(80);
+  // p2t(16) origin(4) uvec(4) vvec(4) params(4) size(4) | p2tFg(16) fgParams(4) p2tLabel(16) labelParams(4)
   bind;
+  // Adaptive downsample (moving frames): render the reslice into a low-res target, then bilinear-blit
+  // it up to the view — the 2D analogue of SceneRenderer.renderUpscaled. Lets a slice cell degrade
+  // resolution under load to keep interactive latency low, snapping back to native when settled.
+  blitPipeline;
+  lowTex;
+  lowView;
+  lowW = 0;
+  lowH = 0;
+  blitBind;
   overlay;
   labels;
   palette;
   scalarTex;
+  fgTex;
+  lutTex;
+  // 256x2 rgba8: row 0 bg LUT, row 1 fg LUT
+  labelVolTex;
+  labelLutTex;
   // actual in-plane extents (mm) spanned by the LAST rendered viewport, aspect-corrected so
   // pixels stay isotropic on a non-square view (0 until first render → fall back to the square span).
   uSpanMm = 0;
@@ -1285,6 +1537,9 @@ var SliceRenderer = class {
   };
   cX = [0, 0, 0];
   // in-plane centre of the LAST rendered frame (for viewToTex picking)
+  // Optional per-orientation basis override (reslice along a volume's own axes). null = the
+  // anatomical preset.
+  basisOverride = {};
   constructor(gpu2, format = DEFAULT_FORMAT2) {
     this.dev = gpu2.device;
     this.format = format;
@@ -1319,6 +1574,72 @@ var SliceRenderer = class {
     }
     return this.emptyPalette;
   }
+  emptyScalar;
+  noScalar() {
+    if (!this.emptyScalar) {
+      this.emptyScalar = this.dev.createTexture({ size: [1, 1, 1], dimension: "3d", format: "r32float", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+      this.dev.queue.writeTexture({ texture: this.emptyScalar }, new Float32Array(1), { bytesPerRow: 4, rowsPerImage: 1 }, [1, 1, 1]);
+    }
+    return this.emptyScalar;
+  }
+  emptyLut;
+  noLut() {
+    if (!this.emptyLut) {
+      this.emptyLut = this.dev.createTexture({ size: [256, 2], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+      this.dev.queue.writeTexture({ texture: this.emptyLut }, new Uint8Array(256 * 2 * 4), { bytesPerRow: 256 * 4 }, [256, 2]);
+    }
+    return this.emptyLut;
+  }
+  /** Foreground layer: a second scalar volume with its own RAS->texture mapping, W/L, opacity and
+   *  compositing mode (Slicer's slice composite node). Pass null to remove. */
+  setForeground(tex, p2t, win, lev, opacity, compositing = 0) {
+    this.fgTex = tex ?? void 0;
+    if (p2t) this.u.set(p2t, 36);
+    this.u[52] = win;
+    this.u[53] = lev;
+    this.u[54] = tex ? opacity : 0;
+    this.u[55] = compositing;
+    if (this.scalarTex) this.rebind();
+  }
+  /** Colour LUTs over the W/L ramp for the background (row 0) and foreground (row 1): 256 rgba8 entries
+   *  each, or null for the grayscale ramp. */
+  setLayerLUTs(bg, fg) {
+    if (!bg && !fg) {
+      this.lutTex = void 0;
+      this.u[35] = 0;
+      this.u[58] = 0;
+      if (this.scalarTex) this.rebind();
+      return;
+    }
+    if (!this.lutTex) this.lutTex = this.dev.createTexture({ size: [256, 2], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+    const gray = new Uint8Array(256 * 4);
+    for (let i = 0; i < 256; i++) {
+      gray[i * 4] = gray[i * 4 + 1] = gray[i * 4 + 2] = i;
+      gray[i * 4 + 3] = 255;
+    }
+    this.dev.queue.writeTexture({ texture: this.lutTex, origin: [0, 0] }, bg ?? gray, { bytesPerRow: 256 * 4 }, [256, 1]);
+    this.dev.queue.writeTexture({ texture: this.lutTex, origin: [0, 1] }, fg ?? gray, { bytesPerRow: 256 * 4 }, [256, 1]);
+    this.u[35] = bg ? 1 : 0;
+    this.u[58] = fg ? 1 : 0;
+    if (this.scalarTex) this.rebind();
+  }
+  /** Label layer: a label volume (integer values in a float texture) coloured through a colour table
+   *  (rgba8 entries, index = label value), blended at `opacity`. Pass null to remove. */
+  setLabelLayer(tex, p2t, table, opacity) {
+    this.labelVolTex = tex ?? void 0;
+    if (p2t) this.u.set(p2t, 60);
+    const n = table ? table.length / 4 : 0;
+    if (table && n > 0) {
+      if (!this.labelLutTex || this.labelLutTex.width !== n) {
+        this.labelLutTex?.destroy();
+        this.labelLutTex = this.dev.createTexture({ size: [n, 1], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+      }
+      this.dev.queue.writeTexture({ texture: this.labelLutTex }, table, { bytesPerRow: n * 4 }, [n, 1]);
+    }
+    this.u[76] = tex && table ? opacity : 0;
+    this.u[77] = n;
+    if (this.scalarTex) this.rebind();
+  }
   emptyOverlay;
   transparentOverlay() {
     if (!this.emptyOverlay) {
@@ -1326,6 +1647,40 @@ var SliceRenderer = class {
       this.dev.queue.writeTexture({ texture: this.emptyOverlay }, new Uint16Array(4), { bytesPerRow: 8, rowsPerImage: 1 }, [1, 1, 1]);
     }
     return this.emptyOverlay;
+  }
+  /** Reslice this orientation along an arbitrary RAS basis instead of the anatomical preset.
+   *  Pass null to restore. The vectors should be unit length and mutually orthogonal; they are
+   *  used verbatim, so the caller owns the display convention for a non-anatomical frame. */
+  setBasis(orient, basis) {
+    this.basisOverride[orient] = basis;
+  }
+  /** offset01 (the setPlane scrub coordinate) for a RAS point, along the plane's current normal — the
+   *  inverse of what setPlane does internally, so a caller holding a position in mm (a slice node's
+   *  centre, a crosshair) can address the same slice for anatomical AND oblique bases. */
+  offset01Along(orient, ras) {
+    const n = this.basisOf(orient).nDir;
+    const { lo, hi } = this.extentAlong(n);
+    return Math.max(0, Math.min(1, (dot3(ras, n) - lo) / Math.max(hi - lo, 1e-6)));
+  }
+  basisOf(orient) {
+    return this.basisOverride[orient] ?? BASES[orient];
+  }
+  /** Extent of the volume's RAS bounding box projected onto a direction — the generalisation
+   *  of "rasHi[axis] - rasLo[axis]" to an oblique axis. Reduces to exactly that for the
+   *  anatomical bases, since projecting an axis-aligned box on its own axis is the axis span. */
+  extentAlong(d) {
+    let lo = Infinity, hi = -Infinity;
+    for (let i = 0; i < 8; i++) {
+      const c = [
+        i & 1 ? this.rasHi[0] : this.rasLo[0],
+        i & 2 ? this.rasHi[1] : this.rasLo[1],
+        i & 4 ? this.rasHi[2] : this.rasLo[2]
+      ];
+      const t = dot3(c, d);
+      if (t < lo) lo = t;
+      if (t > hi) hi = t;
+    }
+    return { lo, hi };
   }
   /** Volume geometry: patientToTexture (RAS->tex[0,1], encodes ijkToRAS) + the RAS
    *  bounding box (for plane extents/scrub range). Get both from the ImageField. */
@@ -1363,7 +1718,11 @@ var SliceRenderer = class {
         { binding: 3, resource: (this.overlay ?? this.transparentOverlay()).createView() },
         { binding: 4, resource: this.nnSampler },
         { binding: 5, resource: (this.labels ?? this.noLabels()).createView() },
-        { binding: 6, resource: (this.palette ?? this.noPalette()).createView() }
+        { binding: 6, resource: (this.palette ?? this.noPalette()).createView() },
+        { binding: 7, resource: (this.fgTex ?? this.noScalar()).createView() },
+        { binding: 8, resource: (this.lutTex ?? this.noLut()).createView() },
+        { binding: 9, resource: (this.labelVolTex ?? this.noScalar()).createView() },
+        { binding: 10, resource: (this.labelLutTex ?? this.noPalette()).createView() }
       ]
     });
   }
@@ -1395,10 +1754,9 @@ var SliceRenderer = class {
    *  Slicer: Red FOV=[891.78,256] at viewport 634x182 -> vertical FOV == the 256mm
    *  A-extent, horizontal follows viewport aspect.) */
   viewSpanMm() {
-    const b = BASES[this.orient];
-    const uExt = this.rasHi[b.uAxis] - this.rasLo[b.uAxis];
-    const vExt = this.rasHi[b.vAxis] - this.rasLo[b.vAxis];
-    return Math.max(uExt, vExt);
+    const b = this.basisOf(this.orient);
+    const u = this.extentAlong(b.uDir), v = this.extentAlong(b.vDir);
+    return Math.max(u.hi - u.lo, v.hi - v.lo);
   }
   /** The fitted in-plane extent (mm) used for a given orientation — the value directly
    *  comparable to a Slicer slice node's fitted fieldOfView. */
@@ -1409,10 +1767,17 @@ var SliceRenderer = class {
     this.orient = prev;
     return s;
   }
-  /** Fitted (zoom=1) in-plane extent for an orientation. */
-  baseSpan(orient) {
-    const b = BASES[orient];
-    return Math.max(this.rasHi[b.uAxis] - this.rasLo[b.uAxis], this.rasHi[b.vAxis] - this.rasLo[b.vAxis]);
+  /** Letterbox fit at zoom=1 (Slicer's FitSliceToVolume): the in-plane FOV (uS0×vS0) that
+   *  exactly contains the slice's bounding box in a viewport of the given aspect — the whole
+   *  slice is visible and the LIMITING axis touches the window edge (so the largest fitting
+   *  axis fills the window, no needless margin). Replaces the old max(uExt,vExt) span, which
+   *  under-zoomed whenever the larger extent wasn't on the viewport's limiting axis. */
+  fitUV(orient, aspectWH) {
+    const b = this.basisOf(orient);
+    const u = this.extentAlong(b.uDir), v = this.extentAlong(b.vDir);
+    const uExt = u.hi - u.lo, vExt = v.hi - v.lo;
+    const uS0 = Math.max(uExt, vExt * aspectWH);
+    return { uS0, vS0: uS0 / aspectWH };
   }
   /** The complete in-plane view frame for an orientation at a given viewport aspect, folding
    *  in pan (mm along uDir/vDir) + zoom. Single source of truth shared by drawInto, rasToView,
@@ -1420,12 +1785,17 @@ var SliceRenderer = class {
    *  pan/zoom. Returns the plane centre `c` (RAS, incl. scrub offset + pan) and the half-... no:
    *  uS/vS are the FULL in-plane extents mapped across the viewport width/height. */
   frameFor(orient, offset01, aspectWH) {
-    const b = BASES[orient];
+    const b = this.basisOf(orient);
     const vs = this.viewState[orient];
-    const span = this.baseSpan(orient) / vs.zoom;
-    const uS = span * Math.max(1, aspectWH), vS = span * Math.max(1, 1 / aspectWH);
+    const { uS0, vS0 } = this.fitUV(orient, aspectWH);
+    const uS = uS0 / vs.zoom, vS = vS0 / vs.zoom;
     const c = [(this.rasLo[0] + this.rasHi[0]) / 2, (this.rasLo[1] + this.rasHi[1]) / 2, (this.rasLo[2] + this.rasHi[2]) / 2];
-    c[b.nAxis] = this.rasLo[b.nAxis] + Math.max(0, Math.min(1, offset01)) * (this.rasHi[b.nAxis] - this.rasLo[b.nAxis]);
+    const nx = this.extentAlong(b.nDir);
+    const want = nx.lo + Math.max(0, Math.min(1, offset01)) * (nx.hi - nx.lo);
+    const have = dot3(c, b.nDir);
+    c[0] += b.nDir[0] * (want - have);
+    c[1] += b.nDir[1] * (want - have);
+    c[2] += b.nDir[2] * (want - have);
     c[0] += b.uDir[0] * vs.panU + b.vDir[0] * vs.panV;
     c[1] += b.uDir[1] * vs.panU + b.vDir[1] * vs.panV;
     c[2] += b.uDir[2] * vs.panU + b.vDir[2] * vs.panV;
@@ -1437,21 +1807,19 @@ var SliceRenderer = class {
   }
   /** Pan the in-plane view by a pixel delta (drag): the anatomy under the cursor follows it. */
   panByPixels(orient, dxPx, dyPx, w, h) {
-    const span = this.baseSpan(orient) / this.viewState[orient].zoom;
-    const uS = span * Math.max(1, w / h), vS = span * Math.max(1, h / w);
+    const z = this.viewState[orient].zoom;
+    const { uS0, vS0 } = this.fitUV(orient, w / h);
+    const uS = uS0 / z, vS = vS0 / z;
     this.viewState[orient].panU -= dxPx / w * uS;
     this.viewState[orient].panV += dyPx / h * vS;
   }
   /** Zoom by `factor` (>1 zooms in) about a pivot (u,v in [0,1]); the pivot point stays fixed. */
   zoomAbout(orient, factor, pu, pv, w, h) {
     const vs = this.viewState[orient];
-    const base = this.baseSpan(orient);
-    const spanOld = base / vs.zoom;
+    const { uS0, vS0 } = this.fitUV(orient, w / h);
     const z = Math.max(0.2, Math.min(50, vs.zoom * factor));
-    const spanNew = base / z;
-    const au = Math.max(1, w / h), av = Math.max(1, h / w);
-    vs.panU += (pu - 0.5) * (spanOld - spanNew) * au;
-    vs.panV += (0.5 - pv) * (spanOld - spanNew) * av;
+    vs.panU += (pu - 0.5) * (uS0 / vs.zoom - uS0 / z);
+    vs.panV += (0.5 - pv) * (vS0 / vs.zoom - vS0 / z);
     vs.zoom = z;
   }
   /** Reset pan/zoom for an orientation to the fitted view. */
@@ -1475,21 +1843,37 @@ var SliceRenderer = class {
    *  zoom proportionally; pan is the centre's offset from the volume centre projected onto the
    *  plane's in-plane axes. The out-of-plane offset is applied separately via setPlane. */
   setMirrorFrame(orient, centerRAS, fovX, fovY) {
-    const b = BASES[orient];
-    const uExt = this.rasHi[b.uAxis] - this.rasLo[b.uAxis];
-    const vExt = this.rasHi[b.vAxis] - this.rasLo[b.vAxis];
-    const zoom = Math.max(uExt / Math.max(fovX, 1e-6), vExt / Math.max(fovY, 1e-6));
+    const b = this.basisOf(orient);
+    const aspect = fovX / Math.max(fovY, 1e-6);
+    const { uS0 } = this.fitUV(orient, aspect);
+    const zoom = Math.max(1e-3, uS0 / Math.max(fovX, 1e-6));
     const volC = [(this.rasLo[0] + this.rasHi[0]) / 2, (this.rasLo[1] + this.rasHi[1]) / 2, (this.rasLo[2] + this.rasHi[2]) / 2];
     const d = [centerRAS[0] - volC[0], centerRAS[1] - volC[1], centerRAS[2] - volC[2]];
     const panU = d[0] * b.uDir[0] + d[1] * b.uDir[1] + d[2] * b.uDir[2];
     const panV = d[0] * b.vDir[0] + d[1] * b.vDir[1] + d[2] * b.vDir[2];
-    this.viewState[orient] = { panU, panV, zoom: Math.max(1e-3, zoom) };
+    this.viewState[orient] = { panU, panV, zoom };
+  }
+  /** The current pan/zoom of a plane expressed the way Slicer's slice node stores it: in-plane centre
+   *  (RAS, without the out-of-plane offset which the caller owns) + field of view (mm) — the inverse
+   *  of setMirrorFrame, so a local pan/zoom can be written back to the app as a slice frame. */
+  mirrorFrame(orient, aspectWH) {
+    const b = this.basisOf(orient);
+    const st = this.viewState[orient];
+    const { uS0, vS0 } = this.fitUV(orient, aspectWH);
+    const fovX = uS0 / st.zoom, fovY = vS0 / st.zoom;
+    const volC = [(this.rasLo[0] + this.rasHi[0]) / 2, (this.rasLo[1] + this.rasHi[1]) / 2, (this.rasLo[2] + this.rasHi[2]) / 2];
+    const centerRAS = [
+      volC[0] + b.uDir[0] * st.panU + b.vDir[0] * st.panV,
+      volC[1] + b.uDir[1] * st.panU + b.vDir[1] * st.panV,
+      volC[2] + b.uDir[2] * st.panU + b.vDir[2] * st.panV
+    ];
+    return { centerRAS, fovX, fovY };
   }
   /** Map a view (u,v) in [0,1] (y down) to normalized texture coords for the current
    *  plane — for click picking. Returns the tex coord; the caller converts to IJK via
    *  ijk = tex*dims - 0.5. Anisotropy/rotation are handled by the same p2t the shader uses. */
   viewToTex(u, v) {
-    const b = BASES[this.orient];
+    const b = this.basisOf(this.orient);
     const uS = this.uSpanMm || this.viewSpanMm();
     const vS = this.vSpanMm || this.viewSpanMm();
     const c = this.cX;
@@ -1509,7 +1893,7 @@ var SliceRenderer = class {
     const d = [ras[0] - c[0], ras[1] - c[1], ras[2] - c[2]];
     const u = 0.5 + (d[0] * b.uDir[0] + d[1] * b.uDir[1] + d[2] * b.uDir[2]) / uS;
     const v = 0.5 - (d[0] * b.vDir[0] + d[1] * b.vDir[1] + d[2] * b.vDir[2]) / vS;
-    return { u, v, distMm: d[b.nAxis] };
+    return { u, v, distMm: dot3(d, b.nDir) };
   }
   /** Map a view (u,v in [0,1], y down) on a plane back to a RAS point ON that plane —
    *  the exact inverse of rasToView (same pan/zoom/aspect). Used to drag a 2D markup:
@@ -1555,6 +1939,62 @@ var SliceRenderer = class {
   renderToView(view, w, h) {
     this.drawInto(view, w, h);
   }
+  /** Bilinear-blit pipeline (fullscreen triangle) that upsamples the low-res reslice to the view. */
+  ensureBlit() {
+    if (this.blitPipeline) return;
+    const m = this.dev.createShaderModule({
+      code: (
+        /* wgsl */
+        `
+struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex fn vs(@builtin(vertex_index) i: u32) -> VO {
+  var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+  var o: VO; o.pos = vec4<f32>(p[i], 0.0, 1.0);
+  o.uv = vec2<f32>((p[i].x + 1.0) * 0.5, (1.0 - p[i].y) * 0.5); return o;
+}
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+@fragment fn fs(in: VO) -> @location(0) vec4<f32> { return textureSample(src, samp, in.uv); }`
+      )
+    });
+    this.blitPipeline = this.dev.createRenderPipeline({
+      layout: "auto",
+      vertex: { module: m, entryPoint: "vs" },
+      fragment: { module: m, entryPoint: "fs", targets: [{ format: this.format }] },
+      primitive: { topology: "triangle-list", cullMode: "none" }
+    });
+  }
+  ensureLow(w, h) {
+    this.ensureBlit();
+    if (this.lowTex && this.lowW === w && this.lowH === h) return;
+    this.lowTex?.destroy();
+    this.lowTex = this.dev.createTexture({ size: [w, h], format: this.format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+    this.lowView = this.lowTex.createView();
+    this.lowW = w;
+    this.lowH = h;
+    this.blitBind = this.dev.createBindGroup({
+      layout: this.blitPipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: this.lowView }, { binding: 1, resource: this.sampler }]
+    });
+  }
+  /** Adaptive (moving-frame) render: reslice at `rw×rh` into an off-screen target, then bilinear-blit
+   *  up to the `vw×vh` view. Single frame, no accumulation — use while interacting; call renderToView
+   *  (native) when the view settles. At rw==vw/rh==vh this is a native render plus a pass-through blit. */
+  renderUpscaled(view, rw, rh, vw, vh) {
+    if (rw >= vw && rh >= vh) {
+      this.drawInto(view, vw, vh);
+      return;
+    }
+    this.ensureLow(rw, rh);
+    this.drawInto(this.lowView, rw, rh);
+    const enc = this.dev.createCommandEncoder();
+    const pass = enc.beginRenderPass({ colorAttachments: [{ view, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }] });
+    pass.setPipeline(this.blitPipeline);
+    pass.setBindGroup(0, this.blitBind);
+    pass.draw(3);
+    pass.end();
+    this.dev.queue.submit([enc.finish()]);
+  }
   async renderToRGBA(w, h) {
     const target = this.dev.createTexture({ size: [w, h], format: this.format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
     this.drawInto(target.createView(), w, h);
@@ -1599,10 +2039,41 @@ var ImageField = class {
   unit;
   stepMm;
   box;
+  normScale = 1;
+  // r8unorm samples return raw/255; clim is packed /normScale so shader math is unchanged
+  dims;
   constructor(dev, data, dims, spacing, lut, opts) {
+    this.dims = dims;
     const center = opts.center ?? [0, 0, 0];
-    this.volTex = dev.createTexture({ size: dims, dimension: "3d", format: "r32float", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
-    dev.queue.writeTexture({ texture: this.volTex }, data, { bytesPerRow: dims[0] * 4, rowsPerImage: dims[1] }, dims);
+    let src = data, fmt = "r32float", bpe = 4;
+    this.normScale = 1;
+    if (data instanceof Uint8Array) {
+      fmt = "r8unorm";
+      bpe = 1;
+      this.normScale = 255;
+    } else if (data instanceof Uint16Array) {
+      src = Float32Array.from(data);
+      fmt = "r32float";
+      bpe = 4;
+    }
+    this.volTex = dev.createTexture({ size: dims, dimension: "3d", format: fmt, usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+    {
+      const bytesPerRow = dims[0] * bpe, rowsPerImage = dims[1], sliceBytes = bytesPerRow * rowsPerImage;
+      const CHUNK = 256 * 1024 * 1024;
+      const slab = Math.max(1, Math.min(dims[2], Math.floor(CHUNK / Math.max(1, sliceBytes))));
+      const u8 = new Uint8Array(src.buffer, src.byteOffset, src.byteLength);
+      for (let z = 0; z < dims[2]; z += slab) {
+        const depth = Math.min(slab, dims[2] - z);
+        const slabBytes = depth * sliceBytes;
+        const slabData = u8.slice(z * sliceBytes, z * sliceBytes + slabBytes);
+        dev.queue.writeTexture(
+          { texture: this.volTex, origin: { x: 0, y: 0, z } },
+          slabData,
+          { offset: 0, bytesPerRow, rowsPerImage },
+          [dims[0], dims[1], depth]
+        );
+      }
+    }
     this.lutTex = dev.createTexture({ size: [256, 1], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
     dev.queue.writeTexture({ texture: this.lutTex }, lut, { bytesPerRow: 256 * 4 }, [256, 1]);
     if (opts.ijkToRAS) {
@@ -1632,6 +2103,11 @@ var ImageField = class {
   getClim() {
     return [this.clim[0], this.clim[1]];
   }
+  /** Phong shading tuple [ka, kd, ks, shininess] — re-packed into the material uniform next
+   *  render (VR presets carry their own lighting). [1,0,0,1] = flat emission (no shading). */
+  setShade(shade) {
+    this.shade = [shade[0], shade[1], shade[2], shade[3]];
+  }
   origP2t;
   // sampling matrix + box at identity, for setWorldTransform
   origBox;
@@ -1648,6 +2124,17 @@ var ImageField = class {
   /** The r32float 3D scalar texture (e.g. to share with a SliceRenderer for MPR). */
   volumeTexture() {
     return this.volTex;
+  }
+  /** r8unorm volumes sample /255, so clim is packed /normScale in the shader; a slice plane sharing this
+   *  texture must use the same factor. 1 for f32 volumes. */
+  normScaleOf() {
+    return this.normScale;
+  }
+  /** Free this field's GPU textures (call when replacing it, e.g. a low-res proxy upgraded to full,
+   *  or an LRU-evicted specimen) so VRAM isn't leaked across a menu of large volumes. */
+  destroy() {
+    this.volTex.destroy();
+    this.lutTex.destroy();
   }
   /** Centre of the volume in world (RAS) at identity — a natural pivot for a transform widget. */
   worldCenter() {
@@ -1668,6 +2155,12 @@ var ImageField = class {
   /** RAS(patient) -> texture[0,1] matrix (encodes the real ijkToRAS geometry). */
   patientToTexture() {
     return this.p2t;
+  }
+  /** Re-place the volume in RAS without re-uploading voxels (a parent transform moved it). */
+  setIjkToRAS(ijkToRAS) {
+    this.p2t = patientToTextureFromIjkToRAS(ijkToRAS, this.dims);
+    this.box = volumeAABBFromIjkToRAS(ijkToRAS, this.dims);
+    this.stepMm = Math.min(...spacingFromIjkToRAS(ijkToRAS));
   }
   structMembers(s) {
     return [
@@ -1732,8 +2225,8 @@ fn sample_field_img${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
   }
   fillUniforms(out, off2) {
     out.set(this.p2t, off2);
-    out[off2 + 16] = this.clim[0];
-    out[off2 + 17] = this.clim[1];
+    out[off2 + 16] = this.clim[0] / this.normScale;
+    out[off2 + 17] = this.clim[1] / this.normScale;
     out[off2 + 20] = this.shade[0];
     out[off2 + 21] = this.shade[1];
     out[off2 + 22] = this.shade[2];
@@ -2188,13 +2681,19 @@ async function inflateDeflate(buf) {
   const ds = new DecompressionStream("deflate");
   return await new Response(new Response(buf).body.pipeThrough(ds)).arrayBuffer();
 }
+var blobFetch = (url) => fetch(url);
 async function fetchZarrVolume(blobBase, z, onBytes, concurrency = 12) {
+  const zv = await fetchZarrVolumeNative(blobBase, z, onBytes, concurrency);
+  const data = zv.data instanceof Float32Array ? zv.data : Float32Array.from(zv.data);
+  return { data, dims: zv.dims, range: zv.range };
+}
+async function fetchZarrVolumeNative(blobBase, z, onBytes, concurrency = 12) {
   const Ctor = ZDT[z.dtype] ?? Int16Array;
   const [nz, ny, nx] = z.shape, [cz, cy, cx2] = z.chunks, [ncz, ncy, ncx] = z.chunkGrid;
   const hashes = z.chunkHashes;
   const posBase = blobBase + z.dir + "/" + z.dataset + "/";
   const chunkUrl = (kk, jj, ii) => hashes ? blobBase + hashes[kk + "." + jj + "." + ii] : posBase + kk + "." + jj + "." + ii;
-  const out = new Float32Array(nz * ny * nx);
+  const out = new Ctor(nz * ny * nx);
   let lo = Infinity, hi = -Infinity;
   const jobs = [];
   for (let kk = 0; kk < ncz; kk++) for (let jj = 0; jj < ncy; jj++) for (let ii = 0; ii < ncx; ii++) jobs.push([kk, jj, ii]);
@@ -2202,7 +2701,7 @@ async function fetchZarrVolume(blobBase, z, onBytes, concurrency = 12) {
   const worker = async () => {
     while (idx < jobs.length) {
       const [kk, jj, ii] = jobs[idx++];
-      const resp = await fetch(chunkUrl(kk, jj, ii));
+      const resp = await blobFetch(chunkUrl(kk, jj, ii));
       let gz;
       if (resp.body && onBytes) {
         const parts = [];
@@ -2244,7 +2743,7 @@ async function fetchZarrVolume(blobBase, z, onBytes, concurrency = 12) {
     }
   };
   await Promise.all(Array.from({ length: Math.min(concurrency, jobs.length) }, worker));
-  return { data: out, dims: [nx, ny, nz], range: [lo, hi] };
+  return { data: out, dtype: z.dtype, dims: [nx, ny, nz], range: [lo, hi] };
 }
 
 // render/fiducial-field.ts
@@ -3030,7 +3529,6 @@ var SliceInteractor = class {
   constructor(geom) {
     this.geom = geom;
   }
-  geom;
   setGeometry(g) {
     this.geom = g;
   }
@@ -3361,6 +3859,16 @@ function attachCameraControls(canvas, camera2, opts = {}) {
   canvas.addEventListener("touchmove", (e) => e.preventDefault(), { passive: false });
   const pointers = /* @__PURE__ */ new Map();
   let pinch = null;
+  let triple = null;
+  const centroid = () => {
+    let mx = 0, my = 0;
+    for (const p of pointers.values()) {
+      mx += p.x;
+      my += p.y;
+    }
+    const n = pointers.size || 1;
+    return { mx: mx / n, my: my / n };
+  };
   const pinchState = () => {
     const [a, b] = [...pointers.values()];
     return { dist: Math.hypot(b.x - a.x, b.y - a.y), mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 };
@@ -3378,6 +3886,11 @@ function attachCameraControls(canvas, camera2, opts = {}) {
     } else if (pointers.size === 2) {
       interactor.end();
       pinch = pinchState();
+    } else if (pointers.size === 3) {
+      pinch = null;
+      const c = centroid();
+      triple = { mx: c.mx, my: c.my };
+      opts.onVolumeDragStart?.();
     }
   });
   const endPointer = (e) => {
@@ -3389,6 +3902,10 @@ function attachCameraControls(canvas, camera2, opts = {}) {
     }
     canvas.releasePointerCapture?.(e.pointerId);
     if (pointers.size < 2) pinch = null;
+    if (pointers.size < 3 && triple) {
+      triple = null;
+      opts.onVolumeDragEnd?.();
+    }
     if (pointers.size === 1) {
       const p = [...pointers.values()][0];
       interactor.start(0, p.x, p.y, canvas.clientHeight, { shift: false, ctrl: false, alt: false });
@@ -3403,7 +3920,12 @@ function attachCameraControls(canvas, camera2, opts = {}) {
     if (!pointers.has(e.pointerId)) return;
     const { x, y } = local(e);
     pointers.set(e.pointerId, { x, y });
-    if (pointers.size >= 2) {
+    if (pointers.size >= 3) {
+      const c = centroid();
+      if (triple) opts.onVolumeDrag?.(c.mx - triple.mx, c.my - triple.my);
+      return;
+    }
+    if (pointers.size === 2) {
       const p = pinchState();
       if (pinch) {
         if (p.dist > 0 && pinch.dist > 0) camera2.dolly(p.dist / pinch.dist);
@@ -3651,6 +4173,7 @@ function attachSliceControls(canvas, cfg) {
   let view = null;
   let scroll = null;
   let grabbed = null;
+  let wlDrag = null;
   const onContext = (e) => e.preventDefault();
   const onWheel = (e) => {
     e.preventDefault();
@@ -3671,6 +4194,12 @@ function attachSliceControls(canvas, cfg) {
       lastDown = dbl ? 0 : now;
       lastX = e.clientX;
       lastY = e.clientY;
+      if (dbl && (e.ctrlKey || e.metaKey) && cfg.wl?.enabled() && cfg.wl.reset) {
+        e.preventDefault();
+        cfg.wl.reset();
+        cfg.redraw();
+        return;
+      }
       if (dbl && h.onDoubleClick?.()) {
         e.preventDefault();
         return;
@@ -3689,8 +4218,16 @@ function attachSliceControls(canvas, cfg) {
     if (e.button !== 0) return;
     e.preventDefault();
     const { u, v, w, h: hh } = uv(e);
+    const mode = cfg.leftMode?.() ?? (cfg.wl?.enabled() ? "wl" : "scroll");
     if (h.onLeftGrab?.(u, v, w, hh)) {
       grabbed = { moved: 0 };
+    } else if (mode === "wl" && cfg.wl) {
+      const [win, lev] = cfg.wl.get();
+      wlDrag = { x: e.clientX, y: e.clientY, win, lev };
+      canvas.style.cursor = "crosshair";
+    } else if (mode === "zoom" || mode === "pan") {
+      view = { mode, x: e.clientX, y: e.clientY, pu: u, pv: v };
+      canvas.style.cursor = mode === "zoom" ? "ns-resize" : "grabbing";
     } else scroll = { x: e.clientX, y: e.clientY, acc: 0 };
     canvas.setPointerCapture(e.pointerId);
   };
@@ -3699,7 +4236,7 @@ function attachSliceControls(canvas, cfg) {
       const dx = e.clientX - view.x, dy = e.clientY - view.y;
       const r = canvas.getBoundingClientRect();
       if (view.mode === "pan") cfg.getSlice().panByPixels(cfg.orient, dx, dy, r.width, r.height);
-      else cfg.getSlice().zoomAbout(cfg.orient, Math.exp(dy * 6e-3), view.pu, view.pv, r.width, r.height);
+      else cfg.getSlice().zoomAbout(cfg.orient, Math.exp(dy * 6e-3), 0.5, 0.5, r.width, r.height);
       view.x = e.clientX;
       view.y = e.clientY;
       cfg.redraw();
@@ -3709,6 +4246,20 @@ function attachSliceControls(canvas, cfg) {
       grabbed.moved += Math.abs(e.movementX) + Math.abs(e.movementY);
       const { u, v, w, h: hh } = uv(e);
       h.onLeftDrag?.(u, v, w, hh);
+      return;
+    }
+    if (wlDrag && cfg.wl) {
+      const [lo, hi] = cfg.wl.range();
+      const r = canvas.getBoundingClientRect();
+      const gain = (hi - lo) / Math.max(1, Math.min(r.width, r.height));
+      let win = wlDrag.win + gain * (e.clientX - wlDrag.x);
+      if (win < 0) win = 0;
+      let lev = wlDrag.lev + gain * (wlDrag.y - e.clientY);
+      if (lev < lo - win / 2) lev = lo - win / 2;
+      if (lev > hi + win / 2) lev = hi + win / 2;
+      cfg.wl.set(win, lev);
+      wlDrag = { x: e.clientX, y: e.clientY, win, lev };
+      cfg.redraw();
       return;
     }
     if (scroll) {
@@ -3742,6 +4293,11 @@ function attachSliceControls(canvas, cfg) {
       const m = grabbed.moved;
       grabbed = null;
       h.onLeftDrop?.(m);
+      return;
+    }
+    if (wlDrag) {
+      wlDrag = null;
+      canvas.style.cursor = "default";
       return;
     }
     scroll = null;
@@ -3802,6 +4358,9 @@ function attachDoubleClick(canvas, onDbl) {
 // render/budget-controller.ts
 var BudgetController = class {
   budgetPx;
+  /** Mutable so a demo can expose it: a viewer who would rather have detail than frame rate raises
+   *  the target frame time, and the loop then keeps a bigger fraction of the native resolution while
+   *  interacting instead of downsampling into aliasing. */
   targetMs;
   minPx;
   maxPx;
@@ -4070,7 +4629,7 @@ function mountCrosshair(cfg) {
 
 // render/demos/widget-control.ts
 var sub2 = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
-var dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+var dot4 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 function camMatrices(cam, w, h) {
   const view = lookAt(cam.position, cam.focalPoint, cam.viewUp);
   const proj = perspectiveZO(cam.viewAngle * Math.PI / 180, w / h, 1, 1e5);
@@ -4102,20 +4661,22 @@ function attachWidgetControls(canvas, camera2, opts) {
     const far = applyMat4(invVp, [ndcx, ndcy, 1]);
     const ro = near, rd = sub2(far, near);
     const n = sub2(camera2.position, camera2.focalPoint);
-    const denom = dot3(rd, n);
+    const denom = dot4(rd, n);
     if (Math.abs(denom) < 1e-9) return [...planePt];
-    const t = dot3(sub2(planePt, ro), n) / denom;
+    const t = dot4(sub2(planePt, ro), n) / denom;
     return [ro[0] + rd[0] * t, ro[1] + rd[1] * t, ro[2] + rd[2] * t];
   };
   const pick = (e) => {
     const { x, y, rw, rh } = cursorCss(e);
     const { w, h } = opts.getSize();
     const { vp } = camMatrices(camera2, w, h);
+    const touch = e.pointerType === "touch";
     let best = null, bestD = Infinity;
     for (const hnd of opts.getHandles()) {
       const s = project(vp, hnd.world, rw, rh);
       if (!s) continue;
-      const d = Math.hypot(s.x - x, s.y - y), r = hnd.pickPx ?? 16;
+      const r = (hnd.pickPx ?? 16) * (touch ? 2.75 : 1);
+      const d = Math.hypot(s.x - x, s.y - y);
       if (d < r && d < bestD) {
         bestD = d;
         best = hnd;
@@ -4123,22 +4684,44 @@ function attachWidgetControls(canvas, camera2, opts) {
     }
     return best;
   };
-  let grabbed = null, hovered = null;
+  let grabbed = null, hovered = null, grabbedId = -1;
+  const release = (pointerId) => {
+    if (!grabbed) return;
+    const g = grabbed;
+    grabbed = null;
+    grabbedId = -1;
+    try {
+      canvas.releasePointerCapture(pointerId);
+    } catch {
+    }
+    window.removeEventListener("pointermove", onMove, true);
+    window.removeEventListener("pointerup", onUp, true);
+    window.removeEventListener("pointercancel", onCancel, true);
+    canvas.style.cursor = "";
+    opts.onDragEnd?.(g);
+  };
   const onDown = (e) => {
     if (e.button !== 0) return;
+    if (grabbed) {
+      release(e.pointerId);
+      return;
+    }
+    if (e.isPrimary === false) return;
     const h = pick(e);
     if (!h) return;
     e.stopPropagation();
     e.preventDefault();
     grabbed = h;
+    grabbedId = e.pointerId;
     canvas.setPointerCapture(e.pointerId);
     canvas.style.cursor = h.cursor ? h.cursor : "grabbing";
     opts.onDragStart?.(h);
     window.addEventListener("pointermove", onMove, true);
     window.addEventListener("pointerup", onUp, true);
+    window.addEventListener("pointercancel", onCancel, true);
   };
   const onMove = (e) => {
-    if (!grabbed) return;
+    if (!grabbed || e.pointerId !== grabbedId) return;
     e.stopPropagation();
     const { x, y, rw, rh } = cursorCss(e);
     const { w, h } = opts.getSize();
@@ -4148,17 +4731,12 @@ function attachWidgetControls(canvas, camera2, opts) {
     opts.onChange?.();
   };
   const onUp = (e) => {
-    if (!grabbed) return;
+    if (!grabbed || e.pointerId !== grabbedId) return;
     e.stopPropagation();
-    const g = grabbed;
-    grabbed = null;
-    try {
-      canvas.releasePointerCapture(e.pointerId);
-    } catch {
-    }
-    window.removeEventListener("pointermove", onMove, true);
-    window.removeEventListener("pointerup", onUp, true);
-    opts.onDragEnd?.(g);
+    release(e.pointerId);
+  };
+  const onCancel = (e) => {
+    if (grabbed && e.pointerId === grabbedId) release(e.pointerId);
   };
   const onHoverMove = (e) => {
     if (grabbed) return;
@@ -4178,6 +4756,7 @@ function attachWidgetControls(canvas, camera2, opts) {
       canvas.removeEventListener("pointermove", onHoverMove);
       window.removeEventListener("pointermove", onMove, true);
       window.removeEventListener("pointerup", onUp, true);
+      window.removeEventListener("pointercancel", onCancel, true);
     }
   };
 }
@@ -4221,14 +4800,18 @@ function glass(el, extra = "") {
 }
 function installChrome(opts) {
   const controls = opts.controls ?? [];
-  const help = opts.help ?? DEFAULT_HELP;
-  const helpBtn = document.createElement("button");
-  helpBtn.textContent = "?";
-  helpBtn.title = "Controls & key bindings";
-  helpBtn.style.cssText = "position:fixed;top:12px;left:12px;z-index:74;width:32px;height:32px;padding:0;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;border-radius:50%;color:#cfe6ff;font:700 15px -apple-system,system-ui,sans-serif;";
-  glass(helpBtn);
-  helpBtn.onclick = openHelp;
-  document.body.appendChild(helpBtn);
+  const host = opts.container ?? document.body;
+  const help = (opts.help === false ? [] : opts.help) ?? DEFAULT_HELP;
+  let helpBtn = null;
+  if (opts.help !== false) {
+    helpBtn = document.createElement("button");
+    helpBtn.textContent = "?";
+    helpBtn.title = "Controls & key bindings";
+    helpBtn.style.cssText = "position:fixed;top:12px;left:12px;z-index:74;width:32px;height:32px;padding:0;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;border-radius:50%;color:#cfe6ff;font:700 15px -apple-system,system-ui,sans-serif;";
+    glass(helpBtn);
+    helpBtn.onclick = openHelp;
+    host.appendChild(helpBtn);
+  }
   let helpEl = null;
   function openHelp() {
     if (helpEl) return;
@@ -4247,7 +4830,7 @@ function installChrome(opts) {
     }
     panel.innerHTML += `<div style="margin-top:16px;font-size:12px;color:rgba(232,238,255,.55)">Press <b style="color:#fff5d6">esc</b> or click outside to dismiss.</div>`;
     helpEl.appendChild(panel);
-    document.body.appendChild(helpEl);
+    host.appendChild(helpEl);
     document.addEventListener("keydown", escClose, true);
   }
   function escClose(e) {
@@ -4261,6 +4844,7 @@ function installChrome(opts) {
     }
   }
   const logo = document.createElement("div");
+  logo.id = "sl-badge";
   logo.title = "SlicerLive \u2014 visualization";
   logo.style.cssText = "position:fixed;z-index:74;cursor:pointer;user-select:none;display:flex;flex-direction:column;align-items:center;gap:4px;padding:7px 12px 6px;border-radius:14px;background:#121826;border:1px solid rgba(255,255,255,.12);box-shadow:0 10px 30px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.06);transition:transform 120ms ease-out;";
   const mark = document.createElement("img");
@@ -4272,13 +4856,13 @@ function installChrome(opts) {
   word.style.cssText = "font:800 12px/1 -apple-system,system-ui,sans-serif;letter-spacing:.5px;color:#eef7ff;text-shadow:0 0 14px rgba(255,210,90,.4);";
   logo.appendChild(mark);
   logo.appendChild(word);
-  document.body.appendChild(logo);
+  host.appendChild(logo);
   const place = () => {
     const a = opts.anchor;
     const r = a && a.getClientRects().length ? a.getBoundingClientRect() : null;
     if (r && r.width > 2 && r.height > 2) {
       logo.style.top = Math.round(r.top + 8) + "px";
-      logo.style.right = Math.round(window.innerWidth - r.right + 8) + "px";
+      logo.style.right = Math.round(globalThis.innerWidth - r.right + 8) + "px";
     } else {
       logo.style.top = "10px";
       logo.style.right = "12px";
@@ -4287,11 +4871,13 @@ function installChrome(opts) {
   place();
   requestAnimationFrame(place);
   globalThis.addEventListener("resize", place);
-  if (opts.anchor && "ResizeObserver" in globalThis) new ResizeObserver(place).observe(opts.anchor);
+  const anchorRO = opts.anchor && "ResizeObserver" in globalThis ? new ResizeObserver(place) : null;
+  anchorRO?.observe(opts.anchor);
   const pop = document.createElement("div");
+  pop.id = "sl-popup";
   pop.style.cssText = "position:fixed;z-index:73;min-width:210px;max-width:300px;max-height:84vh;overflow-y:auto;padding:10px 12px;border-radius:12px;color:#eaf0ff;font:13px -apple-system,system-ui,sans-serif;opacity:0;pointer-events:none;transform:translateY(-6px);transition:opacity 120ms ease-out,transform 120ms ease-out;";
   glass(pop);
-  document.body.appendChild(pop);
+  host.appendChild(pop);
   const paintSw = (sw, on) => {
     sw.style.background = on ? "linear-gradient(180deg,#9fe9ff,#54c6f0)" : "rgba(255,255,255,.18)";
     sw.innerHTML = `<span style="position:absolute;top:2px;left:${on ? 17 : 2}px;width:15px;height:15px;border-radius:50%;background:#fff;transition:left 120ms;box-shadow:0 1px 3px rgba(0,0,0,.4)"></span>`;
@@ -4403,9 +4989,62 @@ function installChrome(opts) {
       }
       const row = document.createElement("div");
       row.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:14px;padding:5px 0;";
+      if (c.slider) {
+        row.style.cssText = "display:flex;flex-direction:column;gap:4px;padding:6px 0;";
+        const top = document.createElement("div");
+        top.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:12px;";
+        const lab2 = document.createElement("span");
+        lab2.textContent = c.label;
+        const val = document.createElement("span");
+        val.style.cssText = "font:600 11px ui-monospace,Menlo,monospace;color:#9fe9ff;font-variant-numeric:tabular-nums;";
+        top.appendChild(lab2);
+        top.appendChild(val);
+        const inp = document.createElement("input");
+        inp.type = "range";
+        inp.min = String(c.slider.min);
+        inp.max = String(c.slider.max);
+        inp.step = String(c.slider.step ?? 1);
+        inp.value = String(c.slider.get());
+        inp.style.cssText = "width:100%;accent-color:#54c6f0;cursor:pointer;";
+        const fmt = c.slider.format ?? ((v) => String(Math.round(v)));
+        const paint = () => {
+          val.textContent = fmt(c.slider.get());
+        };
+        inp.oninput = () => {
+          c.slider.set(parseFloat(inp.value));
+          paint();
+          opts.onChange?.();
+        };
+        inp.onpointerdown = (e) => e.stopPropagation();
+        paint();
+        row.appendChild(top);
+        row.appendChild(inp);
+        pop.appendChild(row);
+        rows.push({ c, row, repaint: () => {
+          inp.value = String(c.slider.get());
+          paint();
+        } });
+        continue;
+      }
       const lab = document.createElement("span");
       lab.textContent = c.label;
       row.appendChild(lab);
+      if (c.button) {
+        const pill = document.createElement("span");
+        pill.style.cssText = "max-width:60%;border-radius:7px;padding:4px 10px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font:600 12px -apple-system,system-ui,sans-serif;color:#eaf0ff;background:rgba(255,255,255,.10);border:1px solid rgba(255,255,255,.20);";
+        pill.textContent = c.button.text();
+        pill.onclick = (e) => {
+          e.stopPropagation();
+          c.button.run();
+        };
+        pill.onpointerdown = (e) => e.stopPropagation();
+        row.appendChild(pill);
+        pop.appendChild(row);
+        rows.push({ c, row, repaint: () => {
+          pill.textContent = c.button.text();
+        } });
+        continue;
+      }
       if (c.getOpacity && c.setOpacity) {
         const box = document.createElement("span");
         box.style.cssText = OPBOX_CSS;
@@ -4521,7 +5160,7 @@ function installChrome(opts) {
     refresh();
     const b = logo.getBoundingClientRect();
     pop.style.top = Math.round(b.bottom + 6) + "px";
-    pop.style.right = Math.round(window.innerWidth - b.right) + "px";
+    pop.style.right = Math.round(globalThis.innerWidth - b.right) + "px";
     pop.style.opacity = "1";
     pop.style.pointerEvents = "auto";
     pop.style.transform = "translateY(0)";
@@ -4532,24 +5171,51 @@ function installChrome(opts) {
     pop.style.transform = "translateY(-6px)";
   };
   let pinned = false;
+  let startOpen = false;
   logo.onmouseenter = () => {
     logo.style.transform = "scale(1.08)";
     show();
   };
   logo.onclick = () => {
+    startOpen = false;
     pinned = !pinned;
     pinned ? show() : hide();
   };
   logo.onmouseleave = () => {
     logo.style.transform = "scale(1)";
-    if (!pinned) setTimeout(() => {
+    if (!pinned && !startOpen) setTimeout(() => {
       if (!pop.matches(":hover") && !pinned) hide();
     }, 120);
   };
   pop.onmouseleave = () => {
+    startOpen = false;
     if (!pinned) hide();
   };
-  return { refresh };
+  const onDocDown = (e) => {
+    const t = e.target;
+    if (logo.contains(t) || pop.contains(t)) return;
+    if (startOpen) return;
+    pinned = false;
+    hide();
+  };
+  document.addEventListener("pointerdown", onDocDown, true);
+  if (opts.openOnLoad ?? true) {
+    startOpen = true;
+    requestAnimationFrame(() => {
+      if (startOpen) show();
+    });
+  }
+  const destroy = () => {
+    document.removeEventListener("pointerdown", onDocDown, true);
+    globalThis.removeEventListener("resize", place);
+    anchorRO?.disconnect();
+    document.removeEventListener("keydown", escClose, true);
+    helpBtn?.remove();
+    helpEl?.remove();
+    logo.remove();
+    pop.remove();
+  };
+  return { refresh, destroy };
 }
 
 // examples/cardiac/cardiac-browser.ts
@@ -5110,7 +5776,6 @@ function steerAutopilot() {
         cands.push(normalize3(off2));
       }
     }
-    void f;
     const from = [...pos];
     Promise.all(cands.map((d) => sc.scene.probe(from, d))).then((ds) => {
       let best = -1, bestDir = null;

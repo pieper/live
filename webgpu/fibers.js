@@ -1512,10 +1512,24 @@ var FiberField = class {
   radius;
   shade;
   opacity = 1;
+  aoStrength;
+  aoRadiusMm;
+  aoDensityScale;
+  aoDirs;
+  aoSteps;
+  haloStrength;
+  haloWidth;
   constructor(dev, strands, opts = {}) {
     this.dev = dev;
     this.radius = opts.radius ?? 0.2;
     this.shade = opts.shade ?? [0.2, 0.65, 0.2, 96];
+    this.aoStrength = Math.max(0, opts.aoStrength ?? 0);
+    this.aoRadiusMm = opts.aoRadiusMm ?? 3;
+    this.aoDensityScale = opts.aoDensityScale ?? 0.08;
+    this.aoDirs = Math.max(1, Math.round(opts.aoDirections ?? 5));
+    this.aoSteps = Math.max(1, Math.round(opts.aoSteps ?? 3));
+    this.haloStrength = Math.max(0, opts.haloStrength ?? 0);
+    this.haloWidth = opts.haloWidthMm ?? 0.5;
     this.clippable = opts.clippable ?? true;
     for (const [id, c] of Object.entries(opts.bundleColors ?? {})) {
       const i = Number(id);
@@ -1648,14 +1662,40 @@ var FiberField = class {
   setOpacity(o) {
     this.opacity = Math.max(0, Math.min(1, o));
   }
+  /** Live AO tuning (strength/radius/density are uniform-resident — no rebuild). The sample PATTERN
+   *  is baked into the shader, so changing directions/steps needs a new field. */
+  setAO(strength, radiusMm, densityScale) {
+    this.aoStrength = Math.max(0, strength);
+    if (radiusMm !== void 0) this.aoRadiusMm = radiusMm;
+    if (densityScale !== void 0) this.aoDensityScale = densityScale;
+  }
+  /** Phong constants [ka, kd, ks, shininess], live (uniform-resident — no rebuild), so a demo can
+   *  tune how bright the tubes read without rebuilding the grid. */
+  setShade(shade) {
+    this.shade = [shade[0], shade[1], shade[2], shade[3]];
+  }
+  get shading() {
+    return [this.shade[0], this.shade[1], this.shade[2], this.shade[3]];
+  }
+  /** Depth-dependent halo strength/width, live (uniform-resident — no rebuild). */
+  setHalo(strength, widthMm) {
+    this.haloStrength = Math.max(0, Math.min(1, strength));
+    if (widthMm !== void 0) this.haloWidth = widthMm;
+  }
+  get halo() {
+    return { strength: this.haloStrength, widthMm: this.haloWidth };
+  }
+  get ao() {
+    return { strength: this.aoStrength, radiusMm: this.aoRadiusMm, densityScale: this.aoDensityScale, dirs: this.aoDirs, steps: this.aoSteps };
+  }
   destroy() {
     this.fBuf.destroy();
     this.uBuf.destroy();
   }
   uniformFloats() {
-    return 20;
+    return 24;
   }
-  // lo(4) + dims(4) + hi(4) + shade(4) + params(4)
+  // lo + dims + hi + shade + params + halo, 4 each
   aabb() {
     return [this.lo, this.hi];
   }
@@ -1674,8 +1714,10 @@ var FiberField = class {
       // grid max xyz, tube radius
       `  fib${s}_shade : vec4<f32>,`,
       // ka, kd, ks, shininess
-      `  fib${s}_params : vec4<f32>,`
-      // opacity, _, _, _
+      `  fib${s}_params : vec4<f32>,`,
+      // opacity, ao strength, ao radius mm, ao density scale
+      `  fib${s}_halo : vec4<f32>,`
+      // halo strength, halo width mm, _, _
     ].join("\n");
   }
   declareBindings(s, base) {
@@ -1746,6 +1788,60 @@ fn fib_dseg${s}(p : vec3<f32>, a : vec3<f32>, b : vec3<f32>) -> f32 {
   let ba = b - a;
   return length(p - a - ba * clamp(dot(p - a, ba) / dot(ba, ba), 0.0, 1.0));
 }
+// Closest approach between the ray and a segment: returns (distance, ray distance at that point).
+// This is what the halo band needs \u2014 the radial distance where the ray passes NEAREST the tube. (An
+// intersection against an inflated radius cannot answer it: its entry point always sits exactly on
+// the inflated surface, so every halo measured the same distance and cancelled itself out.)
+fn fib_rayseg${s}(ro : vec3<f32>, rd : vec3<f32>, a : vec3<f32>, b : vec3<f32>) -> vec2<f32> {
+  let ba = b - a;
+  let w0 = ro - a;
+  let bb = dot(rd, ba);
+  let cc = dot(ba, ba);
+  let dd = dot(rd, w0);
+  let ee = dot(ba, w0);
+  let u = clamp((ee - bb * dd) / max(cc - bb * bb, 1e-8), 0.0, 1.0);
+  let p = a + ba * u;
+  let t = max(dot(p - ro, rd), 0.0);
+  return vec2<f32>(length(ro + rd * t - p), t);
+}
+// Line density at p, straight from the grid's per-cell capsule count \u2014 the occupancy structure the
+// march already needs. No depth buffer, no normals, and occluders off-screen or behind the nearest
+// surface count exactly the same as visible ones.
+fn fib_density${s}(p : vec3<f32>) -> f32 {
+  let lo = u_material.fib${s}_lo.xyz; let cell = u_material.fib${s}_lo.w;
+  let dims = vec3<i32>(u_material.fib${s}_dims.xyz);
+  let g = vec3<i32>(floor((p - lo) / cell));
+  if (any(g < vec3<i32>(0)) || any(g >= dims)) { return 0.0; }
+  let cnt = fib${s}_u[2u * u32(g.x + dims.x * (g.y + dims.y * g.z)) + 1u] & 0xFFFFFFu;
+  return clamp(f32(cnt) * u_material.fib${s}_params.w, 0.0, 1.0);
+}
+// Hemisphere occlusion about the surface normal, with a quadratic falloff so near occluders dominate
+// (LineAO's weighting) and a floor so nothing goes fully black \u2014 dark holes read as missing data.
+fn fib_ao${s}(q : vec3<f32>, n : vec3<f32>, r : f32) -> f32 {
+  let strength = u_material.fib${s}_params.y;
+  if (strength <= 0.0) { return 1.0; }
+  let R = max(u_material.fib${s}_params.z, 1e-3);
+  let up = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.z) > 0.9);
+  let t = normalize(cross(up, n));
+  let b = cross(n, t);
+  let base = q + n * (3.0 * r);      // bias off the tube's own surface
+  var occ = 0.0;
+  var wsum = 0.0;
+  for (var d = 0; d < ${this.aoDirs}; d = d + 1) {
+    var dir = n;
+    if (d > 0) {
+      let a = 6.2831853 * f32(d - 1) / f32(${Math.max(1, this.aoDirs - 1)});
+      dir = normalize(n * 0.57 + (t * cos(a) + b * sin(a)) * 0.82);
+    }
+    for (var k = 1; k <= ${this.aoSteps}; k = k + 1) {
+      let dist = R * f32(k) / f32(${this.aoSteps});
+      let w = 1.0 / (1.0 + 4.0 * (dist / R) * (dist / R));
+      occ += w * fib_density${s}(base + dir * dist);
+      wsum += w;
+    }
+  }
+  return clamp(1.0 - strength * (occ / max(wsum, 1e-6)), 0.12, 1.0);
+}
 fn sample_field_fib${s}(wp_world : vec3<f32>, rd : vec3<f32>, seg : f32) -> vec4<f32> {
   let wp = transform_point_fib${s}(wp_world);
   let lo = u_material.fib${s}_lo.xyz; let cell = u_material.fib${s}_lo.w;
@@ -1789,7 +1885,30 @@ fn sample_field_fib${s}(wp_world : vec3<f32>, rd : vec3<f32>, seg : f32) -> vec4
       let A = fib${s}_f[${PAL}u + 2u * si];
       let B = fib${s}_f[${PAL + 1}u + 2u * si];
       let th = fib_cap${s}(q0, rd, A.xyz, B.xyz, r);
-      if (th <= tc || th > te) { continue; }
+      if (th <= tc || th > te) {
+        // The ray missed this tube here. If halos are on, check whether it passed close enough to sit
+        // in the tube's halo band, measured at the ray's CLOSEST APPROACH to the segment.
+        let hs = u_material.fib${s}_halo.x;
+        if (hs <= 0.0) { continue; }
+        let hw = max(u_material.fib${s}_halo.y, 1e-4);
+        let ca = fib_rayseg${s}(q0, rd, A.xyz, B.xyz);   // (radial distance, ray distance)
+        if (ca.x <= r || ca.x >= r + hw) { continue; }
+        if (ca.y <= tc || ca.y > te) { continue; }
+        let ramp = clamp(1.0 - (ca.x - r) / hw, 0.0, 1.0);   // darkest hugging the tube
+        let ha = clamp(hs * ramp * ramp, 0.0, 1.0);
+        if (ha <= 0.004) { continue; }
+        if (nh == ${MAX_HITS} && ca.y >= ht[${MAX_HITS - 1}]) { continue; }
+        // Black, premultiplied, at the tube's own depth: front-to-back compositing then occludes
+        // whatever lies behind it, which is what separates bundles \u2014 and leaves nearer tubes alone.
+        var j = min(nh, ${MAX_HITS - 1});
+        loop {
+          if (j == 0 || ht[j - 1] <= ca.y) { break; }
+          ht[j] = ht[j - 1]; hc[j] = hc[j - 1]; j = j - 1;
+        }
+        ht[j] = ca.y; hc[j] = vec4<f32>(0.0, 0.0, 0.0, ha);
+        nh = min(nh + 1, ${MAX_HITS});
+        continue;
+      }
       if (nh == ${MAX_HITS} && th >= ht[${MAX_HITS - 1}]) { continue; }
       let q = q0 + rd * th;
       let ba = B.xyz - A.xyz;
@@ -1809,7 +1928,8 @@ fn sample_field_fib${s}(wp_world : vec3<f32>, rd : vec3<f32>, seg : f32) -> vec4
       let ldn = max(dot(nrm, -rd), 0.0);
       let refl = normalize(2.0 * ldn * nrm + rd);
       let rdv = max(dot(refl, -rd), 0.0);
-      let lit = pal.rgb * (ka + kd * ldn) + vec3<f32>(ks * pow(rdv, sh));
+      let ao = fib_ao${s}(q, nrm, r);
+      let lit = pal.rgb * ((ka + kd * ldn) * ao) + vec3<f32>(ks * pow(rdv, sh));
       let col = srgb2physical(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)));
       var j = min(nh, ${MAX_HITS - 1});       // insertion, nearest first (the farthest drops off)
       loop {
@@ -1849,6 +1969,11 @@ fn sample_field_fib${s}(wp_world : vec3<f32>, rd : vec3<f32>, seg : f32) -> vec4
     out[off + 14] = this.shade[2];
     out[off + 15] = this.shade[3];
     out[off + 16] = this.opacity;
+    out[off + 17] = this.aoStrength;
+    out[off + 18] = this.aoRadiusMm;
+    out[off + 19] = this.aoDensityScale;
+    out[off + 20] = this.haloStrength;
+    out[off + 21] = this.haloWidth;
   }
 };
 
@@ -2778,6 +2903,9 @@ function attachWidgetControls(canvas, camera, opts) {
 // render/budget-controller.ts
 var BudgetController = class {
   budgetPx;
+  /** Mutable so a demo can expose it: a viewer who would rather have detail than frame rate raises
+   *  the target frame time, and the loop then keeps a bigger fraction of the native resolution while
+   *  interacting instead of downsampling into aliasing. */
   targetMs;
   minPx;
   maxPx;
@@ -3330,30 +3458,40 @@ function installChrome(opts) {
     pop.style.transform = "translateY(-6px)";
   };
   let pinned = false;
+  let startOpen = false;
   logo.onmouseenter = () => {
     logo.style.transform = "scale(1.08)";
     show();
   };
   logo.onclick = () => {
+    startOpen = false;
     pinned = !pinned;
     pinned ? show() : hide();
   };
   logo.onmouseleave = () => {
     logo.style.transform = "scale(1)";
-    if (!pinned) setTimeout(() => {
+    if (!pinned && !startOpen) setTimeout(() => {
       if (!pop.matches(":hover") && !pinned) hide();
     }, 120);
   };
   pop.onmouseleave = () => {
+    startOpen = false;
     if (!pinned) hide();
   };
   const onDocDown = (e) => {
     const t = e.target;
     if (logo.contains(t) || pop.contains(t)) return;
+    if (startOpen) return;
     pinned = false;
     hide();
   };
   document.addEventListener("pointerdown", onDocDown, true);
+  if (opts.openOnLoad ?? true) {
+    startOpen = true;
+    requestAnimationFrame(() => {
+      if (startOpen) show();
+    });
+  }
   const destroy = () => {
     document.removeEventListener("pointerdown", onDocDown, true);
     globalThis.removeEventListener("resize", place);
