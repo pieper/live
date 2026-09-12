@@ -1722,7 +1722,13 @@ fn sample_field_fib${s}(wp_world : vec3<f32>, rd : vec3<f32>, seg : f32) -> vec4
         if (ca.x <= r || ca.x >= r + hw) { continue; }
         if (ca.y <= tc || ca.y > te) { continue; }
         let ramp = clamp(1.0 - (ca.x - r) / hw, 0.0, 1.0);   // darkest hugging the tube
-        let ha = clamp(hs * ramp * ramp, 0.0, 1.0);
+        // Scale by the tube's OWN opacity \u2014 the same pal.a * fop the lit surface uses below. A halo
+        // is the tube occluding what is behind it, so a group dialled down must darken proportionally
+        // less and a group switched off must not darken at all. (It used to emit full-strength black
+        // regardless, so a hidden group still cast shadows over everything behind it.) Read after the
+        // band rejects above, so a ray that misses the halo never pays for the palette fetch.
+        let hop = clamp(fib${s}_f[u32(B.w + 0.5)].a * fop, 0.0, 1.0);
+        let ha = clamp(hs * ramp * ramp * hop, 0.0, 1.0);
         if (ha <= 0.004) { continue; }
         if (nh == ${MAX_HITS} && ca.y >= ht[${MAX_HITS - 1}]) { continue; }
         // Black, premultiplied, at the tube's own depth: front-to-back compositing then occludes
@@ -3233,6 +3239,7 @@ async function main() {
     targetMs: 100
   });
   let tuned = null;
+  let retuning = false, retuneTimer = 0;
   const showStatus = () => status(
     `${sc.manifest.bundles.length} bundles \xB7 ${sc.strandCount.toLocaleString()} streamlines (${Math.round(sc.fraction * 100)}%${tuned ? ` auto, ${tuned.ms.toFixed(0)} ms probe, fits ${tuned.capPct}%` : ""}) \xB7 ${sc.capsuleCount.toLocaleString()} capsules \xB7 ${(sc.bytesFetched / 1e6).toFixed(1)} MB \xB7 ${canvas.width}\xD7${canvas.height} \xB7 drag to rotate`
   );
@@ -3263,6 +3270,13 @@ async function main() {
       setTimeout(showStatus, 1500);
     }
   };
+  let bakeTimer = 0;
+  const apply = () => {
+    scene.syncUniforms();
+    a3d.draw();
+    clearTimeout(bakeTimer);
+    bakeTimer = setTimeout(() => a3d.renderSettled(true), 140);
+  };
   const resize = () => {
     const dpr = Math.min(2, globalThis.devicePixelRatio || 1);
     const w = Math.max(16, Math.round(canvas.clientWidth * dpr)), h = Math.max(16, Math.round(canvas.clientHeight * dpr));
@@ -3272,6 +3286,8 @@ async function main() {
     if (!userMoved) frameCamera(w, h);
     showStatus();
     a3d.renderSettled(true);
+    clearTimeout(retuneTimer);
+    retuneTimer = setTimeout(() => void retune(), 400);
   };
   globalThis.addEventListener("resize", resize);
   new ResizeObserver(resize).observe(canvas);
@@ -3303,8 +3319,7 @@ async function main() {
         get: () => sc.highlight.active,
         set: (on) => {
           sc.setHighlight(on);
-          scene.syncUniforms();
-          a3d.draw();
+          apply();
           showStatus();
         }
       },
@@ -3320,6 +3335,8 @@ async function main() {
           // rotating. The budget loop re-converges within a few frames either way.
           set: (v) => {
             a3d.budget.targetMs = 1e3 / Math.max(1, Math.min(60, v));
+            clearTimeout(retuneTimer);
+            retuneTimer = setTimeout(() => void retune(), 400);
           },
           format: (v) => `${Math.round(v)} fps`
         }
@@ -3334,8 +3351,7 @@ async function main() {
           get: () => sc.haloSettings.strength,
           set: (v) => {
             sc.setHalo(v);
-            scene.syncUniforms();
-            a3d.draw();
+            apply();
           },
           format: (v) => v <= 1e-3 ? "off" : `${Math.round(v * 100)}%`
         }
@@ -3350,8 +3366,7 @@ async function main() {
           get: () => sc.aoSettings.strength,
           set: (v) => {
             sc.setAO(v);
-            scene.syncUniforms();
-            a3d.draw();
+            apply();
           },
           format: (v) => v <= 1e-3 ? "off" : `${Math.round(v * 100)}%`
         }
@@ -3363,7 +3378,7 @@ async function main() {
         getOpacity: () => sc.groupOpacity(g.name),
         setOpacity: (o) => {
           sc.setGroupOpacity(g.name, o);
-          scene.syncUniforms();
+          apply();
         }
       }))
     ],
@@ -3374,7 +3389,7 @@ async function main() {
       ["SlicerLive badge", "Streamline % + target fps + depth cues + per-group opacity"],
       ["Human-expanded tracts", "Holds 10 tracts at full opacity and drops the rest to 10%, keeping their group colours as context: the dorsal language stream (arcuate, SLF II/III), the ventral semantic pathways (IOFF/IFOF, MdLF), the frontal projection systems that grew with prefrontal cortex (thalamo-frontal, striato-frontal, frontal corona radiata), the prefrontal arm of the cerebro-cerebellar loop (cortico-ponto-cerebellar), and frontal short-association fibres. This is prior knowledge from the comparative literature, not anything measured in this scan. NO tract is unique to humans \u2014 every one has a primate homologue, and the claim is expansion relative to chimpanzee and macaque, clearest for the arcuate's temporal projection (found in 10/10 humans, 1/4 chimpanzees, 0/3 macaques; Rilling 2008). Some inclusions are contested, notably whether macaques have an IFOF at all. Shown bilaterally, though the language evidence is strongest on the left."]
     ] }],
-    onChange: () => a3d.draw()
+    onChange: () => apply()
   });
   const fullBtn = document.getElementById("full");
   if (fullBtn) {
@@ -3429,8 +3444,8 @@ async function main() {
   a3d.renderSettled(true);
   showStatus();
   const PROBE_W = 640, PROBE_H = 360;
-  const PROBE_BUDGET_MS = 10;
-  const AUTO_MAX = 0.5;
+  const PROBE_PX = PROBE_W * PROBE_H;
+  const probeBudgetMs = () => a3d.budget.targetMs * PROBE_PX / Math.max(PROBE_PX, canvas.width * canvas.height);
   const measureFrame = async () => {
     const vw = canvas.width, vh = canvas.height;
     scene.setCamera(camera.position, camera.focalPoint, camera.viewUp, camera.viewAngle, PROBE_W, PROBE_H);
@@ -3442,28 +3457,44 @@ async function main() {
     await gpu.device.queue.onSubmittedWorkDone();
     return performance.now() - t;
   };
-  if (fraction === void 0) {
-    const cap = Math.min(fractionCapForLimits(sc.manifest, gpu.adapter.limits), AUTO_MAX);
-    let ms = await measureFrame();
-    for (let step = 0; step < 8 && sc.fraction + 0.05 <= cap + 1e-6 && ms < PROBE_BUDGET_MS; step++) {
-      const next = Math.round((sc.fraction + 0.05) * 100);
-      status(`tuning density for this GPU\u2026 trying ${next}% (${ms.toFixed(0)} ms probe)`);
-      await sc.setFraction(next / 100);
+  async function retune() {
+    if (fraction !== void 0 || retuning || applying) return;
+    retuning = true;
+    const rebuild = () => {
       scene.build([sc.fibers]);
       scene.setBackground(0.05, 0.06, 0.09);
-      ms = await measureFrame();
-      if (ms > PROBE_BUDGET_MS * 1.35) {
-        await sc.setFraction(Math.max(0.05, sc.fraction - 0.05));
-        scene.build([sc.fibers]);
-        scene.setBackground(0.05, 0.06, 0.09);
-        a3d.renderSettled(true);
-        break;
+    };
+    try {
+      const cap = fractionCapForLimits(sc.manifest, gpu.adapter.limits);
+      const budget = probeBudgetMs();
+      let ms = await measureFrame();
+      for (let step = 0; step < 20; step++) {
+        const up = ms < budget && sc.fraction + 0.05 <= cap + 1e-6;
+        const down = ms > budget * 1.35 && sc.fraction > 0.05 + 1e-6;
+        if (!up && !down) break;
+        const next = Math.max(0.05, Math.min(cap, sc.fraction + (up ? 0.05 : -0.05)));
+        if (Math.abs(next - sc.fraction) < 1e-6) break;
+        status(`tuning density for this GPU\u2026 trying ${Math.round(next * 100)}% (${ms.toFixed(0)} ms probe, ${budget.toFixed(0)} ms budget)`);
+        await sc.setFraction(next);
+        rebuild();
+        ms = await measureFrame();
+        if (up && ms > budget * 1.35) {
+          await sc.setFraction(Math.max(0.05, sc.fraction - 0.05));
+          rebuild();
+          ms = await measureFrame();
+          break;
+        }
       }
+      target = Math.round(sc.fraction * 100);
+      tuned = { capPct: Math.round(cap * 100), ms };
+      a3d.renderSettled(true);
+      showStatus();
+    } catch (e) {
+      status(`could not tune density \u2014 ${e.message}`, true);
+    } finally {
+      retuning = false;
     }
-    target = Math.round(sc.fraction * 100);
-    tuned = { capPct: Math.round(cap * 100), ms };
-    a3d.renderSettled(true);
-    showStatus();
   }
+  await retune();
 }
 main().catch((e) => status("error: " + (e?.message ?? e), true));
