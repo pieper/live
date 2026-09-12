@@ -2555,28 +2555,40 @@ function mountAdaptive3d(opts) {
   const budget = new BudgetController({ targetMs: opts.targetMs ?? 16 });
   const DBG = typeof location !== "undefined" && new URLSearchParams(location.search).has("perf");
   let dbgN = 0, dbgMoving = 0, dbgSettled = 0, dbgLast = 0;
-  const dbgTick = (kind, ms, s) => {
+  const dbgTick = (kind, ms, s, k = 1) => {
     if (!DBG) return;
     dbgN++;
     if (kind === "mov") dbgMoving += ms;
     else dbgSettled += ms;
     const now = performance.now();
     if (now - dbgLast > 500) {
-      console.log(`[perf] mov=${dbgMoving.toFixed(0)}ms/${dbgN}f settled=${dbgSettled.toFixed(0)}ms lastScale=${s.toFixed(2)} last=${ms.toFixed(1)}ms`);
+      console.log(`[perf] mov=${dbgMoving.toFixed(0)}ms/${dbgN}f settled=${dbgSettled.toFixed(0)}ms lastScale=${s.toFixed(2)} samples=${k} last=${ms.toFixed(1)}ms`);
       dbgLast = now;
       dbgMoving = dbgSettled = dbgN = 0;
     }
   };
   const movingCap = opts.movingScaleCap ?? 1;
+  const maxMovingSamples = Math.max(1, Math.round(opts.maxMovingSamples ?? 1));
+  let sampleMs = 0;
   const renderMoving = () => {
     const sc = opts.scene();
     if (!sc) return;
     const { w: vw, h: vh } = opts.size();
     if (!vw || !vh) return;
     const s = Math.min(movingCap, budget.scale(vw, vh)), t0 = performance.now();
+    const k = maxMovingSamples > 1 && s > 0.98 && sampleMs > 0 ? Math.max(1, Math.min(maxMovingSamples, Math.floor(budget.targetMs / sampleMs))) : 1;
     if (s > 0.98) {
       opts.setCamera(sc, vw, vh);
-      sc.renderToView(opts.view(), vw, vh);
+      if (k > 1) {
+        const view = opts.view();
+        sc.renderAccum(view, vw, vh, true);
+        for (let i = 1; i < k; i++) {
+          opts.setCamera(sc, vw, vh);
+          sc.renderAccum(view, vw, vh, false);
+        }
+      } else {
+        sc.renderToView(opts.view(), vw, vh);
+      }
     } else {
       const rw = Math.max(16, Math.round(vw * s)), rh = Math.max(16, Math.round(vh * s));
       opts.setCamera(sc, rw, rh);
@@ -2584,8 +2596,9 @@ function mountAdaptive3d(opts) {
     }
     opts.gpu.device.queue.onSubmittedWorkDone().then(() => {
       const ms = performance.now() - t0;
-      budget.update(ms);
-      dbgTick("mov", ms, s);
+      sampleMs = ms / k;
+      budget.update(sampleMs);
+      dbgTick("mov", ms, s, k);
     });
     opts.onFrame?.();
   };
@@ -3236,7 +3249,13 @@ async function main() {
     // 10 fps rather than the usual 60: dense tracts downsampled hard to hold a high frame rate alias
     // badly while rotating (thin tubes scintillating), and detail matters more here than smoothness.
     // The Target fps slider below moves this at runtime.
-    targetMs: 100
+    targetMs: 100,
+    // These tubes are sub-pixel, so a single sample aliases badly even at full resolution — measured
+    // mid-drag gradient energy 44.5 against 25.6 settled. Once the budget has bought native
+    // resolution, spend what is left on jittered samples of the same frame: at a 1 fps target that is
+    // ~17 samples, at 60 fps it stays at 1 and nothing changes. Capped so a very low target cannot
+    // queue an unbounded stall on one frame.
+    maxMovingSamples: 16
   });
   const bake = () => {
     a3d.renderSettled(true);
@@ -3450,6 +3469,13 @@ async function main() {
       a3d.renderSettled(true);
     },
     accumCount: () => scene.accumCount(),
+    // Deterministic hooks for the quality tests. Measuring a MOVING frame by dragging and guessing
+    // when to screenshot is unreliable: one moving frame at a low fps target takes ~1s, and the loop
+    // settles 120ms after the last kick, so a capture easily lands on a settled frame instead. These
+    // render exactly one moving frame on demand and report what the budget is doing.
+    renderMoving: () => a3d.renderMoving(),
+    targetMs: () => a3d.budget.targetMs,
+    budgetPx: () => a3d.budget.budgetPx,
     loadMs: () => loadMs,
     bytes: () => sc.bytesFetched,
     fraction: () => sc.fraction,
