@@ -1520,6 +1520,14 @@ var FiberField = class {
     this.motionAmp = Math.max(0, amplitude);
     this.motionTime = timeS;
   }
+  /** Phong constants [ka, kd, ks, shininess], live (uniform-resident — no rebuild), so a demo can
+   *  tune how bright the tubes read without rebuilding the grid. */
+  setShade(shade) {
+    this.shade = [shade[0], shade[1], shade[2], shade[3]];
+  }
+  get shading() {
+    return [this.shade[0], this.shade[1], this.shade[2], this.shade[3]];
+  }
   /** Depth-dependent halo strength/width, live (uniform-resident — no rebuild). */
   setHalo(strength, widthMm) {
     this.haloStrength = Math.max(0, Math.min(1, strength));
@@ -1893,6 +1901,32 @@ function orientation(flow, first, last, centre, minSepMm = 10) {
 }
 
 // render/demos/tracts-scene.ts
+function meanColor(colors) {
+  const n = Math.max(1, colors.length);
+  return [0, 1, 2].map((k) => colors.reduce((s, c) => s + c[k], 0) / n);
+}
+var GROUP_COLORS = {
+  Association: [0.31, 0.76, 0.97],
+  // cyan-blue
+  Cerebellar: [1, 0.72, 0.3],
+  // amber
+  Commissural: [0.9, 0.45, 0.45],
+  // coral
+  Projection: [0.51, 0.78, 0.52],
+  // green
+  Superficial: [0.73, 0.41, 0.78]
+  // violet
+};
+var FALLBACK_COLORS = [
+  [0.95, 0.85, 0.35],
+  [0.45, 0.85, 0.85],
+  [0.85, 0.55, 0.75],
+  [0.65, 0.85, 0.45],
+  [0.85, 0.65, 0.45]
+];
+function groupColor(name, index) {
+  return GROUP_COLORS[name] ?? FALLBACK_COLORS[index % FALLBACK_COLORS.length];
+}
 function rootUrl(base) {
   const here = globalThis.location?.href ?? "file:///";
   return new URL(base.endsWith("/") ? base : base + "/", here);
@@ -1926,10 +1960,24 @@ var TractScene = class _TractScene {
    *  halos below carry the local separation and stacking both at full strength goes muddy; AO's job
    *  here is the regional sense of depth into the mass. (Past ~0.025 density it erases thin strands.) */
   aoSettings = { strength: 0.4, radiusMm: 2, densityScale: 0.012 };
-  /** Same story: the field is rebuilt on every density change, so halo settings live here too. This
-   *  is the strongest of the depth cues — close up, strands separate instead of matting together —
-   *  at ~17% cost when zoomed in and none at whole-brain framing. */
-  haloSettings = { strength: 0.6, widthMm: 0.5 };
+  /** Same story: the field is rebuilt on every density change, so halo settings live here too. Halos
+   *  are the strongest depth cue here — close up, strands separate instead of matting together — but
+   *  they work by darkening, so a light touch is enough once the shading is bright and the groups are
+   *  colour-coded. Dial it up on the slider to separate a dense region. */
+  haloSettings = { strength: 0.1, widthMm: 0.5 };
+  /** Brighter than FiberField's own default (0.20/0.65/0.20/96). A brain-sized mass of sub-pixel
+   *  tubes under a headlight reads dark and flat: nearly every ray hits a tube at a grazing angle, so
+   *  the diffuse term rarely gets near its peak, and the halos and occlusion above take more light
+   *  out again. Lifting ambient and diffuse roughly doubles the contrast of the lit pixels (spread
+   *  32.5 -> 57.1) while leaving every bundle's colour exactly as its Slicer display node defines it
+   *  — the colours are the bundle identity in the group list, so they are not boosted. */
+  shadeSettings = [0.45, 1.1, 0.3, 48];
+  colorBy = "group";
+  /** Starting opacity per group. Superficial U-fibres form the brain's outer shell, so at full
+   *  opacity they hide the commissural and projection tracts from every exterior angle and the whole
+   *  view goes violet. Starting them semi-transparent lets the deep groups read through; the group's
+   *  opacity chip takes it back to 1. */
+  static DEFAULT_GROUP_OPACITY = { Superficial: 0.35 };
   constructor(dev, root, manifest, tubeRadius) {
     this.dev = dev;
     this.root = root;
@@ -1946,7 +1994,7 @@ var TractScene = class _TractScene {
     for (const g of this.groups) {
       const n = Math.max(1, g.bundleIds.length);
       g.color = [g.color[0] / n, g.color[1] / n, g.color[2] / n];
-      this.opacity[g.name] = 1;
+      this.opacity[g.name] = _TractScene.DEFAULT_GROUP_OPACITY[g.name] ?? 1;
     }
     const bb = manifest.boundsRAS;
     this.center = [(bb[0] + bb[1]) / 2, (bb[2] + bb[3]) / 2, (bb[4] + bb[5]) / 2];
@@ -1957,6 +2005,8 @@ var TractScene = class _TractScene {
     const sc = new _TractScene(dev, rootUrl(base), manifest, opts.radius ?? 0.175);
     if (opts.ao) Object.assign(sc.aoSettings, opts.ao);
     if (opts.halo) Object.assign(sc.haloSettings, opts.halo);
+    if (opts.shade) sc.shadeSettings = [...opts.shade];
+    if (opts.colorBy) sc.colorBy = opts.colorBy;
     await sc.setFraction(opts.fraction ?? manifest.defaultFraction ?? 0.1, opts.onProgress);
     return sc;
   }
@@ -2064,9 +2114,10 @@ var TractScene = class _TractScene {
       }
     }
     const bundleColors = {};
-    for (let i = 0; i < this.manifest.bundles.length; i++) {
-      const b = this.manifest.bundles[i];
-      bundleColors[i + 1] = [b.color[0], b.color[1], b.color[2], b.opacity * (this.opacity[b.group] ?? 1)];
+    for (let i = 0; i < this.manifest.bundles.length; i++) bundleColors[i + 1] = this.colorFor(i);
+    for (let g = 0; g < this.groups.length; g++) {
+      const grp = this.groups[g];
+      grp.color = this.colorBy === "group" ? groupColor(grp.name, g) : meanColor(grp.bundleIds.map((id) => this.manifest.bundles[id - 1].color));
     }
     const next = new FiberField(this.dev, all, {
       radius: this.tubeRadius,
@@ -2075,7 +2126,8 @@ var TractScene = class _TractScene {
       aoRadiusMm: this.aoSettings.radiusMm,
       aoDensityScale: this.aoSettings.densityScale,
       haloStrength: this.haloSettings.strength,
-      haloWidthMm: this.haloSettings.widthMm
+      haloWidthMm: this.haloSettings.widthMm,
+      shade: this.shadeSettings
     });
     this.fibers?.destroy();
     this.fibers = next;
@@ -2087,10 +2139,23 @@ var TractScene = class _TractScene {
     this.aoSettings.strength = Math.max(0, Math.min(1, strength));
     this.fibers.setAO(this.aoSettings.strength, this.aoSettings.radiusMm, this.aoSettings.densityScale);
   }
+  /** Tube shading, live (uniform-resident — no rebuild). Caller does scene.syncUniforms(). */
+  setShade(shade) {
+    this.shadeSettings = [...shade];
+    this.fibers.setShade(this.shadeSettings);
+  }
   /** Halo strength, live (uniform-resident — no rebuild). Caller does scene.syncUniforms(). */
   setHalo(strength) {
     this.haloSettings.strength = Math.max(0, Math.min(1, strength));
     this.fibers.setHalo(this.haloSettings.strength, this.haloSettings.widthMm);
+  }
+  /** The colour a bundle is drawn in: its group's colour by default, or its own Slicer colour under
+   *  `colorBy: "bundle"`. Its group's opacity is folded in, so this is the single place both the
+   *  rebuild and the opacity controls take colour from. */
+  colorFor(i) {
+    const b = this.manifest.bundles[i];
+    const rgb = this.colorBy === "group" ? groupColor(b.group, Math.max(0, this.manifest.groups.indexOf(b.group))) : b.color;
+    return [rgb[0], rgb[1], rgb[2], b.opacity * (this.opacity[b.group] ?? 1)];
   }
   groupOpacity(group) {
     return this.opacity[group] ?? 1;
@@ -2101,10 +2166,7 @@ var TractScene = class _TractScene {
     this.opacity[group] = Math.max(0, Math.min(1, o));
     const g = this.groups.find((x) => x.name === group);
     if (!g) return;
-    for (const id of g.bundleIds) {
-      const b = this.manifest.bundles[id - 1];
-      this.fibers.setBundleColor(id, [b.color[0], b.color[1], b.color[2], b.opacity * this.opacity[group]]);
-    }
+    for (const id of g.bundleIds) this.fibers.setBundleColor(id, this.colorFor(id - 1));
   }
   destroy() {
     this.fibers?.destroy();
