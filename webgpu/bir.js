@@ -1,4 +1,4 @@
-// render/device.ts
+// ../SlicerLive/render/device.ts
 async function initDevice() {
   const gpu = navigator.gpu;
   if (!gpu) throw new Error("WebGPU not available (need Chrome/Edge/Safari or Deno --unstable-webgpu)");
@@ -18,7 +18,7 @@ async function initDevice() {
   return { adapter, device, features: new Set(want) };
 }
 
-// render/mat4.ts
+// ../SlicerLive/render/mat4.ts
 function identity() {
   const m = new Float32Array(16);
   m[0] = m[5] = m[10] = m[15] = 1;
@@ -178,7 +178,7 @@ function spacingFromIjkToRAS(ijkToRAS) {
   return [col(0), col(1), col(2)];
 }
 
-// render/slice-renderer.ts
+// ../SlicerLive/render/slice-renderer.ts
 var DEFAULT_FORMAT = "rgba8unorm-srgb";
 var SHADER = (
   /* wgsl */
@@ -855,7 +855,7 @@ struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
   }
 };
 
-// render/slice-interactor.ts
+// ../SlicerLive/render/slice-interactor.ts
 var NORMAL = {
   axial: { axis: 2, sign: 1 },
   // sliceToRAS col2 = +S
@@ -951,7 +951,7 @@ var SliceInteractor = class {
   }
 };
 
-// render/scene-renderer.ts
+// ../SlicerLive/render/scene-renderer.ts
 var DEFAULT_FORMAT2 = "rgba8unorm-srgb";
 var SCENE_FLOATS = 16;
 var CLIP_FLOATS = 36;
@@ -2110,7 +2110,7 @@ ${pickDispatch}
   }
 };
 
-// render/fields.ts
+// ../SlicerLive/render/fields.ts
 function transformedAABB(m, lo, hi) {
   const mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
   for (let i = 0; i < 8; i++) {
@@ -2671,7 +2671,7 @@ fn sample_field_seg${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
   }
 };
 
-// render/bake.ts
+// ../SlicerLive/render/bake.ts
 var INIT_WGSL = (
   /* wgsl */
   `
@@ -2887,7 +2887,7 @@ var ColorizeBaker = class {
   }
 };
 
-// render/fiducial-field.ts
+// ../SlicerLive/render/fiducial-field.ts
 var MAX = 64;
 var FiducialField = class {
   kind = "fid";
@@ -3099,7 +3099,7 @@ fn sample_field_fid${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
   }
 };
 
-// render/roi-box-field.ts
+// ../SlicerLive/render/roi-box-field.ts
 var RoiBoxField = class {
   kind = "roi";
   bindingCount = 0;
@@ -3213,7 +3213,7 @@ fn sample_field_roi${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
   }
 };
 
-// render/demos/roi-widget.ts
+// ../SlicerLive/render/demos/roi-widget.ts
 function createRoiWidget(lo, hi, opts = {}) {
   const MIN_HALF = opts.minHalfMm ?? 5;
   const cov = opts.coverage ?? 0.35;
@@ -3298,7 +3298,7 @@ function createRoiWidget(lo, hi, opts = {}) {
   };
 }
 
-// algorithms/geom.ts
+// ../SlicerLive/algorithms/geom.ts
 function labelmapHasInternalBoundary(lab, dims) {
   const [nx, ny, nz] = dims;
   const at = (x, y, z) => lab[(z * ny + y) * nx + x];
@@ -3360,7 +3360,7 @@ function spacingFromIjkToRAS2(ijkToRAS) {
   return [col(0), col(1), col(2)];
 }
 
-// algorithms/editable-segmentation.ts
+// ../SlicerLive/algorithms/editable-segmentation.ts
 var EditableSegmentation = class {
   dims;
   ijkToRAS;
@@ -3446,7 +3446,7 @@ var EditableSegmentation = class {
   }
 };
 
-// render/sdf-bake.ts
+// ../SlicerLive/render/sdf-bake.ts
 var INIT_WGSL2 = (
   /* wgsl */
   `
@@ -4055,7 +4055,7 @@ var JfaSdfBaker = class {
   }
 };
 
-// logic/segmentation-logic.ts
+// ../SlicerLive/logic/segmentation-logic.ts
 function invertAffine(m) {
   const r = [m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10]];
   const det = r[0] * (r[4] * r[8] - r[5] * r[7]) - r[1] * (r[3] * r[8] - r[5] * r[6]) + r[2] * (r[3] * r[7] - r[4] * r[6]);
@@ -4301,7 +4301,7 @@ var SegmentationLogic = class {
   }
 };
 
-// render/demos/segroulette-scene.ts
+// ../SlicerLive/render/demos/segroulette-scene.ts
 var SDF_MAX_DIM = 256;
 function modalityLUT(modality, maxAlpha = 0.42) {
   const lut = new Uint8Array(256 * 4);
@@ -4536,7 +4536,7 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
   };
 }
 
-// render/demos/crosshair.ts
+// ../SlicerLive/render/demos/crosshair.ts
 function createCrosshair(visible = true) {
   const listeners = /* @__PURE__ */ new Set();
   const notify = () => {
@@ -4660,7 +4660,7 @@ function mountCrosshair(cfg) {
   return { state, redraw };
 }
 
-// render/vtk-camera.ts
+// ../SlicerLive/render/vtk-camera.ts
 var sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
 var add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
 var scale = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
@@ -4815,7 +4815,7 @@ var VtkCamera = class _VtkCamera {
   }
 };
 
-// render/vtk-interactor.ts
+// ../SlicerLive/render/vtk-interactor.ts
 var MOTION_FACTOR = 10;
 var MOUSE_WHEEL_MOTION_FACTOR = 1;
 function actionForButton(button, m = {}) {
@@ -4924,7 +4924,7 @@ var CameraInteractor = class _CameraInteractor {
   }
 };
 
-// render/demos/camera-control.ts
+// ../SlicerLive/render/demos/camera-control.ts
 function attachCameraControls(canvas, camera, opts = {}) {
   const interactor = new CameraInteractor(camera, opts.onChange);
   const local = (e) => {
@@ -5032,7 +5032,7 @@ function framedCamera(center, radius, distMul = 2.6) {
   );
 }
 
-// render/demos/slice-control.ts
+// ../SlicerLive/render/demos/slice-control.ts
 function attachSliceControls(canvas, cfg) {
   const SCROLL_PX = cfg.scrollPx ?? 7;
   const h = cfg.hooks ?? {};
@@ -5195,7 +5195,7 @@ function attachSliceControls(canvas, cfg) {
   };
 }
 
-// render/demos/view-grid.ts
+// ../SlicerLive/render/demos/view-grid.ts
 function attachViewGrid(grid, cells, onResize) {
   let maxed = null;
   const cellDiv = (cell) => grid.querySelector(`.cell[data-cell="${cell}"]`);
@@ -5226,7 +5226,7 @@ function attachDoubleClick(canvas, onDbl) {
   });
 }
 
-// render/demos/widget-control.ts
+// ../SlicerLive/render/demos/widget-control.ts
 var sub2 = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
 var dot2 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 function camMatrices(cam, w, h) {
@@ -5360,7 +5360,7 @@ function attachWidgetControls(canvas, camera, opts) {
   };
 }
 
-// render/demos/mosaic.ts
+// ../SlicerLive/render/demos/mosaic.ts
 function createMosaic(host) {
   const wrap = document.createElement("div");
   wrap.style.cssText = "position:absolute;inset:0;z-index:20;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:radial-gradient(60% 60% at 50% 45%,rgba(20,24,38,.35),rgba(6,8,14,.75));opacity:1;transition:opacity 350ms ease-out;";
@@ -5427,10 +5427,10 @@ function createMosaic(host) {
   };
 }
 
-// render/demos/sl-logo.ts
+// ../SlicerLive/render/demos/sl-logo.ts
 var SL_LOGO = "data:image/png;base64,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";
 
-// render/demos/sl-chrome.ts
+// ../SlicerLive/render/demos/sl-chrome.ts
 var DEFAULT_HELP = [
   { title: "3D view", rows: [
     ["Left-drag", "Rotate"],
@@ -5884,7 +5884,7 @@ function installChrome(opts) {
   return { refresh, destroy };
 }
 
-// render/vendor/idc_tools/s3.js
+// ../SlicerLive/render/vendor/idc_tools/s3.js
 var idcS3 = (bucket) => "https://" + (bucket || "idc-open-data") + ".s3.us-east-1.amazonaws.com/";
 async function fetchRetry(url, opts, tries = 6) {
   let err;
@@ -5931,7 +5931,7 @@ function ohifViewerURL(studyInstanceUID) {
   return studyInstanceUID ? `https://viewer.imaging.datacommons.cancer.gov/viewer/${studyInstanceUID}` : null;
 }
 
-// render/vendor/idc_tools/loader.js
+// ../SlicerLive/render/vendor/idc_tools/loader.js
 var _worker = null;
 function resolveWorkerURL(opts) {
   if (opts?.workerUrl)
@@ -6010,8 +6010,42 @@ async function loadSeries(entry, handlers = {}, opts) {
   r.entry = entry;
   return r;
 }
+async function loadThumbnail(prefix, bucket, modality, opts) {
+  const keys = await s3ListKeys(prefix, bucket);
+  if (!keys.length)
+    return null;
+  const mid = keys[Math.floor(keys.length / 2)];
+  const mod = { CT: "CT", MR: "MR", PT: "PET" }[modality] || modality;
+  return new Promise((resolve) => {
+    let w;
+    try {
+      w = new Worker(resolveWorkerURL(opts));
+    } catch {
+      return resolve(null);
+    }
+    let out = null;
+    const done = (v) => {
+      try {
+        w.terminate();
+      } catch {
+      }
+      resolve(v);
+    };
+    w.onmessage = (e) => {
+      const m = e.data;
+      if (m.t === "ct")
+        out = { vol: new (m.dtype === "float32" ? Float32Array : Int16Array)(m.vol), dims: m.dims, win: m.win, lev: m.lev };
+      else if (m.t === "alldone")
+        done(out);
+      else if (m.t === "error")
+        done(null);
+    };
+    w.onerror = () => done(null);
+    w.postMessage({ ctKeys: [mid], segKeys: [], ctBucket: bucket, segBucket: bucket, modality: mod });
+  });
+}
 
-// render/demos/bir.ts
+// ../SlicerLive/render/demos/bir.ts
 var PLANE_COLOR = {
   axial: "#f05a5a",
   sagittal: "#f0d24a",
@@ -6308,7 +6342,9 @@ function mountBir(cfg) {
     cfg.step(selectedPlane, forward);
     cfg.redraw(selectedPlane);
   };
-  btn("patient", "patient", "Select Patient \u2014 back to the patient/study/series browser", cfg.close);
+  if (!cfg.hidePatientBrowser) {
+    btn("patient", "patient", "Select Patient \u2014 back to the patient/study/series browser", cfg.close);
+  }
   btn("prev-study", "prevStudy", "Previous Study", () => cfg.nav?.prevStudy?.(), {
     disabled: !cfg.nav?.prevStudy,
     disabledTip: "Previous Study \u2014 none earlier"
@@ -6336,7 +6372,7 @@ function mountBir(cfg) {
     ["fourUp", "Four-Up (MPR + 3D)"],
     ["twoUp", "2 side-by-side"],
     ["single", "Single viewport"],
-    ["browser", "Browser (patient/study/series)"]
+    ...cfg.hidePatientBrowser ? [] : [["browser", "Browser (patient/study/series)"]]
   ]) layoutSel.add(new Option(label, v));
   layoutSel.addEventListener("change", () => {
     if (layoutSel.value === "browser") cfg.close();
@@ -6380,8 +6416,10 @@ function mountBir(cfg) {
   btn("tool-zoom", "zoom", "Zoom (drag up = out, down = in) \u2014 Z", () => setTool("zoom"));
   btn("tool-pan", "pan", "Pan (translate) \u2014 T", () => setTool("pan"));
   btn("tool-select", "selectvp", "Select Viewport \u2014 V", () => setTool("select"));
-  btn("tool-distance", "distance", "Distance measurement (click start, click end) \u2014 D", () => setTool("distance"));
-  btn("tool-angle", "angle", "Angle measurement (two segments, four clicks \u2014 Cobb) \u2014 A", () => setTool("angle"));
+  if (!cfg.disableMeasurements) {
+    btn("tool-distance", "distance", "Distance measurement (click start, click end) \u2014 D", () => setTool("distance"));
+    btn("tool-angle", "angle", "Angle measurement (two segments, four clicks \u2014 Cobb) \u2014 A", () => setTool("angle"));
+  }
   btn("tool-crosshair", "crosshair", "Cross-hair (click to localize in all viewports) \u2014 J", () => setTool("crosshair"));
   sep();
   let presetPop = null;
@@ -6603,10 +6641,12 @@ function mountBir(cfg) {
     strip = document.createElement("div");
     strip.id = "bir-strip";
     strip.innerHTML = `<div class="head">Series</div>`;
+    let currentItem = null;
     for (const it of cfg.strip) {
       const item = document.createElement("div");
       item.className = "item" + (it.current ? " current" : "");
-      item.title = it.lines.join(" \xB7 ") + " \u2014 double-click to load";
+      if (it.current) currentItem = item;
+      item.title = it.lines.join(" \xB7 ") + " \u2014 click to load";
       const img = document.createElement("img");
       img.alt = "";
       it.thumb().then((b) => {
@@ -6617,9 +6657,12 @@ function mountBir(cfg) {
       cap.className = "cap";
       cap.textContent = it.lines.join(" \xB7 ");
       item.append(img, cap);
-      item.addEventListener("dblclick", () => it.open());
+      item.addEventListener("click", () => {
+        if (!it.current) it.open();
+      });
       strip.appendChild(item);
     }
+    requestAnimationFrame(() => currentItem?.scrollIntoView({ block: "nearest" }));
     const row = document.createElement("div");
     row.id = "bir-row";
     row.style.cssText = "flex:1;display:flex;min-height:0;";
@@ -6693,7 +6736,7 @@ function mountBir(cfg) {
       ["W", "Window \u2014 drag to adjust window/level"],
       ["Z / T", "Zoom / Pan (translate)"],
       ["V", "Select viewport (click also selects)"],
-      ["D / A", "Distance (2 clicks) / Angle (4 clicks, Cobb) measurements"],
+      ...cfg.disableMeasurements ? [] : [["D / A", "Distance (2 clicks) / Angle (4 clicks, Cobb) measurements"]],
       ["J", "Cross-hair \u2014 click localizes in all viewports"],
       ["O", "Localizer lines on/off"],
       ["I", "Annotations \u2014 full / minimal / off"],
@@ -6734,8 +6777,7 @@ function mountBir(cfg) {
       z: () => setTool("zoom"),
       t: () => setTool("pan"),
       v: () => setTool("select"),
-      d: () => setTool("distance"),
-      a: () => setTool("angle"),
+      ...cfg.disableMeasurements ? {} : { d: () => setTool("distance"), a: () => setTool("angle") },
       j: () => setTool("crosshair"),
       o: () => buttons.get("localizer").click(),
       i: () => buttons.get("annotation").click(),
@@ -6808,7 +6850,7 @@ function mountBir(cfg) {
   };
 }
 
-// render/demos/idc-share.ts
+// ../SlicerLive/render/demos/idc-share.ts
 function studyShareURL(src) {
   const u = new URL(globalThis.location.origin + globalThis.location.pathname);
   if (src.st) u.searchParams.set("StudyInstanceUIDs", src.st);
@@ -6982,7 +7024,7 @@ globalThis.__slicerLiveIdc = {
   downloadStudyWithDialog
 };
 
-// render/scene-volume.ts
+// ../SlicerLive/render/scene-volume.ts
 function interpTF(tf, s, comps) {
   if (!tf.length) return new Array(comps).fill(0);
   if (s <= tf[0][0]) return tf[0].slice(1, 1 + comps);
@@ -7011,7 +7053,7 @@ function lutFromTransferFunctions(colorTF, opacityTF, clim) {
   return lut;
 }
 
-// render/ct-vr-presets.ts
+// ../SlicerLive/render/ct-vr-presets.ts
 var CT_VR_PRESETS = [
   {
     name: "CT-AAA",
@@ -7119,7 +7161,7 @@ function presetLUT(p) {
   return { lut, clim, shade };
 }
 
-// render/demos/vr-preset-menu.ts
+// ../SlicerLive/render/demos/vr-preset-menu.ts
 function openVrPresetMenu(opts) {
   if (document.getElementById("vr-preset-menu")) return;
   const overlay = document.createElement("div");
@@ -7162,7 +7204,7 @@ function openVrPresetMenu(opts) {
   document.body.appendChild(overlay);
 }
 
-// render/demos/bir-browser.ts
+// ../SlicerLive/render/demos/bir-browser.ts
 var P = new URLSearchParams(location.search);
 var KITS_DEFAULT = {
   c: "e3e86cde-da96-44b0-9e3b-b0b7bdd5a675",
@@ -7176,8 +7218,8 @@ var KITS_DEFAULT = {
   lic: "CC BY 3.0 \xB7 IDC c4kc_kits \xB7 doi:10.7937/tcia.2019.ix49e8nx"
 };
 var IDC_INDEX_BASE = globalThis.__IDC_INDEX_BASE || P.get("indexBase") || "https://js2.jetstream-cloud.org:8001/swift/v1/idc-index/";
-var GROUPS_URL = new URL("idc-rad-groups.json", IDC_INDEX_BASE).href;
-var PARQUET_URL = new URL("idc-rad-slim.parquet", IDC_INDEX_BASE).href;
+var GROUPS_URL = new URL("idc-rad-v2-groups.json", IDC_INDEX_BASE).href;
+var PARQUET_URL = new URL("idc-rad-v2-slim.parquet", IDC_INDEX_BASE).href;
 var HYPARQUET_ESM = "https://cdn.jsdelivr.net/npm/hyparquet@1.28.2/+esm";
 var splitList = (v) => (v ?? "").split(",").map((x) => x.trim()).filter(Boolean);
 var _dirCache = null;
@@ -7206,13 +7248,17 @@ var SLIM_COLS = [
   "aws_bucket",
   "Modality",
   "instanceCount",
+  "SeriesNumber",
   "SeriesDescription",
   "PatientID",
   "collection_id",
   "license_short_name",
   "source_DOI"
 ];
+var _studyRowsCache = /* @__PURE__ */ new Map();
 async function readStudyRows(studyUID, onStatus) {
+  const memo = _studyRowsCache.get(studyUID);
+  if (memo) return memo;
   const dir = await loadGroupDir(onStatus);
   const RGS = dir.rowGroupSize;
   const spans = [];
@@ -7235,6 +7281,7 @@ async function readStudyRows(studyUID, onStatus) {
     );
     const rows = parts.flat().filter((r) => r.StudyInstanceUID === studyUID);
     if (!rows.length) throw new Error(`StudyInstanceUID not found in the IDC index: ${studyUID}`);
+    _studyRowsCache.set(studyUID, rows);
     return rows;
   } catch (e) {
     if (e.message.includes("not found")) throw e;
@@ -7483,6 +7530,98 @@ async function main() {
       seriesDescription: r.SeriesDescription ? String(r.SeriesDescription) : void 0
     }));
   } : void 0;
+  const IDC_MODE = !!globalThis.__SLICERRAD_IDC;
+  const noMeasure = IDC_MODE || !!globalThis.__BIR_NO_MEASURE || P.get("measure") === "off";
+  const IMG_MODS = /* @__PURE__ */ new Set(["CT", "MR", "PT", "PET", "NM", "US", "XA", "CR", "DX", "MG", "RF", "SC", "XC", "OT"]);
+  const THUMB = 128;
+  let active = 0;
+  const waiters = [];
+  const acquire = () => active < 3 ? (active++, Promise.resolve()) : new Promise((r) => waiters.push(() => (active++, r())));
+  const release = () => {
+    active--;
+    waiters.shift()?.();
+  };
+  const sliceToThumb = (t) => {
+    const [w, h] = t.dims, lo = t.lev - t.win / 2, inv = 255 / Math.max(1, t.win);
+    const px = new Uint8ClampedArray(w * h * 4);
+    for (let i = 0; i < w * h; i++) {
+      let g = (t.vol[i] - lo) * inv;
+      g = g < 0 ? 0 : g > 255 ? 255 : g;
+      px[i * 4] = px[i * 4 + 1] = px[i * 4 + 2] = g;
+      px[i * 4 + 3] = 255;
+    }
+    const c0 = document.createElement("canvas");
+    c0.width = w;
+    c0.height = h;
+    c0.getContext("2d").putImageData(new ImageData(px, w, h), 0, 0);
+    const c = document.createElement("canvas");
+    c.width = THUMB;
+    c.height = THUMB;
+    const cx2 = c.getContext("2d");
+    cx2.fillStyle = "#000";
+    cx2.fillRect(0, 0, THUMB, THUMB);
+    const s = Math.min(THUMB / w, THUMB / h);
+    cx2.drawImage(c0, (THUMB - w * s) / 2, (THUMB - h * s) / 2, w * s, h * s);
+    return new Promise((res2) => c.toBlob(res2, "image/png"));
+  };
+  const placeholderThumb = (modality) => {
+    const c = document.createElement("canvas");
+    c.width = THUMB;
+    c.height = THUMB;
+    const cx2 = c.getContext("2d");
+    cx2.fillStyle = "#0b0e16";
+    cx2.fillRect(0, 0, THUMB, THUMB);
+    cx2.fillStyle = "#3d5a86";
+    cx2.font = "700 26px -apple-system,system-ui,sans-serif";
+    cx2.textAlign = "center";
+    cx2.textBaseline = "middle";
+    cx2.fillText(modality || "?", THUMB / 2, THUMB / 2);
+    return new Promise((res2) => c.toBlob(res2, "image/png"));
+  };
+  const currentSeriesThumb = () => {
+    const { vol, dims, win, lev } = res.ct;
+    const [w, h, d] = dims, z = Math.floor(d / 2);
+    return sliceToThumb({ vol: vol.subarray(z * w * h, (z + 1) * w * h), dims: [w, h, 1], win, lev });
+  };
+  const navigateToSeries = (seriesUID) => {
+    const u = new URL(location.href);
+    u.searchParams.set("StudyInstanceUIDs", source.st);
+    u.searchParams.set("SeriesInstanceUIDs", seriesUID);
+    for (const k of ["series", "seg", "bucket", "segBucket", "modality", "initialSeriesInstanceUID", "seriesUID"]) u.searchParams.delete(k);
+    location.href = u.toString();
+  };
+  let seriesStrip;
+  if (source.st) {
+    try {
+      const rows = await readStudyRows(source.st, setLoad);
+      rows.sort((a, b) => (parseInt(a.SeriesNumber) || 1e9) - (parseInt(b.SeriesNumber) || 1e9) || Number(b.instanceCount) - Number(a.instanceCount));
+      seriesStrip = rows.map((r) => {
+        const mod = String(r.Modality).toUpperCase();
+        const isCurrent = String(r.crdc_series_uuid) === source.c;
+        const desc = String(r.SeriesDescription ?? "").trim();
+        return {
+          seriesUID: String(r.SeriesInstanceUID),
+          lines: [mod, ...desc ? [desc] : [], `${Number(r.instanceCount) || 0} img`],
+          current: isCurrent,
+          thumb: async () => {
+            if (isCurrent) return currentSeriesThumb();
+            if (!IMG_MODS.has(mod) || !r.crdc_series_uuid) return placeholderThumb(mod);
+            await acquire();
+            try {
+              const t = await loadThumbnail(String(r.crdc_series_uuid), String(r.aws_bucket), mod);
+              return t ? sliceToThumb(t) : placeholderThumb(mod);
+            } catch {
+              return placeholderThumb(mod);
+            } finally {
+              release();
+            }
+          },
+          open: () => navigateToSeries(String(r.SeriesInstanceUID))
+        };
+      });
+    } catch {
+    }
+  }
   bir = mountBir({
     overlay: document.getElementById("viewer"),
     bar: document.getElementById("bir-bar"),
@@ -7509,6 +7648,12 @@ async function main() {
     close: () => status("This is the SlicerLive Basic Image Review demo \u2014 reload to restart."),
     jumpAll,
     modality: res.ct.modality,
+    strip: seriesStrip,
+    // Study-level IDC deployments (SlicerRAD-IDC) turn off the measurement tools (no annotation
+    // persistence yet) and hide the patient/study browser links (nothing to return to — the
+    // series strip is the navigation). Set window.__SLICERRAD_IDC / __BIR_NO_MEASURE, or ?measure=off.
+    disableMeasurements: noMeasure,
+    hidePatientBrowser: IDC_MODE,
     extraTools: [
       {
         id: "idc-share",
@@ -7625,7 +7770,7 @@ async function main() {
     xhair?.redraw();
   };
   const renderPresetThumbnails = () => {
-    const THUMB = 116;
+    const THUMB2 = 116;
     const savedOp = sc.volumeOpacity(), savedShift = sc.volumeShift(), savedSeg = sc.segOpacity();
     sc.setVolumeShift(0);
     if (savedSeg > 0) sc.setSegOpacity(0);
@@ -7637,13 +7782,13 @@ async function main() {
     const items = [];
     for (const e of entries) {
       const c = document.createElement("canvas");
-      c.width = THUMB;
-      c.height = THUMB;
+      c.width = THUMB2;
+      c.height = THUMB2;
       const cxt = c.getContext("webgpu");
       cxt.configure({ device: gpu.device, format: preferred, viewFormats: [srgb], alphaMode: "opaque" });
       sc.setVolumePreset(bakeOf(e.name));
-      sc.scene.setCamera(camera.position, camera.focalPoint, camera.viewUp, camera.viewAngle, THUMB, THUMB);
-      sc.scene.renderToView(cxt.getCurrentTexture().createView({ format: srgb }), THUMB, THUMB);
+      sc.scene.setCamera(camera.position, camera.focalPoint, camera.viewUp, camera.viewAngle, THUMB2, THUMB2);
+      sc.scene.renderToView(cxt.getCurrentTexture().createView({ format: srgb }), THUMB2, THUMB2);
       items.push({ name: e.name, label: e.label, canvas: c });
     }
     sc.setVolumePreset(bakeOf(vrPreset));
