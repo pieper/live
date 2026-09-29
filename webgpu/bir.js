@@ -6060,7 +6060,7 @@ async function loadThumbnail(prefix, bucket, modality, opts) {
         done(null);
     };
     w.onerror = () => done(null);
-    w.postMessage({ ctKeys: [mid], segKeys: [], ctBucket: bucket, segBucket: bucket, modality: mod });
+    w.postMessage({ ctKeys: [mid], segKeys: [], ctBucket: bucket, segBucket: bucket, modality: mod, thumbOnly: true });
   });
 }
 
@@ -7344,7 +7344,7 @@ async function resolveFromIndex(studyUID, wantSeries, onStatus) {
   }
   const inStudy = await readStudyRows(studyUID, onStatus);
   const want = new Set(wantSeries);
-  const IMG = /* @__PURE__ */ new Set(["CT", "MR", "PT", "PET", "NM"]);
+  const IMG = /* @__PURE__ */ new Set(["CT", "MR", "PT", "PET", "NM", "US"]);
   const imgs = inStudy.filter((r) => IMG.has(String(r.Modality).toUpperCase()));
   const segs = inStudy.filter((r) => String(r.Modality).toUpperCase() === "SEG");
   const chosen = imgs.find((r) => want.has(r.SeriesInstanceUID)) ?? imgs.slice().sort((a, b) => Number(b.instanceCount) - Number(a.instanceCount))[0];
