@@ -7239,6 +7239,7 @@ var KITS_DEFAULT = {
 var IDC_INDEX_BASE = globalThis.__IDC_INDEX_BASE || P.get("indexBase") || "https://js2.jetstream-cloud.org:8001/swift/v1/idc-index/";
 var GROUPS_URL = new URL("idc-rad-v2-groups.json", IDC_INDEX_BASE).href;
 var PARQUET_URL = new URL("idc-rad-v2-slim.parquet", IDC_INDEX_BASE).href;
+var MEMO_V = "idc-rad:v2";
 var HYPARQUET_ESM = "https://cdn.jsdelivr.net/npm/hyparquet@1.28.2/+esm";
 var splitList = (v) => (v ?? "").split(",").map((x) => x.trim()).filter(Boolean);
 var _dirCache = null;
@@ -7336,10 +7337,17 @@ async function resolveSource(onStatus) {
   return KITS_DEFAULT;
 }
 async function resolveFromIndex(studyUID, wantSeries, onStatus) {
-  const memoKey = `idc-rad:${studyUID}:${wantSeries.join(",")}`;
+  const memoKey = `${MEMO_V}:${studyUID}:${wantSeries.join(",")}`;
   try {
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith("idc-rad:") && !k.startsWith(`${MEMO_V}:`)) localStorage.removeItem(k);
+    }
     const hit = localStorage.getItem(memoKey);
-    if (hit) return JSON.parse(hit);
+    if (hit) {
+      const src2 = JSON.parse(hit);
+      if (!wantSeries.length || src2.sid === wantSeries[0]) return src2;
+    }
   } catch {
   }
   const inStudy = await readStudyRows(studyUID, onStatus);
@@ -7359,6 +7367,7 @@ async function resolveFromIndex(studyUID, wantSeries, onStatus) {
     m: mod === "PET" ? "PT" : mod,
     col: String(chosen.collection_id),
     st: studyUID,
+    sid: String(chosen.SeriesInstanceUID),
     sd: `${chosen.PatientID} \xB7 ${chosen.SeriesDescription || mod}`,
     lic: `${chosen.license_short_name || "IDC"} \xB7 ${chosen.collection_id}${chosen.source_DOI ? " \xB7 doi:" + chosen.source_DOI : ""}`
   };
