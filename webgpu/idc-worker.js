@@ -57,13 +57,16 @@ if (typeof DicomVolume === 'undefined')
 const DV = self.DicomVolume;
 const { sub, dot, cross, lps2ras } = DV;
 async function fetchBuf(key, base) { return (await fetchRetry((base || CT_S3) + key)).arrayBuffer(); }
-function makeThumb(ds) {
+/** Windowed RGBA of one slice. `width` defaults to the 64px mosaic tile; the first slice of a
+ *  series is also rendered at full width, so the reader can put a real image up while the rest
+ *  of the stack is still downloading instead of only a grid of tiles. */
+function makeThumb(ds, width = 64) {
     let pd = ds.PixelData;
     if (Array.isArray(pd))
         pd = pd[0];
     if (!pd)
         return null;
-    const nx = ds.Columns, ny = ds.Rows, TW = 64, TH = Math.max(1, Math.round(64 * ny / nx));
+    const nx = ds.Columns, ny = ds.Rows, TW = Math.min(width, nx), TH = Math.max(1, Math.round(TW * ny / nx));
     const px = ds.PixelRepresentation === 1 ? new Int16Array(pd) : new Uint16Array(pd);
     const slope = Number(ds.RescaleSlope ?? 1), inter = Number(ds.RescaleIntercept ?? 0);
     const lev = Number((Array.isArray(ds.WindowCenter) ? ds.WindowCenter[0] : ds.WindowCenter) ?? 40);
@@ -210,6 +213,12 @@ async function buildVolume(ctKeys, thumbOnly) {
             const k = ctKeys[idx++];
             const ds = naturalize(await fetchBuf(k));
             slices.push(ds);
+            if (slices.length === 1) {
+                // First slice through: a real image, full size, while the rest streams.
+                const big = makeThumb(ds, 512);
+                if (big)
+                    post({ t: 'preview', w: big.w, h: big.h, rgba: big.rgba.buffer }, [big.rgba.buffer]);
+            }
             const th = makeThumb(ds);
             if (th)
                 post({ t: 'thumb', n: Number(ds.InstanceNumber) || slices.length, w: th.w, h: th.h, rgba: th.rgba.buffer }, [th.rgba.buffer]);
@@ -236,7 +245,13 @@ function volumeFromSlices(slices) {
     return { ...v, win, lev, dtype: isPET ? 'float32' : 'int16' };
 }
 function buildLabelmap(ds, bits, ct) {
-    const [nx, ny, nz] = ct.dims, frameBytes = (nx * ny) >> 3;
+    const [nx, ny, nz] = ct.dims;
+    // The SEG frames have their OWN grid (DICOM Rows/Columns) and their own spacing, which need
+    // NOT match the image series it is drawn over: an autoPET lesion SEG is 400x400 on the PET
+    // grid while the CT displayed under it is 512x512. Walking the packed bitmask with the IMAGE
+    // volume's dims reads every frame at the wrong stride and runs off the end of each row.
+    const sx = Number(ds.Columns) || nx, sy = Number(ds.Rows) || ny;   // || : malformed SEG -> old behaviour
+    const frameBytes = Math.ceil(sx * sy / 8);
     const lab = new Uint8Array(nx * ny * nz);
     const M = ct.ijkToRAS, inv = invAffine(M);
     const toIJK = (lps) => {
@@ -274,10 +289,27 @@ function buildLabelmap(ds, bits, ct) {
         };
     }
     const seenSeg = new Set();
+    // DICOM SEG allows segments to overlap, a single-label volume cannot represent it, and the
+    // frame written last silently wins. Count what is lost so the viewer can say so rather than
+    // letting a reader believe the topmost segment is the whole story.
+    let overlapVoxels = 0;
+    const overlapPairs = new Set();
     const perFrame = ds.PerFrameFunctionalGroupsSequence || [];
     const ref = (perFrame[0]?.PlanePositionSequence?.[0]?.ImagePositionPatient || [0, 0, 0]).map(Number), o0 = toIJK(ref);
     const diCol = sub(toIJK([ref[0] + colW[0], ref[1] + colW[1], ref[2] + colW[2]]), o0);
     const diRow = sub(toIJK([ref[0] + rowW[0], ref[1] + rowW[1], ref[2] + rowW[2]]), o0);
+    // Step between frames, for the footprint below: the plane normal scaled by the slice thickness.
+    const pm = shared.PixelMeasuresSequence?.[0] || {};
+    const thick = Number(pm.SliceThickness ?? pm.SpacingBetweenSlices ?? 0) || 1;
+    const nW = cross(sIop.slice(0, 3), sIop.slice(3, 6)).map((v) => v * thick);
+    const diSlc = sub(toIJK([ref[0] + nW[0], ref[1] + nW[1], ref[2] + nW[2]]), o0);
+    // One SEG voxel covers a BOX of image voxels when the SEG grid is the coarser one (2.04 mm
+    // PET vs 0.91 mm CT = ~5 image voxels per SEG voxel). Writing a single voxel per set bit
+    // stipples the mask into isolated dots — about a fifth of the lesion, invisible under the
+    // overlay. Paint every image voxel whose CENTRE falls inside the SEG voxel: that is nearest-
+    // neighbour resampling, the same answer a reverse/pull resample gives, and for a SEG at or
+    // finer than the image grid the span collapses to the one voxel it already wrote.
+    const ext = [0, 1, 2].map((a) => Math.abs(diCol[a]) + Math.abs(diRow[a]) + Math.abs(diSlc[a]));
     for (let f = 0; f < perFrame.length; f++) {
         const fg = perFrame[f];
         const segNum = fg.SegmentIdentificationSequence?.[0]?.ReferencedSegmentNumber;
@@ -289,21 +321,35 @@ function buildLabelmap(ds, bits, ct) {
             post({ t: 'seg', name: names[segNum] || ('Segment ' + segNum) });
         }
         const o = toIJK(ippLps), fb = f * frameBytes;
-        for (let row = 0; row < ny; row++) {
-            const bi = o[0] + row * diRow[0], bj = o[1] + row * diRow[1], bk = o[2] + row * diRow[2], rb = row * nx;
-            for (let col = 0; col < nx; col++) {
+        for (let row = 0; row < sy; row++) {
+            const bi = o[0] + row * diRow[0], bj = o[1] + row * diRow[1], bk = o[2] + row * diRow[2], rb = row * sx;
+            for (let col = 0; col < sx; col++) {
                 const p = rb + col;
                 if (!((bits[fb + (p >> 3)] >> (p & 7)) & 1))
                     continue;
-                const i = Math.round(bi + col * diCol[0]), j = Math.round(bj + col * diCol[1]), k = Math.round(bk + col * diCol[2]);
-                if (i >= 0 && i < nx && j >= 0 && j < ny && k >= 0 && k < nz)
-                    lab[k * nx * ny + j * nx + i] = segNum;
+                const x = bi + col * diCol[0], y = bj + col * diCol[1], z = bk + col * diCol[2];
+                const i0 = Math.max(0, Math.ceil(x - ext[0] / 2)), i1 = Math.min(nx - 1, Math.floor(x + ext[0] / 2));
+                const j0 = Math.max(0, Math.ceil(y - ext[1] / 2)), j1 = Math.min(ny - 1, Math.floor(y + ext[1] / 2));
+                const k0 = Math.max(0, Math.ceil(z - ext[2] / 2)), k1 = Math.min(nz - 1, Math.floor(z + ext[2] / 2));
+                for (let k = k0; k <= k1; k++)
+                    for (let j = j0; j <= j1; j++)
+                        for (let i = i0; i <= i1; i++) {
+                            const o = k * nx * ny + j * nx + i, prev = lab[o];
+                            if (prev && prev !== segNum) {
+                                overlapVoxels++;
+                                overlapPairs.add(prev < segNum ? prev + ':' + segNum : segNum + ':' + prev);
+                            }
+                            lab[o] = segNum;
+                        }
             }
         }
         if (f % 200 === 0)
             prog(`SEG ${f}/${perFrame.length}`, 0.55 + 0.4 * f / perFrame.length);
     }
-    return { lab, colors, names, terminology };
+    return {
+        lab, colors, names, terminology,
+        overlap: { voxels: overlapVoxels, pairs: [...overlapPairs].map((p) => p.split(':').map(Number)) },
+    };
 }
 function invAffine(m) {
     const a = [m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10]], t = [m[3], m[7], m[11]];
@@ -384,7 +430,7 @@ self.onmessage = async (e) => {
                 parsed = { ds, bits: new Uint8Array(pd) };
             }
             const seg = buildLabelmap(parsed.ds, parsed.bits, ct);
-            post({ t: 'labelmap', lab: seg.lab, colors: seg.colors, names: seg.names, terminology: seg.terminology }, [seg.lab.buffer]);
+            post({ t: 'labelmap', lab: seg.lab, colors: seg.colors, names: seg.names, terminology: seg.terminology, overlap: seg.overlap }, [seg.lab.buffer]);
         }
         post({ t: 'alldone' });
     }
