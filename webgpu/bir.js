@@ -5937,7 +5937,8 @@ function installChrome(opts) {
     segHost.innerHTML = "";
     if (!S) return;
     const list = S.list();
-    if (!list.length) return;
+    const noteText = S.note?.();
+    if (!list.length && !noteText) return;
     const wrap = document.createElement("div");
     wrap.style.cssText = "margin-top:6px;border-top:1px solid rgba(255,255,255,.12);padding-top:6px;" + (list.length > 6 ? "max-height:210px;overflow-y:auto;" : "");
     for (const s of list) {
@@ -5962,10 +5963,9 @@ function installChrome(opts) {
       wrap.appendChild(row);
       segRows.push({ num: s.num, name: s.name, box, color: s.color, paint });
     }
-    const note = S.note?.();
-    if (note) {
+    if (noteText) {
       const n = document.createElement("div");
-      n.textContent = note;
+      n.textContent = noteText;
       n.style.cssText = "margin-top:6px;padding:5px 7px;border-radius:6px;background:rgba(255,196,84,.12);color:#ffc454;font:500 11.5px -apple-system,system-ui,sans-serif;line-height:1.35;";
       wrap.appendChild(n);
     }
@@ -6173,6 +6173,9 @@ function runWorker(ctKeys, segKeys, ctBucket, segBucket, modality, handlers, opt
           break;
         case "voi":
           handlers.onVOI?.(m.win, m.lev);
+          break;
+        case "geomcheck":
+          handlers.onGeomCheck?.({ stack: m.stack, reasons: m.reasons, notes: m.notes, kept: m.kept, total: m.total, spacing: m.spacing });
           break;
         case "ctdone":
           handlers.onVolumeDone?.(m.placed, m.expected, m.dropped ?? 0, m.outside ?? 0);
@@ -6661,11 +6664,18 @@ function mountBir(cfg) {
   layoutSel.title = "Layout Multiple Viewports \u2014 hanging protocol";
   layoutSel.style.cssText = "font:600 11px -apple-system,system-ui,sans-serif;color:#d6e2f2;background:#11141d;border:1px solid #33507e;border-radius:4px;padding:2px 4px;cursor:pointer;";
   for (const [v, label] of [
-    ["fourUp", "Four-Up (MPR + 3D)"],
-    ["twoUp", "2 side-by-side"],
-    ["single", "Single viewport"],
+    // A stack has nothing to lay out: no reformats, no 3D. Offering the multi-viewport
+    // protocols would offer views that would be wrong.
+    ...cfg.stackOnly ? [["single", "Single stack viewport"]] : [
+      ["fourUp", "Four-Up (MPR + 3D)"],
+      ["twoUp", "2 side-by-side"],
+      ["single", "Single viewport"]
+    ],
     ...cfg.hidePatientBrowser ? [] : [["browser", "Browser (patient/study/series)"]]
   ]) layoutSel.add(new Option(label, v));
+  if (cfg.stackOnly) {
+    layoutSel.title = "Layout \u2014 this series is an image stack, not a volume: only the stack viewport is available (no reformats or 3D)";
+  }
   layoutSel.addEventListener("change", () => {
     if (layoutSel.value === "browser") cfg.close();
     else setLayout(layoutSel.value);
@@ -6904,14 +6914,18 @@ function mountBir(cfg) {
     disabledTip: "Show Report \u2014 no reports available for this patient"
   });
   btn("help", "help", "Help \u2014 tool guide and keyboard shortcuts \u2014 H / F1", () => showHelp());
-  btn("advanced", "advanced", "Advanced Mode \u2014 toggle BIR basic (single stack) vs MPR Four-Up + 3D \u2014 F10", () => {
+  btn("advanced", "advanced", "Advanced Mode \u2014 toggle BIR basic (single stack) vs MPR Four-Up + 3D \u2014 F10", cfg.stackOnly ? void 0 : () => {
     setLayout(layout === "single" ? "fourUp" : "single");
-  });
+  }, cfg.stackOnly ? {
+    disabled: true,
+    disabledTip: "Advanced Mode \u2014 unavailable: this series is an image stack, not a volume (no MPR or 3D)"
+  } : void 0);
   if (cfg.extraTools?.length) {
     sep();
     for (const t of cfg.extraTools) btn(t.id, t.icon, t.title, t.run);
   }
   const setLayout = (l) => {
+    if (cfg.stackOnly) l = "single";
     layout = l;
     const show = {};
     const names = [...cfg.planes, "threeD"];
@@ -7516,7 +7530,7 @@ var KITS_DEFAULT = {
 var IDC_API_BASE = globalThis.__IDC_API_BASE || P.get("apiBase") || "https://api.imaging.datacommons.cancer.gov/v3";
 var splitList = (v) => (v ?? "").split(",").map((x) => x.trim()).filter(Boolean);
 var UID_RE = /^[0-9a-fA-F.-]{1,64}$/;
-var MEMO_V = "idc-rad:v5";
+var MEMO_V = "idc-rad:v6";
 var SLIM_COLS = [
   "StudyInstanceUID",
   "SeriesInstanceUID",
@@ -7688,7 +7702,9 @@ async function resolveFromIndex(studyUID, wantSeries, onStatus) {
   const IMG = /* @__PURE__ */ new Set(["CT", "MR", "PT", "PET", "NM", "US"]);
   const imgs = inStudy.filter((r) => IMG.has(String(r.Modality).toUpperCase()));
   const segs = inStudy.filter((r) => String(r.Modality).toUpperCase() === "SEG");
-  const chosen = imgs.find((r) => want.has(r.SeriesInstanceUID)) ?? imgs.slice().sort((a, b) => Number(b.instanceCount) - Number(a.instanceCount))[0];
+  const bySize = (a, b) => Number(b.instanceCount) - Number(a.instanceCount);
+  const regular = imgs.filter((r) => r.g_regular).sort(bySize);
+  const chosen = imgs.find((r) => want.has(r.SeriesInstanceUID)) ?? regular[0] ?? imgs.slice().sort(bySize)[0];
   if (!chosen) throw new Error("no CT/MR/PET/NM image series found in this study");
   const seg = segs.find((r) => want.has(r.SeriesInstanceUID)) ?? segs[0];
   const mod = String(chosen.Modality).toUpperCase();
@@ -7745,6 +7761,30 @@ function placeholderVolume(g, modality, voi) {
   }
   return { vol, dims: g.dims, ijkToRAS: g.ijkToRAS, win, lev, dtype: "float32", modality };
 }
+function geometryNotice(g, hadSeg) {
+  const viewer = document.getElementById("viewer");
+  const bar0 = document.getElementById("bir-bar");
+  if (!viewer || !bar0 || bar0.parentElement !== viewer) return;
+  const bar = document.createElement("div");
+  bar.id = "geom-notice";
+  const warn = g.stack;
+  bar.style.cssText = `flex:0 0 auto;display:flex;align-items:flex-start;gap:10px;padding:7px 12px;background:${warn ? "rgba(255,196,84,.13)" : "rgba(110,160,255,.11)"};border-bottom:1px solid ${warn ? "rgba(255,196,84,.35)" : "rgba(110,160,255,.3)"};color:${warn ? "#ffc454" : "#9fc0ff"};font:500 12px -apple-system,system-ui,sans-serif;line-height:1.45;`;
+  const text = document.createElement("div");
+  text.style.cssText = "flex:1 1 auto;min-width:0;";
+  const why = (warn ? g.reasons : g.notes).map((r) => `<li>${r}</li>`).join("");
+  text.innerHTML = warn ? `<b>${g.kept} images shown as a stack \u2014 this series is not a single volume.</b><ul style="margin:3px 0 0;padding-left:18px">${why}</ul><div style="margin-top:3px">The images and their in-plane measurements are real; the reformats, the 3D rendering${hadSeg ? " and the segmentation overlay" : ""} are not shown because this series has no trustworthy third dimension. Other series in the study may be volumes \u2014 pick one from the series strip.</div>` : `<b>Showing ${g.kept} of ${g.total} instances as the volume.</b><ul style="margin:3px 0 0;padding-left:18px">${why}</ul>`;
+  const x = document.createElement("button");
+  x.textContent = "\xD7";
+  x.title = "Dismiss";
+  x.style.cssText = "flex:0 0 auto;background:none;border:0;color:inherit;font:700 16px/1 system-ui;cursor:pointer;opacity:.7;padding:0 2px;";
+  x.addEventListener("click", () => {
+    bar.remove();
+    globalThis.dispatchEvent(new Event("resize"));
+  });
+  bar.appendChild(text);
+  bar.appendChild(x);
+  bar0.insertAdjacentElement("afterend", bar);
+}
 var DEFAULT_VOI = {
   CT: [400, 40],
   MR: [1e3, 500],
@@ -7798,6 +7838,7 @@ async function main() {
   let earlySeg = null;
   let streamStats = { placed: 0, expected: 0, dropped: 0, outside: 0 };
   let filledPlanes = null;
+  let geomCheck = null;
   const handlers = {
     onProgress: (p) => setLoad(`${p.msg}${p.frac ? ` \u2014 ${Math.round(p.frac * 100)}%` : ""}`),
     onSliceCount: (n) => mosaic.setCount(n),
@@ -7813,7 +7854,8 @@ async function main() {
     },
     onVolumeDone: (placed, expected, dropped, outside) => {
       streamStats = { placed, expected, dropped, outside };
-    }
+    },
+    onGeomCheck: (g) => geomCheck = g
   };
   let geomResolve = () => {
   };
@@ -7825,7 +7867,11 @@ async function main() {
     geometry: source.geom
   }) : loadSeries(source, handlers);
   const res = streaming ? { ct: placeholderVolume(await geomReady, source.m, firstSlice) } : await loadDone;
-  const sc = buildSegrouletteScene(gpu, srgb, res.ct, res.seg);
+  const stack = !!geomCheck?.stack;
+  const sc = buildSegrouletteScene(gpu, srgb, res.ct, stack ? void 0 : res.seg);
+  const kAxis = [sc.ijkToRAS[2], sc.ijkToRAS[6], sc.ijkToRAS[10]].map(Math.abs);
+  const stackPlane = kAxis[2] >= kAxis[1] && kAxis[2] >= kAxis[0] ? "axial" : kAxis[1] >= kAxis[0] ? "coronal" : "sagittal";
+  const planeOrder = stack ? [stackPlane, ...PLANES.filter((p) => p !== stackPlane)] : PLANES;
   let vmin = Infinity, vmax = -Infinity;
   const sampleRange = (v) => {
     const stride = Math.max(1, Math.floor(v.length / 2e5));
@@ -7890,7 +7936,10 @@ async function main() {
       };
       const pid = (source.sd.split("\xB7")[0] || "").trim() || source.col;
       mk("tl", `${pid}<br>${source.col} \xB7 ${res.ct.modality}`);
-      mk("tr", `${res.ct.modality} \xB7 ${sc.dims[2]} slices${sc.hasSeg ? " \xB7 SEG" : ""}<br>${sc.dims[0]}\xD7${sc.dims[1]}`);
+      mk(
+        "tr",
+        `${res.ct.modality} \xB7 ${sc.dims[2]} ${stack ? "images (stack)" : "slices"}${sc.hasSeg ? " \xB7 SEG" : ""}<br>${sc.dims[0]}\xD7${sc.dims[1]}`
+      );
       annEls[p] = { br: mk("br", "") };
     }
     updateAnnWL();
@@ -7940,7 +7989,7 @@ async function main() {
     const el = document.getElementById("sr-" + p);
     if (!el) return;
     const { index, count, mm } = sliceIndexOf(p);
-    el.textContent = `${index}/${count} \xB7 ${mm.toFixed(1)} mm`;
+    el.textContent = stack ? `image ${index}/${count}` : `${index}/${count} \xB7 ${mm.toFixed(1)} mm`;
   };
   const resize = () => {
     const dpr = Math.min(2, globalThis.devicePixelRatio || 1);
@@ -8098,7 +8147,7 @@ async function main() {
     overlay: document.getElementById("viewer"),
     bar: document.getElementById("bir-bar"),
     grid: document.getElementById("grid"),
-    planes: PLANES,
+    planes: planeOrder,
     canvases: cv,
     cellOf: (name) => document.querySelector(`[data-cell="${name}"]`),
     slice: () => sc.slice,
@@ -8130,6 +8179,9 @@ async function main() {
     // series strip is the navigation). Set window.__SLICERRAD_IDC / __BIR_NO_MEASURE, or ?measure=off.
     disableMeasurements: noMeasure,
     hidePatientBrowser: IDC_MODE,
+    // Not a volume → no reformats and no 3D to lay out: BIR basic, one stack viewport.
+    stackOnly: stack,
+    initialLayout: stack ? "single" : void 0,
     extraTools: [
       {
         id: "idc-share",
@@ -8374,7 +8426,10 @@ async function main() {
     }
   ];
   const chrome = installChrome({
-    controls,
+    // A stack has no 3D view, so the volume-rendering and crop controls would act on nothing:
+    // only the annotation toggle (and the segmentation section, which explains its own absence)
+    // are meaningful.
+    controls: stack ? controls.filter((c) => c.label === "Corner annotations") : controls,
     // The BIR toolbar has its own Help button — suppress sl-chrome's fixed top-left "?" so it
     // doesn't overlap the toolbar (reported obscuring the Select-Patient / nav icons).
     help: false,
@@ -8390,6 +8445,9 @@ async function main() {
       // A DICOM SEG may define overlapping segments; a single-label volume cannot hold them, so
       // the frame decoded last wins. Say so rather than letting the list read as the whole truth.
       note: () => {
+        if (stack) {
+          return res.seg || source.s ? "\u26A0 Segmentation hidden \u2014 this series is a stack of images, not a volume, so a segmentation drawn on the slice positions cannot be registered to it." : null;
+        }
         const ov = sc.segOverlap;
         if (!ov) return null;
         const nameOf = (n) => sc.segments.find((s) => s.num === n)?.name ?? `Segment ${n}`;
@@ -8401,10 +8459,13 @@ async function main() {
   });
   buildAnnotations();
   applyAnn();
+  if (geomCheck && (geomCheck.stack || geomCheck.notes.length)) {
+    geometryNotice(geomCheck, !!(res.seg || source.s));
+  }
   const info = document.getElementById("info");
   if (info) info.textContent = `${source.sd} \xB7 ${res.ct.modality} ${sc.dims.join("\xD7")} \xB7 ${source.lic}`;
   resize();
-  const READY = `${source.sd} \u2014 scroll to page slices, pick a tool from the toolbar, drag 3D to orbit`;
+  const READY = stack ? `${source.sd} \u2014 image stack: scroll to page images, pick a tool from the toolbar` : `${source.sd} \u2014 scroll to page slices, pick a tool from the toolbar, drag 3D to orbit`;
   if (!streaming) {
     await mosaic.done();
     status(READY);
