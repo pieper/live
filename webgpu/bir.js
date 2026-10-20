@@ -4482,7 +4482,7 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
     writeSlice(k, slice2) {
       volumeField.updateSlab(k, slice2);
     },
-    setDataRange(lo, hi) {
+    setVolumeWindow(lo, hi) {
       grayClim[0] = lo;
       grayClim[1] = hi;
       if (baseVolLut === grayLut) {
@@ -5856,9 +5856,13 @@ function installChrome(opts) {
         top.appendChild(val);
         const inp = document.createElement("input");
         inp.type = "range";
-        inp.min = String(c.slider.min);
-        inp.max = String(c.slider.max);
-        inp.step = String(c.slider.step ?? 1);
+        const num = (v, dflt) => v === void 0 ? dflt : typeof v === "function" ? v() : v;
+        const setBounds = () => {
+          inp.min = String(num(c.slider.min, 0));
+          inp.max = String(num(c.slider.max, 1));
+          inp.step = String(num(c.slider.step, 1));
+        };
+        setBounds();
         inp.value = String(c.slider.get());
         inp.style.cssText = "width:100%;accent-color:#54c6f0;cursor:pointer;";
         const fmt = c.slider.format ?? ((v) => String(Math.round(v)));
@@ -5876,6 +5880,7 @@ function installChrome(opts) {
         row.appendChild(inp);
         pop.appendChild(row);
         rows.push({ c, row, repaint: () => {
+          setBounds();
           inp.value = String(c.slider.get());
           paint();
         } });
@@ -8009,6 +8014,7 @@ async function main() {
     wl.win = win;
     wl.lev = lev;
     sc.slice.setWindowLevel(win, lev);
+    sc.setVolumeWindow(lev - win / 2, lev + win / 2);
     for (const p of PLANES) drawSlice(p);
     xhair?.redraw();
     syncWl();
@@ -8284,7 +8290,16 @@ async function main() {
   });
   let vrPreset = null;
   let vrShift = 0;
-  const shiftRange = Math.max(200, (vmax - vmin) / 2);
+  const shiftStep = () => {
+    const half = (vmax - vmin) / 2;
+    return Math.max(1, Math.round((Number.isFinite(half) && half > 200 ? half : 200) / 200));
+  };
+  const shiftRange = () => {
+    const half = (vmax - vmin) / 2;
+    const span = Number.isFinite(half) && half > 200 ? half : 200;
+    const step = shiftStep();
+    return step * Math.round(span / step);
+  };
   const bakeOf = (name) => name ? presetLUT(CT_VR_PRESETS.find((p) => p.name === name)) : null;
   const presetLabel = () => vrPreset ? CT_VR_PRESETS.find((p) => p.name === vrPreset)?.label ?? vrPreset : "Default (W/L)";
   const applyVrPreset = (name) => {
@@ -8333,7 +8348,7 @@ async function main() {
     presets: () => CT_VR_PRESETS.map((p) => p.name),
     setPreset: (name) => applyVrPreset(name),
     setShift: (hu) => applyVrShift(hu),
-    vrState: () => ({ preset: vrPreset, shift: vrShift, shiftRange, dataRange: [vmin, vmax] }),
+    vrState: () => ({ preset: vrPreset, shift: vrShift, shiftRange: shiftRange(), dataRange: [vmin, vmax] }),
     thumbCount: () => renderPresetThumbnails().length
   });
   const controls = [
@@ -8351,9 +8366,9 @@ async function main() {
     {
       label: "Shift",
       slider: {
-        min: -shiftRange,
-        max: shiftRange,
-        step: Math.max(1, Math.round(shiftRange / 200)),
+        min: () => -shiftRange(),
+        max: () => shiftRange(),
+        step: () => shiftStep(),
         get: () => vrShift,
         set: (v) => applyVrShift(v),
         format: (v) => (v > 0 ? "+" : "") + Math.round(v)
@@ -8514,7 +8529,7 @@ async function main() {
   }
   if (unfilled) console.warn(`[bir] ${unfilled} plane(s) of ${sc.dims[2]} never received data`);
   bir?.refreshStrip();
-  if (Number.isFinite(vmin) && vmax > vmin) sc.setDataRange(vmin, vmax);
+  chrome.refresh();
   drawAll();
   await mosaic.done();
   resize();
