@@ -225,21 +225,30 @@ fn srgb2physical(c : vec3<f32>) -> vec3<f32> {
   let lo = c / 12.92; let hi = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
   return select(lo, hi, c > vec3<f32>(0.04045));
 }
-/** The overlay colour at a texture coordinate, from whichever source is configured. */
-fn ov_tex(t : vec3<f32>) -> vec4<f32> {
+/** The overlay colour of ONE label layer at a texture coordinate.
+ *
+ *  size.z is the number of label layers (0 = the pre-coloured rgba overlay, which is one layer by
+ *  definition). The layers are stacked along z in a single label texture \u2014 depth = nz * layers \u2014
+ *  because DICOM SEG segments may overlap and one label per voxel cannot hold that: segments that
+ *  overlap are decoded into different layers and composited here, the way OHIF composites one
+ *  representation per layer. */
+fn ov_layer(t : vec3<f32>, layer : i32) -> vec4<f32> {
   if (u.size.z > 0.5) {
-    let d = vec3<f32>(textureDimensions(t_labels));
+    let full = vec3<f32>(textureDimensions(t_labels));
+    let nz = full.z / max(u.size.z, 1.0);                    // depth of ONE layer
+    let d = vec3<f32>(full.x, full.y, nz);
     let vi = vec3<i32>(clamp(floor(t * d), vec3<f32>(0.0), d - vec3<f32>(1.0)));
-    let lab = i32(textureLoad(t_labels, vi, 0).r);
+    let lab = i32(textureLoad(t_labels, vec3<i32>(vi.x, vi.y, vi.z + layer * i32(nz)), 0).r);
     if (lab == 0) { return vec4<f32>(0.0); }
     return textureLoad(t_palette, vec2<i32>(lab, 1), 0);
   }
+  if (layer > 0) { return vec4<f32>(0.0); }
   return textureSampleLevel(t_overlay, s_nn, t, 0.0);
 }
-fn ov_at(ras : vec3<f32>) -> vec4<f32> {   // overlay at a RAS point (0 outside the volume)
+fn ov_at(ras : vec3<f32>, layer : i32) -> vec4<f32> {   // overlay at a RAS point (0 outside the volume)
   let t = (u.p2t * vec4<f32>(ras, 1.0)).xyz;
   if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { return vec4<f32>(0.0); }
-  return ov_tex(t);
+  return ov_layer(t, layer);
 }
 @fragment
 fn fs_main(v : V) -> @location(0) vec4<f32> {
@@ -282,36 +291,56 @@ fn fs_main(v : V) -> @location(0) vec4<f32> {
       }
     }
   }
-  let ov = ov_tex(tex);
   // Slicer-style 2D segmentation: a semi-transparent per-voxel FILL plus a brighter boundary
   // OUTLINE, with independent opacities (params.z = fill, params.w = outline). The outline is
   // screen-space (constant pixel width under zoom), drawn in the segment's own colour along its
   // inner edge \u2014 at both label\u2194label and label\u2194background boundaries.
-  let fillA = clamp(ov.a * u.params.z, 0.0, 1.0);
-  var outA = 0.0;
-  if (u.params.w > 0.0) {
+  //
+  // Each label layer composites over the one below, so a voxel claimed by two segments comes out
+  // MORE OPAQUE than either alone (1-(1-a1)(1-a2)) and in the blend of their colours \u2014 which is
+  // how an overlap reads as an overlap rather than as whichever segment was decoded last. Each
+  // layer is also edge-tested on its OWN labels, so every segment keeps its own contour through
+  // the region it shares; the contours blend only where they coincide.
+  let nL = max(i32(u.size.z), 1);
+  let w = max(u.uvec.w, 1.0);
+  let du = u.uvec.xyz / u.size.x * w;     // w px right, in RAS
+  let dv = u.vvec.xyz / u.size.y * w;     // w px up
+  let dd = 0.70710678;                    // diagonals at the same distance
+  var fillC = vec3<f32>(0.0); var fillA = 0.0;   // premultiplied
+  var edgeC = vec3<f32>(0.0); var edgeA = 0.0;
+  for (var l = 0; l < nL; l = l + 1) {
+    let ov = ov_layer(tex, l);
+    if (ov.a <= 0.0) { continue; }                 // segment hidden, or no label in this layer
+    // The display alpha is folded in PER LAYER, before compositing \u2014 that is what makes an
+    // overlap more opaque: one layer gives exactly a, two give 1-(1-a)^2.
+    let fa = clamp(ov.a * u.params.z, 0.0, 1.0);
+    fillC = ov.rgb * fa + fillC * (1.0 - fa);
+    fillA = fa + fillA * (1.0 - fa);
+    if (u.params.w <= 0.0) { continue; }
     // The contour is the band of voxels within w SCREEN pixels of a boundary, so it keeps the
     // same visual weight at every zoom. Eight neighbours, not four: at four, a boundary running
     // diagonally is only sampled across its corners and the line thins and breaks up as w grows.
-    let w = max(u.uvec.w, 1.0);
-    let du = u.uvec.xyz / u.size.x * w;     // w px right, in RAS
-    let dv = u.vvec.xyz / u.size.y * w;     // w px up
-    let dd = 0.70710678;                    // diagonals at the same distance
-    let n0 = ov_at(ras + du); let n1 = ov_at(ras - du); let n2 = ov_at(ras + dv); let n3 = ov_at(ras - dv);
-    let n4 = ov_at(ras + (du + dv) * dd); let n5 = ov_at(ras + (du - dv) * dd);
-    let n6 = ov_at(ras - (du + dv) * dd); let n7 = ov_at(ras - (du - dv) * dd);
     // A neighbour is a DIFFERENT segment iff its overlay texel differs at all. The overlay is
     // sampled NEAREST from a crisp per-voxel bake, so every texel is an exact palette entry and
     // an exact comparison is the label test: two touching segments whose colours happen to be
     // close still get a boundary, where a distance threshold used to merge them into one blob.
     // A hidden segment (palette alpha 0) differs from a visible neighbour, so the visible one
     // keeps its contour there; and its own voxels have ov.a = 0, so it draws nothing itself.
-    let edge = select(0.0, 1.0,
-      any(n0 != ov) || any(n1 != ov) || any(n2 != ov) || any(n3 != ov) ||
-      any(n4 != ov) || any(n5 != ov) || any(n6 != ov) || any(n7 != ov));
-    outA = clamp(ov.a * u.params.w * edge, 0.0, 1.0);
+    let n0 = ov_at(ras + du, l); let n1 = ov_at(ras - du, l);
+    let n2 = ov_at(ras + dv, l); let n3 = ov_at(ras - dv, l);
+    let n4 = ov_at(ras + (du + dv) * dd, l); let n5 = ov_at(ras + (du - dv) * dd, l);
+    let n6 = ov_at(ras - (du + dv) * dd, l); let n7 = ov_at(ras - (du - dv) * dd, l);
+    if (any(n0 != ov) || any(n1 != ov) || any(n2 != ov) || any(n3 != ov) ||
+        any(n4 != ov) || any(n5 != ov) || any(n6 != ov) || any(n7 != ov)) {
+      let ea = clamp(ov.a * u.params.w, 0.0, 1.0);
+      edgeC = ov.rgb * ea + edgeC * (1.0 - ea);
+      edgeA = ea + edgeA * (1.0 - ea);
+    }
   }
-  col = mix(col, ov.rgb, max(fillA, outA));
+  // Fill first, then the contours over it (the contour of a segment reads over its own fill and
+  // over anything it overlaps).
+  if (fillA > 0.0) { col = mix(col, fillC / fillA, fillA); }
+  if (edgeA > 0.0) { col = mix(col, edgeC / edgeA, edgeA); }
   return vec4<f32>(srgb2physical(col), 1.0);
 }
 `
@@ -565,10 +594,10 @@ var SliceRenderer = class {
   /** Colour the overlay from a u8 label volume + the 256x2 palette (row 1 = colour/opacity),
    *  instead of a pre-coloured rgba volume. Same geometry requirement as setTextures. Pass
    *  nulls to go back to the rgba overlay. */
-  setLabelOverlay(labels, palette) {
+  setLabelOverlay(labels, palette, layers = 1) {
     this.labels = labels ?? void 0;
     this.palette = palette ?? void 0;
-    this.u[34] = labels && palette ? 1 : 0;
+    this.u[34] = labels && palette ? Math.max(1, layers) : 0;
     if (this.scalarTex) this.rebind();
   }
   rebind() {
@@ -4394,16 +4423,28 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
     ijkToRAS: ct.ijkToRAS,
     shade: baseShade
   });
+  const layersOf = (sg) => [sg.lab, ...sg.extra ?? []];
+  const mergedLabels = (sg) => {
+    const stack = layersOf(sg);
+    if (stack.length === 1) return sg.lab;
+    const out = new Uint8Array(sg.lab);
+    for (let l = 1; l < stack.length; l++) {
+      const lay = stack[l];
+      for (let i = 0; i < lay.length; i++) if (lay[i]) out[i] = lay[i];
+    }
+    return out;
+  };
   const segments = [];
   const palette = new Float32Array(256 * 4);
   const enumerateSegments = (sg) => {
     segments.length = 0;
     palette.fill(0);
     const total = dims[0] * dims[1] * dims[2];
+    const stack = layersOf(sg);
     for (const [num, r, g, b] of sg.colors) {
       if (num === 0 || r === 0 && g === 0 && b === 0) continue;
       let n = 0;
-      for (let i = 0; i < sg.lab.length; i++) if (sg.lab[i] === num) n++;
+      for (const lay of stack) for (let i = 0; i < lay.length; i++) if (lay[i] === num) n++;
       if (!n || n > total * 0.6) continue;
       if (num < 256) {
         palette[num * 4] = r;
@@ -4422,12 +4463,63 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
     for (const s of segments) if (s.num < 256) p[s.num * 4 + 3] = opacityOf(s.num);
     return p;
   };
-  let colorTex = seg ? bakeColorizeRGBA(dev, seg.lab, dims, visPalette(), SLICE_OVERLAY_SIGMA) : void 0;
+  let colorTex;
+  let labelTex;
+  let paletteTex;
+  let labelLayers = 0;
+  const writePalette = () => {
+    if (!paletteTex) return;
+    const p = visPalette();
+    const row = new Uint8Array(256 * 4);
+    for (let i = 0; i < 256; i++) {
+      row[i * 4] = Math.round(p[i * 4] * 255);
+      row[i * 4 + 1] = Math.round(p[i * 4 + 1] * 255);
+      row[i * 4 + 2] = Math.round(p[i * 4 + 2] * 255);
+      row[i * 4 + 3] = Math.round(p[i * 4 + 3] * 255);
+    }
+    dev.queue.writeTexture({ texture: paletteTex, origin: [0, 1] }, row, { bytesPerRow: 256 * 4 }, [256, 1]);
+  };
+  const buildLabelOverlay = (sg) => {
+    const stack = layersOf(sg);
+    labelLayers = stack.length;
+    labelTex?.destroy();
+    labelTex = dev.createTexture({
+      size: [dims[0], dims[1], dims[2] * labelLayers],
+      dimension: "3d",
+      format: "r8uint",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
+    });
+    for (let l = 0; l < stack.length; l++) {
+      dev.queue.writeTexture(
+        { texture: labelTex, origin: [0, 0, l * dims[2]] },
+        stack[l],
+        { bytesPerRow: dims[0], rowsPerImage: dims[1] },
+        [dims[0], dims[1], dims[2]]
+      );
+    }
+    if (!paletteTex) {
+      paletteTex = dev.createTexture({
+        size: [256, 2],
+        format: "rgba8unorm",
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
+      });
+    }
+    writePalette();
+  };
+  const applyOverlay = () => {
+    slice.setTextures(volumeField.volumeTexture(), colorTex);
+    slice.setLabelOverlay(labelTex ?? null, paletteTex ?? null, labelLayers);
+  };
+  const makeOverlay = (sg) => {
+    if ((sg.extra?.length ?? 0) > 0) buildLabelOverlay(sg);
+    else colorTex = bakeColorizeRGBA(dev, sg.lab, dims, visPalette(), SLICE_OVERLAY_SIGMA);
+  };
+  if (seg) makeOverlay(seg);
   let mode = "volume";
   let segLogic;
   let editable;
   const buildSdf = (sg) => {
-    const cap = resampleIsotropic(sg.lab, dims, ct.ijkToRAS, opts.sdfMaxDim ?? SDF_MAX_DIM, opts.sdfMaxVoxels);
+    const cap = resampleIsotropic(mergedLabels(sg), dims, ct.ijkToRAS, opts.sdfMaxDim ?? SDF_MAX_DIM, opts.sdfMaxVoxels);
     if (cap.coarsened) console.warn(`SEGRoulette: SDF grid coarsened to fit the device memory budget (${cap.dims.join("\xD7")}, ${cap.vox.toFixed(2)}mm) \u2014 a remote render server would allow full resolution.`);
     editable = new EditableSegmentation(dev, cap.dims, { ijkToRAS: cap.ijkToRAS });
     const boundaryMode = labelmapHasInternalBoundary(cap.lab, cap.dims) ? "all" : "outer";
@@ -4466,6 +4558,10 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
   rebuild();
   const rebakeColorized = () => {
     if (!seg) return;
+    if (labelTex) {
+      writePalette();
+      return;
+    }
     const nt = bakeColorizeRGBA(dev, seg.lab, dims, visPalette(), SLICE_OVERLAY_SIGMA);
     const old = colorTex;
     colorTex = nt;
@@ -4474,7 +4570,7 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
   };
   const slice = new SliceRenderer(gpu, format);
   slice.setVolume(volumeField.patientToTexture(), rasLo, rasHi);
-  slice.setTextures(volumeField.volumeTexture(), colorTex);
+  applyOverlay();
   slice.setWindowLevel(ct.win, ct.lev);
   slice.setOverlayOpacity(seg ? 0.5 : 0);
   const center = [(rasLo[0] + rasHi[0]) / 2, (rasLo[1] + rasHi[1]) / 2, (rasLo[2] + rasHi[2]) / 2];
@@ -4511,8 +4607,9 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
       enumerateSegments(sg);
       if (!segments.length) return;
       colorTex?.destroy();
-      colorTex = bakeColorizeRGBA(dev, sg.lab, dims, visPalette(), SLICE_OVERLAY_SIGMA);
-      slice.setTextures(volumeField.volumeTexture(), colorTex);
+      colorTex = void 0;
+      makeOverlay(sg);
+      applyOverlay();
       buildSdf(sg);
       hasSeg = !!segLogic;
       showSeg = hasSeg && segLayerOpacity > 1e-3;
@@ -6291,7 +6388,7 @@ function runWorker(ctKeys, segKeys, ctBucket, segBucket, modality, handlers, opt
           break;
         }
         case "labelmap": {
-          seg = { lab: new Uint8Array(m.lab), colors: m.colors, names: m.names, terminology: m.terminology, overlap: m.overlap };
+          seg = { lab: new Uint8Array(m.lab), extra: (m.extra ?? []).map((e2) => new Uint8Array(e2)), colors: m.colors, names: m.names, terminology: m.terminology, overlap: m.overlap };
           chain = chain.then(() => handlers.onLabelmap?.(seg)).catch((err) => console.error("[idc_tools] onLabelmap", err));
           break;
         }
@@ -7980,6 +8077,7 @@ async function main() {
   sc.setVolumeOpacity(0.5);
   sc.setSegOpacity(0.5);
   let midSlice = null;
+  let shownSeg = res.seg ?? null;
   let scheduleRedraw = () => {
   };
   let segAttached = false;
@@ -7994,6 +8092,7 @@ async function main() {
     scheduleRedraw();
   };
   const takeSeg = (sg) => {
+    shownSeg = sg;
     sc.attachSegmentation(sg);
     segAttached = true;
     segRefreshUi();
@@ -8308,6 +8407,39 @@ async function main() {
       draw3d();
     },
     roiState: () => ({ visible: sc.roiVisible(), handles: sc.roi.handleList().length }),
+    // Segmentation introspection for the harnesses: what decoded, how it was layered, and where
+    // a given segment is (so a test can put a view on it).
+    rawSeg: () => shownSeg,
+    segInfo: () => ({
+      layers: 1 + (shownSeg?.extra?.length ?? 0),
+      overlap: sc.segOverlap,
+      segments: sc.segments.map((x) => ({ num: x.num, name: x.name, voxels: x.voxels }))
+    }),
+    segCentroid: (num) => {
+      const stack2 = [shownSeg?.lab, ...shownSeg?.extra ?? []].filter(Boolean);
+      const [nx, ny] = sc.dims;
+      let n = 0, si = 0, sj = 0, sk = 0;
+      for (const lay of stack2) {
+        for (let o = 0; o < lay.length; o++) {
+          if (lay[o] !== num) continue;
+          const k2 = o / (nx * ny) | 0, j2 = (o - k2 * nx * ny) / nx | 0, i2 = o - k2 * nx * ny - j2 * nx;
+          si += i2;
+          sj += j2;
+          sk += k2;
+          n++;
+        }
+      }
+      if (!n) return null;
+      const M = sc.ijkToRAS, i = si / n, j = sj / n, k = sk / n;
+      return [
+        M[0] * i + M[1] * j + M[2] * k + M[3],
+        M[4] * i + M[5] * j + M[6] * k + M[7],
+        M[8] * i + M[9] * j + M[10] * k + M[11]
+      ];
+    },
+    jumpTo: (ras) => jumpAll(ras),
+    rasToAxialView: (ras, aspectWH) => sc.slice.rasToView("axial", off.axial, ras, aspectWH),
+    ijkToRAS: () => sc.ijkToRAS,
     setSegOpacity: (o) => {
       sc.setSegOpacity(o);
       applySegOverlay();
@@ -8553,8 +8685,10 @@ async function main() {
         drawAll();
       },
       enabled: () => sc.hasSeg,
-      // A DICOM SEG may define overlapping segments; a single-label volume cannot hold them, so
-      // the frame decoded last wins. Say so rather than letting the list read as the whole truth.
+      // A DICOM SEG may define overlapping segments. They are decoded into separate label
+      // layers and composited, so the shared region reads as the blend of its segments and
+      // comes out more opaque than either alone — but a reader should still be told that the
+      // region belongs to two segments rather than inferring one odd-coloured one.
       note: () => {
         if (stack) {
           return res.seg || source.s ? "\u26A0 Segmentation hidden \u2014 this series is a stack of images, not a volume, so a segmentation drawn on the slice positions cannot be registered to it." : null;
@@ -8564,7 +8698,8 @@ async function main() {
         const nameOf = (n) => sc.segments.find((s) => s.num === n)?.name ?? `Segment ${n}`;
         const pairs = ov.pairs.slice(0, 3).map(([a, b]) => `${nameOf(a)} / ${nameOf(b)}`).join(", ");
         const more = ov.pairs.length > 3 ? ` and ${ov.pairs.length - 3} more` : "";
-        return `\u26A0 Segments overlap \u2014 showing the topmost. ${ov.voxels.toLocaleString()} voxels are claimed by two segments (${pairs}${more}).`;
+        const crowded = ov.crowded ? ` ${ov.crowded} segment(s) overlap more deeply than the four layers drawn; there the topmost wins.` : "";
+        return `\u26A0 Segments overlap \u2014 the shared regions are blended and drawn more opaque. ${ov.voxels.toLocaleString()} voxels are claimed by more than one segment (${pairs}${more}).${crowded}`;
       }
     }
   });
