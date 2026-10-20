@@ -2234,6 +2234,21 @@ var ImageField = class {
   volumeTexture() {
     return this.volTex;
   }
+  /** Overwrite `depth` z-slices of the volume starting at `z`, in place. The bind group holds a
+   *  stable view of volTex, so a render after this picks the new voxels up with no rebuild —
+   *  which is what lets a volume be allocated first and filled as its slices arrive. `data` is
+   *  one slab in the texture's own dtype (f32 unless the volume was created from a Uint8Array). */
+  updateSlab(z, data, depth = 1) {
+    const [nx, ny, nz] = this.dims;
+    if (z < 0 || z + depth > nz) return;
+    const bpe = data instanceof Uint8Array ? 1 : 4;
+    this.dev.queue.writeTexture(
+      { texture: this.volTex, origin: { x: 0, y: 0, z } },
+      data,
+      { offset: 0, bytesPerRow: nx * bpe, rowsPerImage: ny },
+      [nx, ny, depth]
+    );
+  }
   /** r8unorm volumes sample /255, so clim is packed /normScale in the shader; a slice plane sharing this
    *  texture must use the same factor. 1 for f32 volumes. */
   normScaleOf() {
@@ -4365,12 +4380,14 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
   });
   const segments = [];
   const palette = new Float32Array(256 * 4);
-  if (seg) {
+  const enumerateSegments = (sg) => {
+    segments.length = 0;
+    palette.fill(0);
     const total = dims[0] * dims[1] * dims[2];
-    for (const [num, r, g, b] of seg.colors) {
+    for (const [num, r, g, b] of sg.colors) {
       if (num === 0 || r === 0 && g === 0 && b === 0) continue;
       let n = 0;
-      for (let i = 0; i < seg.lab.length; i++) if (seg.lab[i] === num) n++;
+      for (let i = 0; i < sg.lab.length; i++) if (sg.lab[i] === num) n++;
       if (!n || n > total * 0.6) continue;
       if (num < 256) {
         palette[num * 4] = r;
@@ -4378,9 +4395,10 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
         palette[num * 4 + 2] = b;
         palette[num * 4 + 3] = 1;
       }
-      segments.push({ num, name: seg.names[num] ?? `Segment ${num}`, color: [r, g, b], voxels: n });
+      segments.push({ num, name: sg.names[num] ?? `Segment ${num}`, color: [r, g, b], voxels: n });
     }
-  }
+  };
+  if (seg) enumerateSegments(seg);
   const segOpacity = /* @__PURE__ */ new Map();
   const opacityOf = (num) => segOpacity.get(num) ?? 1;
   const visPalette = () => {
@@ -4392,8 +4410,8 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
   let mode = "volume";
   let segLogic;
   let editable;
-  if (seg && segments.length > 0) {
-    const cap = resampleIsotropic(seg.lab, dims, ct.ijkToRAS, opts.sdfMaxDim ?? SDF_MAX_DIM, opts.sdfMaxVoxels);
+  const buildSdf = (sg) => {
+    const cap = resampleIsotropic(sg.lab, dims, ct.ijkToRAS, opts.sdfMaxDim ?? SDF_MAX_DIM, opts.sdfMaxVoxels);
     if (cap.coarsened) console.warn(`SEGRoulette: SDF grid coarsened to fit the device memory budget (${cap.dims.join("\xD7")}, ${cap.vox.toFixed(2)}mm) \u2014 a remote render server would allow full resolution.`);
     editable = new EditableSegmentation(dev, cap.dims, { ijkToRAS: cap.ijkToRAS });
     const boundaryMode = labelmapHasInternalBoundary(cap.lab, cap.dims) ? "all" : "outer";
@@ -4405,8 +4423,9 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
     editable.loadLabelmap(cap.lab);
     segLogic.refineNow();
     mode = "sdf";
-  }
-  const hasSeg = !!segLogic;
+  };
+  if (seg && segments.length > 0) buildSdf(seg);
+  let hasSeg = !!segLogic;
   const scene = new SceneRenderer(gpu, format);
   const [rasLo, rasHi] = volumeField.aabb();
   const roi = createRoiWidget(rasLo, rasHi, { coverage: 0.35 });
@@ -4460,6 +4479,33 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
     hasSeg,
     roi,
     segOverlap: seg?.overlap && seg.overlap.voxels > 0 ? seg.overlap : null,
+    writeSlice(k, slice2) {
+      volumeField.updateSlab(k, slice2);
+    },
+    setDataRange(lo, hi) {
+      grayClim[0] = lo;
+      grayClim[1] = hi;
+      if (baseVolLut === grayLut) {
+        baseClim = [lo, hi];
+        volumeField.setClim(lo, hi);
+      }
+    },
+    attachSegmentation(sg) {
+      seg = sg;
+      enumerateSegments(sg);
+      if (!segments.length) return;
+      colorTex?.destroy();
+      colorTex = bakeColorizeRGBA(dev, sg.lab, dims, visPalette(), SLICE_OVERLAY_SIGMA);
+      slice.setTextures(volumeField.volumeTexture(), colorTex);
+      buildSdf(sg);
+      hasSeg = !!segLogic;
+      showSeg = hasSeg && segLayerOpacity > 1e-3;
+      this.hasSeg = hasSeg;
+      this.mode = mode;
+      this.segments = segments;
+      this.segOverlap = sg.overlap && sg.overlap.voxels > 0 ? sg.overlap : null;
+      rebuild();
+    },
     setLayers(sv, ss) {
       this.setVolumeOpacity(sv ? 1 : 0);
       this.setSegOpacity(ss ? 1 : 0);
@@ -5376,34 +5422,81 @@ function attachWidgetControls(canvas, camera, opts) {
 }
 
 // render/demos/mosaic.ts
-function createMosaic(host) {
+function trackPointers() {
+  const g = globalThis;
+  if (g.__slPointersTracked) return;
+  g.__slPointersTracked = true;
+  g.__slPointersDown = 0;
+  const opt = { capture: true, passive: true };
+  globalThis.addEventListener("pointerdown", () => g.__slPointersDown = (g.__slPointersDown ?? 0) + 1, opt);
+  const up = () => g.__slPointersDown = Math.max(0, (g.__slPointersDown ?? 0) - 1);
+  globalThis.addEventListener("pointerup", up, opt);
+  globalThis.addEventListener("pointercancel", up, opt);
+}
+function createMosaic(host, opts = {}) {
+  const strip = !!opts.strip;
+  trackPointers();
   const wrap = document.createElement("div");
-  wrap.style.cssText = "position:absolute;inset:0;z-index:20;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:radial-gradient(60% 60% at 50% 45%,rgba(20,24,38,.35),rgba(6,8,14,.75));opacity:1;transition:opacity 350ms ease-out;";
+  wrap.style.cssText = strip ? "position:relative;flex:0 0 auto;display:block;height:var(--sl-strip-h,132px);box-sizing:border-box;overflow:hidden;background:#070a11;border-top:1px solid #1b2740;transition:height 420ms cubic-bezier(.4,0,.2,1),opacity 260ms ease-out;" : "position:absolute;inset:0;z-index:20;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:radial-gradient(60% 60% at 50% 45%,rgba(20,24,38,.35),rgba(6,8,14,.75));opacity:1;transition:opacity 350ms ease-out;";
   const preview_ = document.createElement("canvas");
   const PREVIEW_CSS = "max-width:min(62vmin,540px);border-radius:8px;box-shadow:0 10px 40px rgba(0,0,0,.5);";
-  preview_.style.cssText = PREVIEW_CSS + "max-height:46vh;display:none;";
+  preview_.style.cssText = PREVIEW_CSS + (strip ? "max-height:100%;" : "max-height:46vh;") + "display:none;";
   const canvas = document.createElement("canvas");
   const TILES_FULL = "max-width:min(70vmin,620px);max-height:70vh;";
   const TILES_UNDER_PREVIEW = "max-width:min(52vmin,440px);max-height:26vh;opacity:.85;";
   const TILES_CSS = "border-radius:8px;box-shadow:0 10px 40px rgba(0,0,0,.5);image-rendering:auto;";
-  canvas.style.cssText = TILES_FULL + TILES_CSS;
+  const TILES_STRIP = "display:block;width:100%;height:100%;object-fit:cover;";
+  canvas.style.cssText = strip ? TILES_STRIP : TILES_FULL + TILES_CSS;
   const cap = document.createElement("div");
-  cap.style.cssText = "font:600 12px ui-monospace,Menlo,monospace;color:#9fe9ff;text-shadow:0 0 4px #000;";
+  cap.style.cssText = strip ? "position:absolute;left:50%;bottom:7px;transform:translateX(-50%);z-index:1;font:600 12px ui-monospace,Menlo,monospace;color:#9fe9ff;text-shadow:0 0 5px #000,0 0 5px #000;background:rgba(5,8,14,.55);padding:2px 10px;border-radius:6px;pointer-events:none;white-space:nowrap;" : "font:600 12px ui-monospace,Menlo,monospace;color:#9fe9ff;text-shadow:0 0 4px #000;";
   wrap.appendChild(preview_);
   wrap.appendChild(canvas);
   wrap.appendChild(cap);
-  const hostPos = getComputedStyle(host).position;
-  if (hostPos === "static") host.style.position = "relative";
+  if (!strip) {
+    const hostPos = getComputedStyle(host).position;
+    if (hostPos === "static") host.style.position = "relative";
+  }
   host.appendChild(wrap);
+  const idle = () => {
+    const down = () => globalThis.__slPointersDown ?? 0;
+    if (!down()) return Promise.resolve();
+    return new Promise((resolve) => {
+      const check = () => {
+        if (down()) return;
+        globalThis.removeEventListener("pointerup", check, true);
+        globalThis.removeEventListener("pointercancel", check, true);
+        setTimeout(resolve, 32);
+      };
+      globalThis.addEventListener("pointerup", check, true);
+      globalThis.addEventListener("pointercancel", check, true);
+    });
+  };
   const ctx = canvas.getContext("2d");
   const tmp = document.createElement("canvas");
   const tctx = tmp.getContext("2d");
-  let cols = 1, rows = 1, cw = 0, ch = 0, count = 0, filled = 0;
+  let cols = 1, rows = 1, cw = 0, ch = 0, count = 0, filled = 0, laidOut = false;
+  const gridFor = (n, aspect) => {
+    if (!strip) {
+      const c = Math.ceil(Math.sqrt(n));
+      return [c, Math.ceil(n / c)];
+    }
+    const box = wrap.getBoundingClientRect();
+    const W = Math.max(1, box.width), H = Math.max(1, box.height || 132);
+    let best = [n, 1], bestScale = 0;
+    for (let r = 1; r <= Math.min(n, 12); r++) {
+      const c = Math.ceil(n / r);
+      const scale2 = Math.min(W / (c * aspect), H / r);
+      if (scale2 > bestScale) {
+        bestScale = scale2;
+        best = [c, r];
+      }
+    }
+    return best;
+  };
   const layout = (n, aspect = 1) => {
     count = Math.max(1, n);
-    cols = Math.ceil(Math.sqrt(count));
-    rows = Math.ceil(count / cols);
-    const cellW = 96;
+    [cols, rows] = gridFor(count, aspect);
+    const cellW = strip ? Math.max(8, Math.round(1600 / cols)) : 96;
     cw = cellW;
     ch = Math.round(cellW / aspect);
     canvas.width = cols * cw;
@@ -5416,9 +5509,14 @@ function createMosaic(host) {
       layout(n);
     },
     thumb(n, w, h, rgba) {
-      if (!count || cols * rows < count) layout(Math.max(count, n), w / h);
-      if (ch !== Math.round(cw / (w / h))) {
-        ch = Math.round(cw / (w / h));
+      const aspect = w / h;
+      if (!count || cols * rows < count) layout(Math.max(count, n), aspect);
+      else if (!laidOut) {
+        laidOut = true;
+        layout(count, aspect);
+      }
+      if (ch !== Math.round(cw / aspect)) {
+        ch = Math.round(cw / aspect);
         canvas.height = rows * ch;
         ctx.fillStyle = "#0b0e14";
         ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -5478,15 +5576,30 @@ ${location.href}`;
       wrap.appendChild(card);
     },
     done() {
-      wrap.style.opacity = "0";
-      setTimeout(() => wrap.remove(), 400);
+      if (!strip) {
+        wrap.style.opacity = "0";
+        setTimeout(() => wrap.remove(), 400);
+        return Promise.resolve();
+      }
+      return idle().then(
+        () => new Promise((resolve) => {
+          wrap.style.height = "0px";
+          wrap.style.padding = "0px";
+          wrap.style.opacity = "0";
+          setTimeout(() => {
+            wrap.remove();
+            resolve();
+          }, 460);
+        })
+      );
     },
     reset() {
       filled = 0;
       count = 0;
+      laidOut = false;
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       preview_.style.display = "none";
-      canvas.style.cssText = TILES_FULL + TILES_CSS;
+      canvas.style.cssText = (strip ? "max-height:100%;max-width:62vw;" : TILES_FULL) + TILES_CSS;
       wrap.style.opacity = "1";
       if (!wrap.isConnected) host.appendChild(wrap);
     }
@@ -5847,7 +5960,7 @@ function installChrome(opts) {
         if (!(S.enabled && !S.enabled())) S.set(s.num, o);
       }, s.color, () => opts.onChange?.());
       wrap.appendChild(row);
-      segRows.push({ num: s.num, box, color: s.color, paint });
+      segRows.push({ num: s.num, name: s.name, box, color: s.color, paint });
     }
     const note = S.note?.();
     if (note) {
@@ -5862,6 +5975,12 @@ function installChrome(opts) {
   function paintSegments() {
     const S = opts.segments;
     if (!S) return;
+    const list = S.list();
+    const changed = list.length !== segRows.length || list.some((s, i) => s.num !== segRows[i].num || s.name !== segRows[i].name);
+    if (changed) {
+      buildSegments();
+      return;
+    }
     const dis = S.enabled ? !S.enabled() : false;
     segHost.style.opacity = dis ? "0.4" : "1";
     for (const r of segRows) r.paint();
@@ -6021,7 +6140,7 @@ function resolveWorkerURL(opts) {
     return opts.workerUrl;
   return new URL("./idc-worker.js", import.meta.url);
 }
-function runWorker(ctKeys, segKeys, ctBucket, segBucket, modality, handlers, opts) {
+function runWorker(ctKeys, segKeys, ctBucket, segBucket, modality, handlers, opts, geometry) {
   if (_worker) {
     try {
       _worker.terminate();
@@ -6045,6 +6164,22 @@ function runWorker(ctKeys, segKeys, ctBucket, segBucket, modality, handlers, opt
           break;
         case "preview":
           handlers.onPreview?.(m.w, m.h, m.rgba);
+          break;
+        case "geometry":
+          handlers.onGeometry?.(m);
+          break;
+        case "slice":
+          handlers.onSlice?.(m.k, new Float32Array(m.px));
+          break;
+        case "voi":
+          handlers.onVOI?.(m.win, m.lev);
+          break;
+        case "ctdone":
+          handlers.onVolumeDone?.(m.placed, m.expected, m.dropped ?? 0, m.outside ?? 0);
+          break;
+        case "segerror":
+          console.warn("[idc_tools] SEG failed:", m.error);
+          handlers.onSegError?.(m.error);
           break;
         case "seg":
           handlers.onSegName?.(m.name);
@@ -6083,7 +6218,7 @@ function runWorker(ctKeys, segKeys, ctBucket, segBucket, modality, handlers, opt
         _worker = null;
       reject(new Error("idc_tools worker: " + (e.message || e)));
     };
-    w.postMessage({ ctKeys, segKeys, ctBucket, segBucket, modality });
+    w.postMessage({ ctKeys, segKeys, ctBucket, segBucket, modality, geometry });
   });
 }
 async function loadSeries(entry, handlers = {}, opts) {
@@ -6092,7 +6227,7 @@ async function loadSeries(entry, handlers = {}, opts) {
   if (!ctKeys.length)
     throw new Error("idc_tools: no DICOM under CT prefix " + entry.c);
   const segKeys = entry.s ? await s3ListKeys(entry.s, entry.sb) : [];
-  const r = await runWorker(ctKeys, segKeys, entry.cb, entry.sb, modality, handlers, opts);
+  const r = await runWorker(ctKeys, segKeys, entry.cb, entry.sb, modality, handlers, opts, opts?.geometry);
   r.entry = entry;
   return r;
 }
@@ -6794,6 +6929,7 @@ function mountBir(cfg) {
     globalThis.dispatchEvent(new Event("resize"));
   };
   let strip = null;
+  let refreshCurrentThumb = null;
   if (cfg.strip?.length) {
     strip = document.createElement("div");
     strip.id = "bir-strip";
@@ -6806,10 +6942,12 @@ function mountBir(cfg) {
       item.title = it.lines.join(" \xB7 ") + " \u2014 click to load";
       const img = document.createElement("img");
       img.alt = "";
-      it.thumb().then((b) => {
+      const loadThumb = () => it.thumb().then((b) => {
         if (b) img.src = URL.createObjectURL(b);
       }).catch(() => {
       });
+      loadThumb();
+      if (it.current) refreshCurrentThumb = loadThumb;
       const cap = document.createElement("div");
       cap.className = "cap";
       cap.textContent = it.lines.join(" \xB7 ");
@@ -6993,6 +7131,7 @@ function mountBir(cfg) {
     leftMode: () => tool === "wl" || tool === "zoom" || tool === "pan" ? tool : "scroll",
     hooks,
     drawOverlay,
+    refreshStrip: () => refreshCurrentThumb?.(),
     resize: () => {
       resizeOverlays();
       redrawOverlays();
@@ -7376,8 +7515,8 @@ var KITS_DEFAULT = {
 };
 var IDC_API_BASE = globalThis.__IDC_API_BASE || P.get("apiBase") || "https://api.imaging.datacommons.cancer.gov/v3";
 var splitList = (v) => (v ?? "").split(",").map((x) => x.trim()).filter(Boolean);
-var UID_RE = /^[0-9.]{1,64}$/;
-var MEMO_V = "idc-rad:v4";
+var UID_RE = /^[0-9a-fA-F.-]{1,64}$/;
+var MEMO_V = "idc-rad:v5";
 var SLIM_COLS = [
   "StudyInstanceUID",
   "SeriesInstanceUID",
@@ -7392,17 +7531,65 @@ var SLIM_COLS = [
   "license_short_name",
   "source_DOI"
 ];
+var GEOM_SELECT = `
+  COALESCE(c.Rows, m.Rows, p.Rows) AS g_rows,
+  COALESCE(c.Columns, m.Columns, p.Columns) AS g_cols,
+  COALESCE(c.PixelSpacing_row_mm, m.PixelSpacing_row_mm, p.PixelSpacing_row_mm) AS g_ps_row,
+  COALESCE(c.PixelSpacing_col_mm, m.PixelSpacing_col_mm, p.PixelSpacing_col_mm) AS g_ps_col,
+  v.origin_patient AS g_origin,
+  v.ImageOrientationPatient AS g_iop,
+  v.slice_spacing_mm AS g_slice_mm,
+  v.regularly_spaced_3d_volume AS g_regular`;
+var GEOM_JOINS = `
+  LEFT JOIN ct_index c ON c.SeriesInstanceUID = i.SeriesInstanceUID
+  LEFT JOIN mr_index m ON m.SeriesInstanceUID = i.SeriesInstanceUID
+  LEFT JOIN pt_index p ON p.SeriesInstanceUID = i.SeriesInstanceUID
+  LEFT JOIN volume_geometry_index v ON v.SeriesInstanceUID = i.SeriesInstanceUID`;
+function geometryOf(row) {
+  if (!row?.g_regular || !row.g_origin || !row.g_iop) return null;
+  const origin = row.g_origin.map(Number);
+  const iop = row.g_iop.map(Number);
+  const psRow = Number(row.g_ps_row), psCol = Number(row.g_ps_col), sliceMm = Number(row.g_slice_mm);
+  const nx = Number(row.g_cols), ny = Number(row.g_rows), nz = Number(row.instanceCount);
+  if (![psRow, psCol, sliceMm, nx, ny, nz].every((v) => Number.isFinite(v) && v > 0)) return null;
+  if (origin.some((v) => !Number.isFinite(v)) || iop.length !== 6) return null;
+  const rowDir = iop.slice(0, 3), colDir = iop.slice(3, 6);
+  const n = [
+    rowDir[1] * colDir[2] - rowDir[2] * colDir[1],
+    rowDir[2] * colDir[0] - rowDir[0] * colDir[2],
+    rowDir[0] * colDir[1] - rowDir[1] * colDir[0]
+  ];
+  const ras = (v) => [-v[0], -v[1], v[2]];
+  const c0 = ras(rowDir.map((x) => x * psCol));
+  const c1 = ras(colDir.map((x) => x * psRow));
+  const c2 = ras(n.map((x) => x * sliceMm));
+  const o = ras(origin);
+  const ijkToRAS = [
+    c0[0],
+    c1[0],
+    c2[0],
+    o[0],
+    c0[1],
+    c1[1],
+    c2[1],
+    o[1],
+    c0[2],
+    c1[2],
+    c2[2],
+    o[2],
+    0,
+    0,
+    0,
+    1
+  ];
+  return { origin, iop, spacing: sliceMm, dims: [nx, ny, nz], ijkToRAS };
+}
 async function idcSql(sql, values = []) {
-  let i = 0;
-  const statement = sql.replace(/\?/g, () => {
-    const v = values[i++];
-    if (!UID_RE.test(v ?? "")) throw new Error(`not a DICOM UID: ${v}`);
-    return `'${v}'`;
-  });
+  for (const v of values) if (!UID_RE.test(v)) throw new Error(`not a DICOM UID: ${v}`);
   const resp = await fetch(`${IDC_API_BASE}/sql`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sql: statement })
+    body: JSON.stringify({ sql, params: values })
   });
   if (!resp.ok) {
     const detail = await resp.text().catch(() => "");
@@ -7426,7 +7613,7 @@ async function readStudyRows(studyUID, onStatus) {
   let rows;
   try {
     rows = await idcSql(
-      `SELECT ${SLIM_COLS.join(", ")} FROM index WHERE StudyInstanceUID = ? ORDER BY TRY_CAST(SeriesNumber AS INTEGER) NULLS LAST, SeriesInstanceUID`,
+      `SELECT ${SLIM_COLS.map((c) => "i." + c).join(", ")},${GEOM_SELECT} FROM index i${GEOM_JOINS} WHERE i.StudyInstanceUID = ? ORDER BY TRY_CAST(i.SeriesNumber AS INTEGER) NULLS LAST, i.SeriesInstanceUID`,
       [studyUID]
     );
   } catch (e) {
@@ -7442,9 +7629,21 @@ async function readStudyRows(studyUID, onStatus) {
   _studyRowsCache.set(studyUID, rows);
   return rows;
 }
+async function geometryForUuid(uuid) {
+  try {
+    const rows = await idcSql(
+      `SELECT i.instanceCount,${GEOM_SELECT} FROM index i${GEOM_JOINS} WHERE i.crdc_series_uuid = ?`,
+      [uuid]
+    );
+    return (rows.length ? geometryOf(rows[0]) : null) ?? void 0;
+  } catch {
+    return void 0;
+  }
+}
 async function resolveSource(onStatus) {
   const series = P.get("series");
   if (series) {
+    onStatus("looking the series up in the IDC index\u2026");
     return {
       c: series,
       cb: P.get("bucket") || "idc-open-data",
@@ -7454,7 +7653,8 @@ async function resolveSource(onStatus) {
       col: P.get("collection") || "IDC",
       st: "",
       sd: `${P.get("patient") || "IDC"} \xB7 ${series.slice(0, 8)}\u2026`,
-      lic: "NCI Imaging Data Commons"
+      lic: "NCI Imaging Data Commons",
+      geom: await geometryForUuid(series)
     };
   }
   const studyUIDs = [...splitList(P.get("StudyInstanceUIDs")), ...splitList(P.get("studyUID"))];
@@ -7466,7 +7666,8 @@ async function resolveSource(onStatus) {
     ];
     return await resolveFromIndex(studyUIDs[0], want, onStatus);
   }
-  return KITS_DEFAULT;
+  onStatus("looking the demo case up in the IDC index\u2026");
+  return { ...KITS_DEFAULT, geom: await geometryForUuid(KITS_DEFAULT.c) };
 }
 async function resolveFromIndex(studyUID, wantSeries, onStatus) {
   const memoKey = `${MEMO_V}:${studyUID}:${wantSeries.join(",")}`;
@@ -7492,6 +7693,7 @@ async function resolveFromIndex(studyUID, wantSeries, onStatus) {
   const seg = segs.find((r) => want.has(r.SeriesInstanceUID)) ?? segs[0];
   const mod = String(chosen.Modality).toUpperCase();
   const src = {
+    geom: geometryOf(chosen) ?? void 0,
     c: String(chosen.crdc_series_uuid),
     cb: String(chosen.aws_bucket),
     s: seg ? String(seg.crdc_series_uuid) : void 0,
@@ -7520,6 +7722,37 @@ var status = (msg, err = false) => {
 };
 var cvEl = (id) => document.getElementById(id);
 var PLANES = ["axial", "coronal", "sagittal"];
+function placeholderVolume(g, modality, voi) {
+  const [nx, ny, nz] = g.dims;
+  const vol = new Float32Array(nx * ny * nz);
+  const dflt = DEFAULT_VOI[modality.toUpperCase()] ?? DEFAULT_VOI.CT;
+  const win = voi?.win || dflt[0], lev = voi?.win ? voi.lev : dflt[1];
+  const lo = voi ? voi.p33 : lev - win / 4;
+  const hi = voi ? voi.p66 : lev + win / 4;
+  const M = g.ijkToRAS;
+  const CM = 100;
+  const BIAS = 32768, inv = 1 / CM;
+  for (let k = 0; k < nz; k++) {
+    for (let j = 0; j < ny; j++) {
+      let x = M[1] * j + M[2] * k + M[3] + BIAS;
+      let y = M[5] * j + M[6] * k + M[7] + BIAS;
+      let z = M[9] * j + M[10] * k + M[11] + BIAS;
+      let o = (k * ny + j) * nx;
+      for (let i = 0; i < nx; i++, o++, x += M[0], y += M[4], z += M[8]) {
+        vol[o] = (x * inv | 0) + (y * inv | 0) + (z * inv | 0) & 1 ? hi : lo;
+      }
+    }
+  }
+  return { vol, dims: g.dims, ijkToRAS: g.ijkToRAS, win, lev, dtype: "float32", modality };
+}
+var DEFAULT_VOI = {
+  CT: [400, 40],
+  MR: [1e3, 500],
+  PT: [10, 5],
+  PET: [10, 5],
+  NM: [1e3, 500],
+  US: [255, 128]
+};
 var SEG_FILL = 0.5;
 var CT_WL_PRESETS = [
   { name: "Soft Tissue", win: 400, lev: 40 },
@@ -7547,33 +7780,92 @@ async function main() {
     cx[n] = cv[n].getContext("webgpu");
     cx[n].configure({ device: gpu.device, format: preferred, viewFormats: [srgb], alphaMode: "opaque" });
   }
-  const mosaic = createMosaic(document.getElementById("viewer"));
-  _mosaic = mosaic;
-  mosaic.status("contacting the NCI Imaging Data Commons\u2026");
+  let mosaic;
   const setLoad = (m) => {
     status(m);
-    mosaic.status(m);
+    mosaic?.status(m);
   };
+  status("contacting the NCI Imaging Data Commons\u2026");
   const source = await resolveSource(setLoad);
-  const res = await loadSeries(source, {
-    onProgress: (p) => {
-      setLoad(`${p.msg}${p.frac ? ` \u2014 ${Math.round(p.frac * 100)}%` : ""}`);
-    },
+  const streaming = !!source.geom;
+  mosaic = createMosaic(document.getElementById("viewer"), { strip: streaming });
+  _mosaic = mosaic;
+  mosaic.status("contacting the NCI Imaging Data Commons\u2026");
+  let firstSlice;
+  let onSliceReady = null;
+  const earlySlices = [];
+  let onLabelmapReady = null;
+  let earlySeg = null;
+  let streamStats = { placed: 0, expected: 0, dropped: 0, outside: 0 };
+  let filledPlanes = null;
+  const handlers = {
+    onProgress: (p) => setLoad(`${p.msg}${p.frac ? ` \u2014 ${Math.round(p.frac * 100)}%` : ""}`),
     onSliceCount: (n) => mosaic.setCount(n),
     onThumb: (n, w, h, rgba) => mosaic.thumb(n, w, h, rgba),
-    onPreview: (w, h, rgba) => mosaic.preview(w, h, rgba)
-  });
+    onPreview: (w, h, rgba) => mosaic.preview(w, h, rgba),
+    onSlice: (k, px) => {
+      if (onSliceReady) onSliceReady(k, px);
+      else earlySlices.push([k, px]);
+    },
+    onLabelmap: (sg) => {
+      if (onLabelmapReady) onLabelmapReady(sg);
+      else earlySeg = sg;
+    },
+    onVolumeDone: (placed, expected, dropped, outside) => {
+      streamStats = { placed, expected, dropped, outside };
+    }
+  };
+  let geomResolve = () => {
+  };
+  const geomReady = new Promise((r) => geomResolve = r);
+  const loadDone = streaming ? loadSeries(source, { ...handlers, onGeometry: (g) => {
+    firstSlice = g;
+    geomResolve(g);
+  } }, {
+    geometry: source.geom
+  }) : loadSeries(source, handlers);
+  const res = streaming ? { ct: placeholderVolume(await geomReady, source.m, firstSlice) } : await loadDone;
   const sc = buildSegrouletteScene(gpu, srgb, res.ct, res.seg);
-  const vd = res.ct.vol;
   let vmin = Infinity, vmax = -Infinity;
-  const vstride = Math.max(1, Math.floor(vd.length / 2e6));
-  for (let i = 0; i < vd.length; i += vstride) {
-    const v = vd[i];
-    if (v < vmin) vmin = v;
-    if (v > vmax) vmax = v;
-  }
+  const sampleRange = (v) => {
+    const stride = Math.max(1, Math.floor(v.length / 2e5));
+    for (let i = 0; i < v.length; i += stride) {
+      const x = v[i];
+      if (x < vmin) vmin = x;
+      if (x > vmax) vmax = x;
+    }
+  };
+  if (!streaming) sampleRange(res.ct.vol);
   const dataRange = () => [vmin, vmax];
   sc.setVolumeOpacity(0.5);
+  let midSlice = null;
+  let scheduleRedraw = () => {
+  };
+  let segAttached = false;
+  let segRefreshUi = () => {
+  };
+  if (streaming) filledPlanes = new Uint8Array(sc.dims[2]);
+  const takeSlice = (k, px) => {
+    if (k === Math.floor(sc.dims[2] / 2)) midSlice = px.slice();
+    sc.writeSlice(k, px);
+    if (filledPlanes) filledPlanes[k] = 1;
+    sampleRange(px);
+    scheduleRedraw();
+  };
+  const takeSeg = (sg) => {
+    sc.attachSegmentation(sg);
+    segAttached = true;
+    segRefreshUi();
+    scheduleRedraw();
+  };
+  if (streaming) {
+    for (const [k, px] of earlySlices) takeSlice(k, px);
+    onSliceReady = takeSlice;
+    if (earlySeg) takeSeg(earlySeg);
+    onLabelmapReady = takeSeg;
+  }
+  earlySlices.length = 0;
+  earlySeg = null;
   let sliceOutline = false;
   const applySegOverlay = () => {
     const master = sc.segOpacity();
@@ -7587,6 +7879,7 @@ async function main() {
     for (const p of PLANES) {
       const cell = document.querySelector(`[data-cell="${p}"]`);
       if (!cell) continue;
+      for (const old of cell.querySelectorAll(".ann")) old.remove();
       const mk = (cls, html) => {
         const e = document.createElement("div");
         e.className = "ann " + cls;
@@ -7662,6 +7955,7 @@ async function main() {
   for (const n of names) new ResizeObserver(() => resize()).observe(cv[n]);
   const viewGrid = attachViewGrid(document.getElementById("grid"), [...names], resize);
   attachDoubleClick(cv.threeD, () => viewGrid.toggleMax("threeD"));
+  let wlUserSet = false;
   const setWL = (win, lev) => {
     wl.win = win;
     wl.lev = lev;
@@ -7679,6 +7973,7 @@ async function main() {
     for (const q of CT_WL_PRESETS) presets.add(new Option(`${q.name} (${q.win}/${q.lev})`, q.name));
   };
   presets.addEventListener("change", () => {
+    wlUserSet = true;
     if (presets.value === "auto") setWL(sc.win, sc.lev);
     else {
       const q = CT_WL_PRESETS.find((x) => x.name === presets.value);
@@ -7755,9 +8050,10 @@ async function main() {
     return new Promise((res2) => c.toBlob(res2, "image/png"));
   };
   const currentSeriesThumb = () => {
-    const { vol, dims, win, lev } = res.ct;
+    const { dims, win, lev } = res.ct;
     const [w, h, d] = dims, z = Math.floor(d / 2);
-    return sliceToThumb({ vol: vol.subarray(z * w * h, (z + 1) * w * h), dims: [w, h, 1], win, lev });
+    const mid = midSlice ?? res.ct.vol.subarray(z * w * h, (z + 1) * w * h);
+    return sliceToThumb({ vol: mid, dims: [w, h, 1], win, lev });
   };
   const navigateToSeries = (seriesUID) => {
     const u = new URL(location.href);
@@ -7819,7 +8115,10 @@ async function main() {
     redrawAll: drawAll,
     rasLo: sc.rasLo,
     rasHi: sc.rasHi,
-    wl: { get: () => [wl.win, wl.lev], set: setWL, auto: [sc.win, sc.lev] },
+    wl: { get: () => [wl.win, wl.lev], set: (w, l) => {
+      wlUserSet = true;
+      setWL(w, l);
+    }, auto: [sc.win, sc.lev] },
     presetsEl: presets,
     resetViews: () => sliceControls.forEach((c) => c.resetView()),
     close: () => status("This is the SlicerLive Basic Image Review demo \u2014 reload to restart."),
@@ -7880,7 +8179,10 @@ async function main() {
       wl: {
         enabled: () => bir.tool() === "wl",
         get: () => [wl.win, wl.lev],
-        set: setWL,
+        set: (w, l) => {
+          wlUserSet = true;
+          setWL(w, l);
+        },
         range: dataRange,
         reset: () => setWL(sc.win, sc.lev)
       },
@@ -8071,7 +8373,7 @@ async function main() {
       }
     }
   ];
-  installChrome({
+  const chrome = installChrome({
     controls,
     // The BIR toolbar has its own Help button — suppress sl-chrome's fixed top-left "?" so it
     // doesn't overlap the toolbar (reported obscuring the Select-Patient / nav icons).
@@ -8102,8 +8404,60 @@ async function main() {
   const info = document.getElementById("info");
   if (info) info.textContent = `${source.sd} \xB7 ${res.ct.modality} ${sc.dims.join("\xD7")} \xB7 ${source.lic}`;
   resize();
-  mosaic.done();
-  status(`${source.sd} \u2014 scroll to page slices, pick a tool from the toolbar, drag 3D to orbit`);
+  const READY = `${source.sd} \u2014 scroll to page slices, pick a tool from the toolbar, drag 3D to orbit`;
+  if (!streaming) {
+    await mosaic.done();
+    status(READY);
+    return;
+  }
+  let dirty = false;
+  const redrawSoon = () => {
+    if (dirty) return;
+    dirty = true;
+    requestAnimationFrame(() => {
+      dirty = false;
+      drawAll();
+    });
+  };
+  scheduleRedraw = redrawSoon;
+  segRefreshUi = () => {
+    applySegOverlay();
+    chrome.refresh();
+    buildAnnotations();
+    applyAnn();
+  };
+  if (segAttached) segRefreshUi();
+  redrawSoon();
+  if (firstSlice && !wlUserSet && firstSlice.win > 0) {
+    sc.win = firstSlice.win;
+    sc.lev = firstSlice.lev;
+    setWL(firstSlice.win, firstSlice.lev);
+  }
+  await loadDone;
+  if (!streamStats.placed) throw new Error("no image slices could be placed in the volume");
+  let unfilled = 0;
+  if (filledPlanes) {
+    const blank = new Float32Array(sc.dims[0] * sc.dims[1]).fill(vmin);
+    for (let k = 0; k < filledPlanes.length; k++) {
+      if (!filledPlanes[k]) {
+        sc.writeSlice(k, blank);
+        unfilled++;
+      }
+    }
+  }
+  if (streamStats.dropped) {
+    console.info(`[bir] ${streamStats.dropped} instance(s) in this series are not image slices and were skipped`);
+  }
+  if (streamStats.outside) {
+    console.warn(`[bir] ${streamStats.outside} slice(s) fell outside the volume the index describes`);
+  }
+  if (unfilled) console.warn(`[bir] ${unfilled} plane(s) of ${sc.dims[2]} never received data`);
+  bir?.refreshStrip();
+  if (Number.isFinite(vmin) && vmax > vmin) sc.setDataRange(vmin, vmax);
+  drawAll();
+  await mosaic.done();
+  resize();
+  status(READY);
 }
 var LoadError = class extends Error {
   constructor(title, detail, hint) {
