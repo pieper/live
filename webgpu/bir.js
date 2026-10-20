@@ -6586,8 +6586,14 @@ var STYLE = `
 #bir-strip .item:hover { border-color:#33507e; }
 #bir-strip .item.current { border-color:#2b6cb0; box-shadow:0 0 0 1px #2b6cb0; }
 #bir-strip img { width:100%; aspect-ratio:1; object-fit:contain; background:#000; display:block; }
+#bir-strip .item.no-thumb img { display:none; }
 #bir-strip .cap { font:10px -apple-system,system-ui,sans-serif; color:#9fb3d0; padding:3px 6px;
-  line-height:1.35; }
+  line-height:1.35; display:flex; gap:5px; align-items:baseline; }
+#bir-strip .item.no-thumb .cap { padding:5px 6px; }
+#bir-strip .cap .mod { flex:0 0 auto; font-weight:700; color:#cfe0f5; background:#1b2740;
+  border-radius:3px; padding:0 4px; }
+#bir-strip .cap .txt { min-width:0; overflow:hidden; text-overflow:ellipsis;
+  display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; }
 .bir-cell-selected { outline:1px solid #2b6cb0; outline-offset:-1px; }
 .srv-grid.ann-none .srv-orient, .srv-grid.ann-none .srv-slice-readout,
 .srv-grid.ann-min .srv-slice-readout { display:none; }
@@ -7148,14 +7154,20 @@ function mountBir(cfg) {
       const img = document.createElement("img");
       img.alt = "";
       const loadThumb = () => it.thumb().then((b) => {
+        item.classList.toggle("no-thumb", !b);
         if (b) img.src = URL.createObjectURL(b);
-      }).catch(() => {
-      });
+      }).catch(() => item.classList.add("no-thumb"));
       loadThumb();
       if (it.current) refreshCurrentThumb = loadThumb;
       const cap = document.createElement("div");
       cap.className = "cap";
-      cap.textContent = it.lines.join(" \xB7 ");
+      const mod = document.createElement("span");
+      mod.className = "mod";
+      mod.textContent = it.modality ?? it.lines[0] ?? "";
+      const txt = document.createElement("span");
+      txt.className = "txt";
+      txt.textContent = (it.modality ? it.lines : it.lines.slice(1)).join(" \xB7 ");
+      cap.append(mod, txt);
       item.append(img, cap);
       item.addEventListener("click", () => {
         if (!it.current) it.open();
@@ -8279,20 +8291,6 @@ async function main() {
     cx2.drawImage(c0, (THUMB - w * s) / 2, (THUMB - h * s) / 2, w * s, h * s);
     return new Promise((res2) => c.toBlob(res2, "image/png"));
   };
-  const placeholderThumb = (modality) => {
-    const c = document.createElement("canvas");
-    c.width = THUMB;
-    c.height = THUMB;
-    const cx2 = c.getContext("2d");
-    cx2.fillStyle = "#0b0e16";
-    cx2.fillRect(0, 0, THUMB, THUMB);
-    cx2.fillStyle = "#3d5a86";
-    cx2.font = "700 26px -apple-system,system-ui,sans-serif";
-    cx2.textAlign = "center";
-    cx2.textBaseline = "middle";
-    cx2.fillText(modality || "?", THUMB / 2, THUMB / 2);
-    return new Promise((res2) => c.toBlob(res2, "image/png"));
-  };
   const currentSeriesThumb = () => {
     const { dims, win, lev } = res.ct;
     const [w, h, d] = dims, z = Math.floor(d / 2);
@@ -8310,24 +8308,32 @@ async function main() {
   if (source.st) {
     try {
       const rows = await readStudyRows(source.st, setLoad);
-      rows.sort((a, b) => (parseInt(a.SeriesNumber) || 1e9) - (parseInt(b.SeriesNumber) || 1e9) || Number(b.instanceCount) - Number(a.instanceCount));
+      const seriesNo = (r) => {
+        const n = parseInt(r.SeriesNumber);
+        return Number.isFinite(n) ? n : 1e9;
+      };
+      rows.sort((a, b) => seriesNo(a) - seriesNo(b) || Number(b.instanceCount) - Number(a.instanceCount));
       seriesStrip = rows.map((r) => {
         const mod = String(r.Modality).toUpperCase();
         const isCurrent = String(r.crdc_series_uuid) === source.c;
         const desc = String(r.SeriesDescription ?? "").trim();
         return {
           seriesUID: String(r.SeriesInstanceUID),
-          lines: [mod, ...desc ? [desc] : [], `${Number(r.instanceCount) || 0} img`],
+          modality: mod,
+          lines: [...desc ? [desc] : [], `${Number(r.instanceCount) || 0} img`],
           current: isCurrent,
+          // null = no picture: the row collapses to its text instead of showing a square that
+          // says "SR". Reports, segmentation objects and presentation states are most of a
+          // study's series list, and squares of placeholder crowd out the images.
           thumb: async () => {
             if (isCurrent) return currentSeriesThumb();
-            if (!IMG_MODS.has(mod) || !r.crdc_series_uuid) return placeholderThumb(mod);
+            if (!IMG_MODS.has(mod) || !r.crdc_series_uuid) return null;
             await acquire();
             try {
               const t = await loadThumbnail(String(r.crdc_series_uuid), String(r.aws_bucket), mod);
-              return t ? sliceToThumb(t) : placeholderThumb(mod);
+              return t ? sliceToThumb(t) : null;
             } catch {
-              return placeholderThumb(mod);
+              return null;
             } finally {
               release();
             }
