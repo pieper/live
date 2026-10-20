@@ -5806,6 +5806,61 @@ function installChrome(opts) {
     box.addEventListener("pointercancel", end);
     return paint;
   };
+  const attachSteps = (box, max, get, set, fmt, color, disabled, onChange) => {
+    box.style.cursor = "ew-resize";
+    box.title = `Click to step up (wraps past ${max}) \xB7 Drag sideways to set`;
+    const c = `rgb(${Math.round(color[0] * 255)},${Math.round(color[1] * 255)},${Math.round(color[2] * 255)})`;
+    const paint = () => {
+      const v = Math.max(0, Math.min(max, Math.round(get())));
+      box.style.opacity = v === 0 ? "0.75" : "1";
+      box.innerHTML = `<span style="position:absolute;left:0;top:0;bottom:0;width:${v / max * 100}%;background:${c};opacity:.9"></span><span style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font:700 10px -apple-system,system-ui,sans-serif;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,.75)">${fmt(v)}</span>`;
+    };
+    paint();
+    const clamp = (v) => Math.max(0, Math.min(max, Math.round(v)));
+    let startX = 0, startV = 0, dragged = false, id = -1;
+    box.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (disabled()) return;
+      startX = e.clientX;
+      startV = get();
+      dragged = false;
+      id = e.pointerId;
+      try {
+        box.setPointerCapture(id);
+      } catch {
+      }
+    });
+    box.addEventListener("pointermove", (e) => {
+      if (id < 0) return;
+      const dx = e.clientX - startX;
+      if (Math.abs(dx) > 3) dragged = true;
+      if (dragged) {
+        const v = clamp(startV + dx / (130 / max));
+        if (v !== get()) {
+          set(v);
+          onChange();
+        }
+        paint();
+      }
+    });
+    const end = () => {
+      if (id < 0) return;
+      if (!dragged) {
+        set((clamp(get()) + 1) % (max + 1));
+        paint();
+        onChange();
+      }
+      try {
+        box.releasePointerCapture(id);
+      } catch {
+      }
+      id = -1;
+    };
+    box.addEventListener("pointerup", end);
+    box.addEventListener("pointercancel", end);
+    return paint;
+  };
   const OPBOX_CSS = "width:44px;height:18px;border-radius:6px;position:relative;overflow:hidden;flex:0 0 auto;background:rgba(255,255,255,.14);box-shadow:inset 0 0 0 1px rgba(255,255,255,.18);touch-action:none;";
   const heading = (text, first) => {
     const h = document.createElement("div");
@@ -5919,6 +5974,24 @@ function installChrome(opts) {
         rows.push({ c, row, repaint: () => {
           pill.textContent = c.button.text();
         } });
+        continue;
+      }
+      if (c.steps) {
+        const box = document.createElement("span");
+        box.style.cssText = OPBOX_CSS;
+        row.appendChild(box);
+        const paint = attachSteps(
+          box,
+          c.steps.max,
+          c.steps.get,
+          (v) => c.steps.set(v),
+          c.steps.format ?? ((v) => String(v)),
+          c.color ?? [0.62, 0.9, 1],
+          () => c.disabled?.() ?? false,
+          () => opts.onChange?.()
+        );
+        rows.push({ c, row, repaint: paint });
+        pop.appendChild(row);
         continue;
       }
       if (c.getOpacity && c.setOpacity) {
@@ -7933,13 +8006,11 @@ async function main() {
   }
   earlySlices.length = 0;
   earlySeg = null;
-  let sliceOutline = true;
   let outlineWidth = 2;
   const applySegOverlay = () => {
-    const master = sc.segOpacity();
-    sc.slice.setOverlayOpacity(sliceOutline ? 0 : master * SEG_FILL);
-    sc.slice.setOutlineOpacity(sliceOutline ? master : 0);
-    sc.slice.setOutlineWidth(outlineWidth);
+    sc.slice.setOverlayOpacity(sc.segOpacity() * SEG_FILL);
+    sc.slice.setOutlineOpacity(outlineWidth > 0 ? 1 : 0);
+    sc.slice.setOutlineWidth(Math.max(1, outlineWidth));
   };
   let roiEnabled = false, roiVisible = false, roiFirstEnable = true;
   let annOn = true;
@@ -8409,35 +8480,23 @@ async function main() {
       disabled: () => !sc.hasSeg,
       color: [0.62, 0.9, 1]
     },
-    // How the segmentation draws on the MPR planes: outline (default) or filled regions. Either
-    // way the "Segmentation" opacity above scales it, and 0% is off.
+    // Outline width on the MPR planes, 0-4 px: click the chip to step up (4 wraps back to off),
+    // or drag it sideways. Independent of the Segmentation opacity above, which is the FILL —
+    // so the contours stay crisp over a dialled-down fill, or stand alone at 0%.
     {
       label: "Segmentation outline",
-      get: () => sliceOutline,
-      set: (on) => {
-        sliceOutline = on;
-        applySegOverlay();
-        for (const p of PLANES) drawSlice(p);
-        xhair?.redraw();
-      },
-      disabled: () => !sc.hasSeg
-    },
-    {
-      label: "Outline width",
-      slider: {
-        min: 1,
+      steps: {
         max: 4,
-        step: 1,
         get: () => outlineWidth,
         set: (v) => {
-          outlineWidth = Math.round(v);
+          outlineWidth = v;
           applySegOverlay();
           for (const p of PLANES) drawSlice(p);
           xhair?.redraw();
         },
-        format: (v) => `${Math.round(v)} px`
+        format: (v) => v ? `${v} px` : "off"
       },
-      disabled: () => !sc.hasSeg || !sliceOutline
+      disabled: () => !sc.hasSeg
     },
     // 3D volume-render crop: enabling it reveals the ROI box the first time (Slicer behaviour).
     {
