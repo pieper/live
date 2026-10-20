@@ -186,7 +186,8 @@ var SHADER = (
 struct U {
   p2t : mat4x4<f32>,     // RAS -> texture[0,1] (folds in ijkToRAS: rotation + anisotropy)
   origin : vec4<f32>,    // RAS of the plane center (for the current scrub offset)
-  uvec : vec4<f32>,      // RAS vector spanning the view width  (isotropic mm)
+  uvec : vec4<f32>,      // xyz: RAS vector spanning the view width (isotropic mm); w: segmentation
+                         //      outline width in SCREEN PIXELS (see setOutlineWidth)
   vvec : vec4<f32>,      // RAS vector spanning the view height (isotropic mm)
   params : vec4<f32>,    // win, lev, fillOpacity, outlineOpacity
   size : vec4<f32>,      // sizeX, sizeY, labelOverlayMode, bgLutMode (0 gray, 1 LUT row 0)
@@ -289,16 +290,25 @@ fn fs_main(v : V) -> @location(0) vec4<f32> {
   let fillA = clamp(ov.a * u.params.z, 0.0, 1.0);
   var outA = 0.0;
   if (u.params.w > 0.0) {
-    let du = u.uvec.xyz / u.size.x * 1.5;   // ~1.5 px right, in RAS
-    let dv = u.vvec.xyz / u.size.y * 1.5;   // ~1.5 px up
+    // The contour is the band of voxels within w SCREEN pixels of a boundary, so it keeps the
+    // same visual weight at every zoom. Eight neighbours, not four: at four, a boundary running
+    // diagonally is only sampled across its corners and the line thins and breaks up as w grows.
+    let w = max(u.uvec.w, 1.0);
+    let du = u.uvec.xyz / u.size.x * w;     // w px right, in RAS
+    let dv = u.vvec.xyz / u.size.y * w;     // w px up
+    let dd = 0.70710678;                    // diagonals at the same distance
     let n0 = ov_at(ras + du); let n1 = ov_at(ras - du); let n2 = ov_at(ras + dv); let n3 = ov_at(ras - dv);
+    let n4 = ov_at(ras + (du + dv) * dd); let n5 = ov_at(ras + (du - dv) * dd);
+    let n6 = ov_at(ras - (du + dv) * dd); let n7 = ov_at(ras - (du - dv) * dd);
     // A neighbour is a DIFFERENT segment iff its overlay texel differs at all. The overlay is
     // sampled NEAREST from a crisp per-voxel bake, so every texel is an exact palette entry and
     // an exact comparison is the label test: two touching segments whose colours happen to be
     // close still get a boundary, where a distance threshold used to merge them into one blob.
     // A hidden segment (palette alpha 0) differs from a visible neighbour, so the visible one
     // keeps its contour there; and its own voxels have ov.a = 0, so it draws nothing itself.
-    let edge = select(0.0, 1.0, any(n0 != ov) || any(n1 != ov) || any(n2 != ov) || any(n3 != ov));
+    let edge = select(0.0, 1.0,
+      any(n0 != ov) || any(n1 != ov) || any(n2 != ov) || any(n3 != ov) ||
+      any(n4 != ov) || any(n5 != ov) || any(n6 != ov) || any(n7 != ov));
     outA = clamp(ov.a * u.params.w * edge, 0.0, 1.0);
   }
   col = mix(col, ov.rgb, max(fillA, outA));
@@ -602,6 +612,12 @@ var SliceRenderer = class {
   setOverlayOutline(on) {
     this.u[31] = on ? 1 : 0;
   }
+  /** Overlay outline width, in SCREEN pixels (constant under zoom). Rides in uvec.w, which the
+   *  per-frame uniform update writes alongside the view vectors. */
+  setOutlineWidth(px) {
+    this.outlineWidth = Math.max(1, px);
+  }
+  outlineWidth = 2;
   /** Physical size (mm) of the square view for the current plane (isotropic, letterboxed).
    *  Matches Slicer's FitSliceToBackground: the field of view is exactly the volume's
    *  extent along the limiting in-plane axis — NO extra margin. (Verified against
@@ -774,7 +790,7 @@ var SliceRenderer = class {
     this.u[20] = b.uDir[0] * uS;
     this.u[21] = b.uDir[1] * uS;
     this.u[22] = b.uDir[2] * uS;
-    this.u[23] = 0;
+    this.u[23] = this.outlineWidth;
     this.u[24] = b.vDir[0] * vS;
     this.u[25] = b.vDir[1] * vS;
     this.u[26] = b.vDir[2] * vS;
@@ -7917,11 +7933,13 @@ async function main() {
   }
   earlySlices.length = 0;
   earlySeg = null;
-  let sliceOutline = false;
+  let sliceOutline = true;
+  let outlineWidth = 2;
   const applySegOverlay = () => {
     const master = sc.segOpacity();
-    sc.slice.setOverlayOpacity(master * SEG_FILL);
+    sc.slice.setOverlayOpacity(sliceOutline ? 0 : master * SEG_FILL);
     sc.slice.setOutlineOpacity(sliceOutline ? master : 0);
+    sc.slice.setOutlineWidth(outlineWidth);
   };
   let roiEnabled = false, roiVisible = false, roiFirstEnable = true;
   let annOn = true;
@@ -8220,7 +8238,7 @@ async function main() {
     roiState: () => ({ visible: sc.roiVisible(), handles: sc.roi.handleList().length }),
     setSegOpacity: (o) => {
       sc.setSegOpacity(o);
-      sc.slice.setOverlayOpacity(o * SEG_FILL);
+      applySegOverlay();
       drawAll();
     }
   };
@@ -8391,7 +8409,8 @@ async function main() {
       disabled: () => !sc.hasSeg,
       color: [0.62, 0.9, 1]
     },
-    // Segmentation overlay: fill (default) vs outline on the MPR planes.
+    // How the segmentation draws on the MPR planes: outline (default) or filled regions. Either
+    // way the "Segmentation" opacity above scales it, and 0% is off.
     {
       label: "Segmentation outline",
       get: () => sliceOutline,
@@ -8402,6 +8421,23 @@ async function main() {
         xhair?.redraw();
       },
       disabled: () => !sc.hasSeg
+    },
+    {
+      label: "Outline width",
+      slider: {
+        min: 1,
+        max: 4,
+        step: 1,
+        get: () => outlineWidth,
+        set: (v) => {
+          outlineWidth = Math.round(v);
+          applySegOverlay();
+          for (const p of PLANES) drawSlice(p);
+          xhair?.redraw();
+        },
+        format: (v) => `${Math.round(v)} px`
+      },
+      disabled: () => !sc.hasSeg || !sliceOutline
     },
     // 3D volume-render crop: enabling it reveals the ROI box the first time (Slicer behaviour).
     {
@@ -8474,6 +8510,7 @@ async function main() {
   });
   buildAnnotations();
   applyAnn();
+  applySegOverlay();
   if (geomCheck && (geomCheck.stack || geomCheck.notes.length)) {
     geometryNotice(geomCheck, !!(res.seg || source.s));
   }
