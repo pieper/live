@@ -7978,6 +7978,7 @@ async function main() {
   if (!streaming) sampleRange(res.ct.vol);
   const dataRange = () => [vmin, vmax];
   sc.setVolumeOpacity(0.5);
+  sc.setSegOpacity(0.5);
   let midSlice = null;
   let scheduleRedraw = () => {
   };
