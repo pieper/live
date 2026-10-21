@@ -3884,6 +3884,17 @@ var JfaSdfBaker = class {
     i32v[27] = 0;
     this.dev.queue.writeBuffer(this.uni, 0, ab);
   }
+  /** Distance-blur σ, in VOXELS, applied to the signed distance on every bake/refine (0 = none).
+   *  The zero level set barely moves, so the silhouette stays where the labelmap put it; what the
+   *  blur smooths is the GRADIENT, i.e. the shading normal — which is what turns a voxel-faceted
+   *  "golf ball" into a surface. Takes effect on the next bake(); the caller decides when that is,
+   *  since a sweep is ~20 compute passes. */
+  setSmoothing(sigmaVoxels) {
+    this.smoothSigma = Math.max(0, sigmaVoxels);
+  }
+  smoothing() {
+    return this.smoothSigma;
+  }
   /** FAST bake for LIVE editing: plain JFA (approximate) + a light distance-only blur (crisp colour
    *  seams). Cheap, so it keeps up with an in-progress stroke; the seams stay voxel-jagged until the
    *  edit settles and refine() runs. */
@@ -3971,7 +3982,7 @@ var JfaSdfBaker = class {
     p.dispatchWorkgroups(g[0], g[1], g[2]);
     p.end();
     dev.queue.submit([enc.finish()]);
-    this.blurStage(this.blurPipe, this.smoothSigma, this.sdfTex, this.sdfScratch, region);
+    if (this.smoothSigma > 0) this.blurStage(this.blurPipe, this.smoothSigma, this.sdfTex, this.sdfScratch, region);
     this.blurStage(this.colBlurPipe, 1, this.sdfTex, this.sdfScratch, region);
     this.blurStage(this.fullBlurPipe, 1, this.attrTex, this.attrScratch, region);
   }
@@ -4175,7 +4186,7 @@ var SegmentationLogic = class {
     this.clippable = opts.clippable ?? false;
     this.setLabelColor(1, opts.color ?? [0.3, 0.85, 0.55]);
     if (this.renderMode === "sdf") {
-      this.sdf = new JfaSdfBaker(device, seg.masterTexture(), seg.dims, seg.ijkToRAS, 1, 2, this.boundaryMode);
+      this.sdf = new JfaSdfBaker(device, seg.masterTexture(), seg.dims, seg.ijkToRAS, this.sigma, 2, this.boundaryMode);
     } else {
       this.baker = new ColorizeBaker(device, seg.masterTexture(), seg.dims);
       this.presenceTex = this.baker.output();
@@ -4361,6 +4372,23 @@ var SegmentationLogic = class {
     this.opacity = o;
     this.segField?.setOpacity(o);
   }
+  /** Surface smoothing, σ in VOXELS (0 = none). In sdf mode this is the distance blur: it barely
+   *  moves the zero level set, so the silhouette stays faithful to the labelmap, but it smooths
+   *  the shading normal — the difference between a faceted voxel surface and a modelled one. In
+   *  surface mode it is the presence-field Gaussian, which does move the surface outward.
+   *
+   *  Re-bakes immediately (fast path, so a slider stays responsive) and schedules the settle
+   *  refine, exactly as an edit does. */
+  setSmoothing(sigmaVoxels) {
+    this.sigma = Math.max(0, sigmaVoxels);
+    this.sdf?.setSmoothing(this.sigma);
+    this.rebake();
+    for (const cb of this.redrawCbs) cb();
+    this.scheduleRefine();
+  }
+  smoothing() {
+    return this.sigma;
+  }
   /** Notified after every edit (post-rebake) so the app can redraw. */
   onRedraw(cb) {
     this.redrawCbs.push(cb);
@@ -4518,12 +4546,13 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
   let mode = "volume";
   let segLogic;
   let editable;
+  let segSigma = 1;
   const buildSdf = (sg) => {
     const cap = resampleIsotropic(mergedLabels(sg), dims, ct.ijkToRAS, opts.sdfMaxDim ?? SDF_MAX_DIM, opts.sdfMaxVoxels);
     if (cap.coarsened) console.warn(`SEGRoulette: SDF grid coarsened to fit the device memory budget (${cap.dims.join("\xD7")}, ${cap.vox.toFixed(2)}mm) \u2014 a remote render server would allow full resolution.`);
     editable = new EditableSegmentation(dev, cap.dims, { ijkToRAS: cap.ijkToRAS });
     const boundaryMode = labelmapHasInternalBoundary(cap.lab, cap.dims) ? "all" : "outer";
-    segLogic = new SegmentationLogic(dev, editable, { renderMode: "sdf", opacity: 1, boundaryMode, refineDelayMs: opts.refineDelayMs });
+    segLogic = new SegmentationLogic(dev, editable, { renderMode: "sdf", opacity: 1, boundaryMode, sigmaVoxels: segSigma, refineDelayMs: opts.refineDelayMs });
     for (const s of segments) {
       segLogic.setLabelColor(s.num, s.color);
       segLogic.setLabelOpacity(s.num, opacityOf(s.num));
@@ -4661,6 +4690,11 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
       else scene.syncUniforms();
     },
     segOpacity: () => segLayerOpacity,
+    setSegSmoothing(sigmaVoxels) {
+      segSigma = Math.max(0, sigmaVoxels);
+      segLogic?.setSmoothing(segSigma);
+    },
+    segSmoothing: () => segSigma,
     setSegmentOpacity(num, opacity) {
       const o = Math.max(0, Math.min(1, opacity));
       if (o >= 1) segOpacity.delete(num);
@@ -6425,6 +6459,60 @@ async function loadSeries(entry, handlers = {}, opts) {
   r.entry = entry;
   return r;
 }
+async function loadSegmentation(prefix, bucket, ctLike, handlers = {}, opts) {
+  const segKeys = await s3ListKeys(prefix, bucket);
+  if (!segKeys.length)
+    return null;
+  return new Promise((resolve, reject) => {
+    let w;
+    try {
+      w = new Worker(resolveWorkerURL(opts));
+    } catch (err) {
+      return reject(err);
+    }
+    let seg;
+    const done = (fn) => {
+      try {
+        w.terminate();
+      } catch {
+      }
+      fn();
+    };
+    w.onmessage = (e) => {
+      const m = e.data;
+      switch (m.t) {
+        case "progress":
+          handlers.onProgress?.({ frac: m.frac, msg: m.msg });
+          break;
+        case "seg":
+          handlers.onSegName?.(m.name);
+          break;
+        case "segerror":
+          console.warn("[idc_tools] SEG failed:", m.error);
+          handlers.onSegError?.(m.error);
+          break;
+        case "labelmap":
+          seg = { lab: new Uint8Array(m.lab), extra: (m.extra ?? []).map((x) => new Uint8Array(x)), colors: m.colors, names: m.names, terminology: m.terminology, overlap: m.overlap };
+          break;
+        case "error":
+          done(() => reject(new Error(m.error)));
+          break;
+        case "alldone":
+          done(() => resolve(seg ?? null));
+          break;
+      }
+    };
+    w.onerror = (ev) => done(() => reject(new Error("idc_tools worker: " + (ev.message || ev))));
+    w.postMessage({
+      ctKeys: [],
+      segKeys,
+      ctBucket: bucket,
+      segBucket: bucket,
+      modality: "SEG",
+      segOnly: { dims: ctLike.dims, ijkToRAS: ctLike.ijkToRAS }
+    });
+  });
+}
 async function loadThumbnail(prefix, bucket, modality, opts) {
   const keys = await s3ListKeys(prefix, bucket);
   if (!keys.length)
@@ -6585,6 +6673,9 @@ var STYLE = `
   overflow:hidden; background:#05060a; }
 #bir-strip .item:hover { border-color:#33507e; }
 #bir-strip .item.current { border-color:#2b6cb0; box-shadow:0 0 0 1px #2b6cb0; }
+/* The displayed OVERLAY (a segmentation drawn over the open series) \u2014 a second kind of
+   "showing", so it reads differently from the open series itself. */
+#bir-strip .item.overlay { border-color:#54c6f0; box-shadow:inset 3px 0 0 #54c6f0; }
 #bir-strip img { width:100%; aspect-ratio:1; object-fit:contain; background:#000; display:block; }
 #bir-strip .item.no-thumb img { display:none; }
 #bir-strip .cap { font:10px -apple-system,system-ui,sans-serif; color:#9fb3d0; padding:3px 6px;
@@ -7150,7 +7241,8 @@ function mountBir(cfg) {
       const item = document.createElement("div");
       item.className = "item" + (it.current ? " current" : "");
       if (it.current) currentItem = item;
-      item.title = it.lines.join(" \xB7 ") + " \u2014 click to load";
+      item.dataset.uid = it.seriesUID;
+      item.title = it.lines.join(" \xB7 ") + (it.overlay ? " \u2014 click to show over the current images" : " \u2014 click to load");
       const img = document.createElement("img");
       img.alt = "";
       const loadThumb = () => it.thumb().then((b) => {
@@ -7349,6 +7441,11 @@ function mountBir(cfg) {
     hooks,
     drawOverlay,
     refreshStrip: () => refreshCurrentThumb?.(),
+    markOverlay: (uid) => {
+      for (const el of strip?.querySelectorAll(".item") ?? []) {
+        el.classList.toggle("overlay", !!uid && el.dataset.uid === uid);
+      }
+    },
     resize: () => {
       resizeOverlays();
       redrawOverlays();
@@ -7917,6 +8014,7 @@ async function resolveFromIndex(studyUID, wantSeries, onStatus) {
     cb: String(chosen.aws_bucket),
     s: seg ? String(seg.crdc_series_uuid) : void 0,
     sb: seg ? String(seg.aws_bucket) : void 0,
+    sgid: seg ? String(seg.SeriesInstanceUID) : void 0,
     m: mod === "PET" ? "PT" : mod,
     col: String(chosen.collection_id),
     st: studyUID,
@@ -8297,6 +8395,40 @@ async function main() {
     const mid = midSlice ?? res.ct.vol.subarray(z * w * h, (z + 1) * w * h);
     return sliceToThumb({ vol: mid, dims: [w, h, 1], win, lev });
   };
+  let segSwapping = false;
+  const showSegmentation = async (segUuid, bucket, seriesUID, label) => {
+    if (segSwapping) return;
+    segSwapping = true;
+    try {
+      status(`loading ${label}\u2026`);
+      const sg = await loadSegmentation(segUuid, bucket, { dims: sc.dims, ijkToRAS: sc.ijkToRAS }, {
+        onProgress: (p) => status(`${label}: ${p.msg}${p.frac ? ` \u2014 ${Math.round(p.frac * 100)}%` : ""}`)
+      });
+      if (!sg) throw new Error("no DICOM under that segmentation series");
+      shownSeg = sg;
+      source.s = segUuid;
+      source.sb = bucket;
+      source.sgid = seriesUID;
+      sc.attachSegmentation(sg);
+      segAttached = true;
+      applySegOverlay();
+      chrome.refresh();
+      buildAnnotations();
+      applyAnn();
+      drawAll();
+      bir?.markOverlay(seriesUID);
+      const u = new URL(location.href);
+      if (source.st) u.searchParams.set("StudyInstanceUIDs", source.st);
+      u.searchParams.set("SeriesInstanceUIDs", [source.sid, seriesUID].filter(Boolean).join(","));
+      history.replaceState(null, "", u.toString());
+      status(READY);
+    } catch (e) {
+      status(`Couldn't load ${label}: ${e.message}`, true);
+      setTimeout(() => status(READY), 6e3);
+    } finally {
+      segSwapping = false;
+    }
+  };
   const navigateToSeries = (seriesUID) => {
     const u = new URL(location.href);
     u.searchParams.set("StudyInstanceUIDs", source.st);
@@ -8320,6 +8452,7 @@ async function main() {
         return {
           seriesUID: String(r.SeriesInstanceUID),
           modality: mod,
+          overlay: mod === "SEG",
           lines: [...desc ? [desc] : [], `${Number(r.instanceCount) || 0} img`],
           current: isCurrent,
           // null = no picture: the row collapses to its text instead of showing a square that
@@ -8338,7 +8471,14 @@ async function main() {
               release();
             }
           },
-          open: () => navigateToSeries(String(r.SeriesInstanceUID))
+          // A segmentation is an OVERLAY on what is already loaded, not a new thing to open:
+          // swapping it in place is the difference between one object and the whole series.
+          open: () => mod === "SEG" && r.crdc_series_uuid ? showSegmentation(
+            String(r.crdc_series_uuid),
+            String(r.aws_bucket),
+            String(r.SeriesInstanceUID),
+            desc || "segmentation"
+          ) : navigateToSeries(String(r.SeriesInstanceUID))
         };
       });
     } catch {
@@ -8637,6 +8777,31 @@ async function main() {
       },
       disabled: () => !sc.hasSeg
     },
+    // 3D segmentation surface smoothing. The segmentation is a labelmap, so its surface is a
+    // voxel staircase; this is the σ of the blur applied to the distance field, which barely
+    // moves the surface but smooths its shading normal. 0 shows the voxels honestly.
+    //
+    // Capped at 2 voxels, measured rather than guessed: on the KiTS kidneys σ=1.5 is still the
+    // whole organ, smoothly shaded, while by σ=2.25 the blur has begun eating thin structure —
+    // "barely moves the zero level set" stops being true once σ approaches the thickness of what
+    // is being smoothed. A control that can silently shrink a segmentation is worse than one
+    // that stops short.
+    {
+      label: "Segment smoothing (3D)",
+      slider: {
+        min: 0,
+        max: 2,
+        step: 0.25,
+        get: () => sc.segSmoothing(),
+        set: (v) => {
+          sc.setSegSmoothing(v);
+          draw3d();
+          xhair?.redraw();
+        },
+        format: (v) => v > 0 ? `\u03C3 ${v.toFixed(2)} vox` : "off"
+      },
+      disabled: () => !sc.hasSeg
+    },
     // 3D volume-render crop: enabling it reveals the ROI box the first time (Slicer behaviour).
     {
       label: "Crop volume (3D)",
@@ -8712,6 +8877,9 @@ async function main() {
   buildAnnotations();
   applyAnn();
   applySegOverlay();
+  if (source.s) {
+    if (source.sgid) bir.markOverlay(source.sgid);
+  }
   if (geomCheck && (geomCheck.stack || geomCheck.notes.length)) {
     geometryNotice(geomCheck, !!(res.seg || source.s));
   }
