@@ -495,11 +495,13 @@ function attachSliceControls(canvas, cfg) {
       scroll.acc += e.clientX - scroll.x - (e.clientY - scroll.y);
       scroll.x = e.clientX;
       scroll.y = e.clientY;
-      while (Math.abs(scroll.acc) >= SCROLL_PX) {
+      const per = cfg.scrollMmPerPx && cfg.stepMm ? Math.max(0.05, cfg.stepMm() / cfg.scrollMmPerPx) : SCROLL_PX;
+      for (let i = 0; Math.abs(scroll.acc) >= per && i < 400; i++) {
         const f = scroll.acc > 0;
         cfg.step(f);
-        scroll.acc -= f ? SCROLL_PX : -SCROLL_PX;
+        scroll.acc -= f ? per : -per;
       }
+      if (Math.abs(scroll.acc) >= per) scroll.acc = 0;
       cfg.redraw();
       return;
     }
@@ -783,6 +785,7 @@ function rasToScreen3D(cam, ras, w, h) {
 
 // render/demos/sl-logo.ts
 var SL_LOGO = "data:image/png;base64,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";
+var SL_FAVICON = "data:image/png;base64,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";
 
 // render/demos/sl-chrome.ts
 var DEFAULT_HELP = [
@@ -822,6 +825,15 @@ function installChrome(opts) {
   const controls = opts.controls ?? [];
   const host = opts.container ?? document.body;
   const help = (opts.help === false ? [] : opts.help) ?? DEFAULT_HELP;
+  try {
+    if (typeof document !== "undefined" && document.head && !document.querySelector('link[rel~="icon"]')) {
+      const link = document.createElement("link");
+      link.rel = "icon";
+      link.href = SL_FAVICON;
+      document.head.appendChild(link);
+    }
+  } catch {
+  }
   let helpBtn = null;
   if (opts.help !== false) {
     helpBtn = document.createElement("button");
@@ -955,6 +967,61 @@ function installChrome(opts) {
     box.addEventListener("pointercancel", end);
     return paint;
   };
+  const attachSteps = (box, max, get, set, fmt, color, disabled, onChange) => {
+    box.style.cursor = "ew-resize";
+    box.title = `Click to step up (wraps past ${max}) \xB7 Drag sideways to set`;
+    const c = `rgb(${Math.round(color[0] * 255)},${Math.round(color[1] * 255)},${Math.round(color[2] * 255)})`;
+    const paint = () => {
+      const v = Math.max(0, Math.min(max, Math.round(get())));
+      box.style.opacity = v === 0 ? "0.75" : "1";
+      box.innerHTML = `<span style="position:absolute;left:0;top:0;bottom:0;width:${v / max * 100}%;background:${c};opacity:.9"></span><span style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font:700 10px -apple-system,system-ui,sans-serif;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,.75)">${fmt(v)}</span>`;
+    };
+    paint();
+    const clamp = (v) => Math.max(0, Math.min(max, Math.round(v)));
+    let startX = 0, startV = 0, dragged = false, id = -1;
+    box.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (disabled()) return;
+      startX = e.clientX;
+      startV = get();
+      dragged = false;
+      id = e.pointerId;
+      try {
+        box.setPointerCapture(id);
+      } catch {
+      }
+    });
+    box.addEventListener("pointermove", (e) => {
+      if (id < 0) return;
+      const dx = e.clientX - startX;
+      if (Math.abs(dx) > 3) dragged = true;
+      if (dragged) {
+        const v = clamp(startV + dx / (130 / max));
+        if (v !== get()) {
+          set(v);
+          onChange();
+        }
+        paint();
+      }
+    });
+    const end = () => {
+      if (id < 0) return;
+      if (!dragged) {
+        set((clamp(get()) + 1) % (max + 1));
+        paint();
+        onChange();
+      }
+      try {
+        box.releasePointerCapture(id);
+      } catch {
+      }
+      id = -1;
+    };
+    box.addEventListener("pointerup", end);
+    box.addEventListener("pointercancel", end);
+    return paint;
+  };
   const OPBOX_CSS = "width:44px;height:18px;border-radius:6px;position:relative;overflow:hidden;flex:0 0 auto;background:rgba(255,255,255,.14);box-shadow:inset 0 0 0 1px rgba(255,255,255,.18);touch-action:none;";
   const heading = (text, first) => {
     const h = document.createElement("div");
@@ -1021,9 +1088,13 @@ function installChrome(opts) {
         top.appendChild(val);
         const inp = document.createElement("input");
         inp.type = "range";
-        inp.min = String(c.slider.min);
-        inp.max = String(c.slider.max);
-        inp.step = String(c.slider.step ?? 1);
+        const num = (v, dflt) => v === void 0 ? dflt : typeof v === "function" ? v() : v;
+        const setBounds = () => {
+          inp.min = String(num(c.slider.min, 0));
+          inp.max = String(num(c.slider.max, 1));
+          inp.step = String(num(c.slider.step, 1));
+        };
+        setBounds();
         inp.value = String(c.slider.get());
         inp.style.cssText = "width:100%;accent-color:#54c6f0;cursor:pointer;";
         const fmt = c.slider.format ?? ((v) => String(Math.round(v)));
@@ -1041,6 +1112,7 @@ function installChrome(opts) {
         row.appendChild(inp);
         pop.appendChild(row);
         rows.push({ c, row, repaint: () => {
+          setBounds();
           inp.value = String(c.slider.get());
           paint();
         } });
@@ -1063,6 +1135,24 @@ function installChrome(opts) {
         rows.push({ c, row, repaint: () => {
           pill.textContent = c.button.text();
         } });
+        continue;
+      }
+      if (c.steps) {
+        const box = document.createElement("span");
+        box.style.cssText = OPBOX_CSS;
+        row.appendChild(box);
+        const paint = attachSteps(
+          box,
+          c.steps.max,
+          c.steps.get,
+          (v) => c.steps.set(v),
+          c.steps.format ?? ((v) => String(v)),
+          c.color ?? [0.62, 0.9, 1],
+          () => c.disabled?.() ?? false,
+          () => opts.onChange?.()
+        );
+        rows.push({ c, row, repaint: paint });
+        pop.appendChild(row);
         continue;
       }
       if (c.getOpacity && c.setOpacity) {
@@ -1102,7 +1192,8 @@ function installChrome(opts) {
     segHost.innerHTML = "";
     if (!S) return;
     const list = S.list();
-    if (!list.length) return;
+    const noteText = S.note?.();
+    if (!list.length && !noteText) return;
     const wrap = document.createElement("div");
     wrap.style.cssText = "margin-top:6px;border-top:1px solid rgba(255,255,255,.12);padding-top:6px;" + (list.length > 6 ? "max-height:210px;overflow-y:auto;" : "");
     for (const s of list) {
@@ -1125,7 +1216,13 @@ function installChrome(opts) {
         if (!(S.enabled && !S.enabled())) S.set(s.num, o);
       }, s.color, () => opts.onChange?.());
       wrap.appendChild(row);
-      segRows.push({ num: s.num, box, color: s.color, paint });
+      segRows.push({ num: s.num, name: s.name, box, color: s.color, paint });
+    }
+    if (noteText) {
+      const n = document.createElement("div");
+      n.textContent = noteText;
+      n.style.cssText = "margin-top:6px;padding:5px 7px;border-radius:6px;background:rgba(255,196,84,.12);color:#ffc454;font:500 11.5px -apple-system,system-ui,sans-serif;line-height:1.35;";
+      wrap.appendChild(n);
     }
     segHost.appendChild(wrap);
     paintSegments();
@@ -1133,6 +1230,12 @@ function installChrome(opts) {
   function paintSegments() {
     const S = opts.segments;
     if (!S) return;
+    const list = S.list();
+    const changed = list.length !== segRows.length || list.some((s, i) => s.num !== segRows[i].num || s.name !== segRows[i].name);
+    if (changed) {
+      buildSegments();
+      return;
+    }
     const dis = S.enabled ? !S.enabled() : false;
     segHost.style.opacity = dis ? "0.4" : "1";
     for (const r of segRows) r.paint();
@@ -2503,7 +2606,8 @@ var SHADER = (
 struct U {
   p2t : mat4x4<f32>,     // RAS -> texture[0,1] (folds in ijkToRAS: rotation + anisotropy)
   origin : vec4<f32>,    // RAS of the plane center (for the current scrub offset)
-  uvec : vec4<f32>,      // RAS vector spanning the view width  (isotropic mm)
+  uvec : vec4<f32>,      // xyz: RAS vector spanning the view width (isotropic mm); w: segmentation
+                         //      outline width in SCREEN PIXELS (see setOutlineWidth)
   vvec : vec4<f32>,      // RAS vector spanning the view height (isotropic mm)
   params : vec4<f32>,    // win, lev, fillOpacity, outlineOpacity
   size : vec4<f32>,      // sizeX, sizeY, labelOverlayMode, bgLutMode (0 gray, 1 LUT row 0)
@@ -2513,6 +2617,9 @@ struct U {
   fgParams : vec4<f32>,  // win, lev, opacity (0 = no foreground), compositing (0 alpha,1 reverse alpha,2 add,3 subtract)
   p2tLabel : mat4x4<f32>,// RAS -> label texture[0,1]
   labelParams : vec4<f32>, // opacity (0 = no label layer), lutEntries, fgLutMode (0 gray, 1 LUT row 1), _
+  bgColor : vec4<f32>,     // rgb shown OUTSIDE the volume (the letterbox), a unused. Default black.
+  slab : vec4<f32>,        // thicknessMm, mode (0 single, 1 max, 2 mean, 3 min), steps, fgMode
+  nrm : vec4<f32>,         // plane normal in RAS (unit), for marching through the slab
 };
 @group(0) @binding(0) var<uniform> u : U;
 @group(0) @binding(1) var s_lin : sampler;
@@ -2541,44 +2648,113 @@ fn srgb2physical(c : vec3<f32>) -> vec3<f32> {
   let lo = c / 12.92; let hi = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
   return select(lo, hi, c > vec3<f32>(0.04045));
 }
-/** The overlay colour at a texture coordinate, from whichever source is configured. */
-fn ov_tex(t : vec3<f32>) -> vec4<f32> {
+/** The overlay colour of ONE label layer at a texture coordinate.
+ *
+ *  size.z is the number of label layers (0 = the pre-coloured rgba overlay, which is one layer by
+ *  definition). The layers are stacked along z in a single label texture \u2014 depth = nz * layers \u2014
+ *  because DICOM SEG segments may overlap and one label per voxel cannot hold that: segments that
+ *  overlap are decoded into different layers and composited here, the way OHIF composites one
+ *  representation per layer. */
+fn ov_layer(t : vec3<f32>, layer : i32) -> vec4<f32> {
   if (u.size.z > 0.5) {
-    let d = vec3<f32>(textureDimensions(t_labels));
+    let full = vec3<f32>(textureDimensions(t_labels));
+    let nz = full.z / max(u.size.z, 1.0);                    // depth of ONE layer
+    let d = vec3<f32>(full.x, full.y, nz);
     let vi = vec3<i32>(clamp(floor(t * d), vec3<f32>(0.0), d - vec3<f32>(1.0)));
-    let lab = i32(textureLoad(t_labels, vi, 0).r);
+    let lab = i32(textureLoad(t_labels, vec3<i32>(vi.x, vi.y, vi.z + layer * i32(nz)), 0).r);
     if (lab == 0) { return vec4<f32>(0.0); }
     return textureLoad(t_palette, vec2<i32>(lab, 1), 0);
   }
+  if (layer > 0) { return vec4<f32>(0.0); }
   return textureSampleLevel(t_overlay, s_nn, t, 0.0);
 }
-fn ov_at(ras : vec3<f32>) -> vec4<f32> {   // overlay at a RAS point (0 outside the volume)
+fn ov_at(ras : vec3<f32>, layer : i32) -> vec4<f32> {   // overlay at a RAS point (0 outside the volume)
   let t = (u.p2t * vec4<f32>(ras, 1.0)).xyz;
   if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { return vec4<f32>(0.0); }
-  return ov_tex(t);
+  return ov_layer(t, layer);
 }
+// Composite the background volume through a SLAB of slab.x millimetres centred on the plane.
+//
+// This is what a clinical reader's "Thickness" spinbox does, and with the thickness set to the
+// whole volume it is also a MIP \u2014 which is why the rotating MIP needs no separate renderer, just
+// an oblique basis and a full-depth slab. Slicer has no 2D slab/MIP renderer at all (the usual
+// answer is 3D volume rendering with the MIP technique), so this is new capability, not a port.
+//
+// Returns the composited scalar, and hit = false when every sample fell outside the volume.
+struct SlabSample { value : f32, hit : bool };
+fn sample_slab_tex(ras : vec3<f32>, p2t : mat4x4<f32>, fg : bool, mode : i32) -> SlabSample {
+  let steps = max(1, i32(u.slab.z));
+  var acc = 0.0;
+  var best = -3.402823e38;
+  var worst = 3.402823e38;
+  var n = 0;
+  for (var i = 0; i < steps; i = i + 1) {
+    // Centre the slab on the plane: a 10 mm slab reads 5 mm either side, so the displayed slice
+    // stays where the scrollbar says it is.
+    let f = select(f32(i) / f32(steps - 1) - 0.5, 0.0, steps == 1);
+    let p = ras + u.nrm.xyz * (f * u.slab.x);
+    let t = (p2t * vec4<f32>(p, 1.0)).xyz;
+    if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { continue; }
+    var sv = 0.0;
+    if (fg) { sv = textureSampleLevel(t_fg, s_lin, t, 0.0).r; }
+    else { sv = textureSampleLevel(t_scalar, s_lin, t, 0.0).r; }
+    acc = acc + sv;
+    best = max(best, sv);
+    worst = min(worst, sv);
+    n = n + 1;
+  }
+  if (n == 0) { return SlabSample(0.0, false); }
+  if (mode == 1) { return SlabSample(best, true); }
+  if (mode == 2) { return SlabSample(acc / f32(n), true); }
+  if (mode == 3) { return SlabSample(worst, true); }
+  return SlabSample(acc / f32(n), true);
+}
+fn sample_slab(ras : vec3<f32>) -> SlabSample {
+  return sample_slab_tex(ras, u.p2t, false, i32(u.slab.y + 0.5));
+}
+
 @fragment
 fn fs_main(v : V) -> @location(0) vec4<f32> {
   let uv = v.position.xy / u.size.xy;                 // [0,1], y down
   let ras = u.origin.xyz + u.uvec.xyz * (uv.x - 0.5) + u.vvec.xyz * (0.5 - uv.y);
   let t4 = u.p2t * vec4<f32>(ras, 1.0);
   let tex = t4.xyz;
-  if (any(tex < vec3<f32>(0.0)) || any(tex > vec3<f32>(1.0))) { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }
-  let val = textureSampleLevel(t_scalar, s_lin, tex, 0.0).r;
+  // Outside the volume. Not always black: standalone PET is read as inverted grey on WHITE, so a
+  // black letterbox would invert the figure/ground around the image and bury the annotations.
+  // With a slab we must ask the SLAB whether anything was hit \u2014 an oblique MIP has plenty of rays
+  // whose centre sample misses the volume while the slab still crosses it.
+  let slab = sample_slab(ras);
+  if (!slab.hit) { return vec4<f32>(srgb2physical(u.bgColor.rgb), 1.0); }
+  let val = slab.value;
   let win = max(u.params.x, 1e-6);
   let g = clamp((val - (u.params.y - win * 0.5)) / win, 0.0, 1.0);
   var col = vec3<f32>(g);
   if (u.size.w > 0.5) { col = textureLoad(t_lut, vec2<i32>(i32(g * 255.0), 0), 0).rgb; }
   // \u2500\u2500 foreground layer (Slicer's vtkImageBlend semantics per compositing mode) \u2500\u2500
   if (u.fgParams.z > 0.0) {
-    let tf = (u.p2tFg * vec4<f32>(ras, 1.0)).xyz;
-    if (all(tf >= vec3<f32>(0.0)) && all(tf <= vec3<f32>(1.0))) {
-      let fv = textureSampleLevel(t_fg, s_lin, tf, 0.0).r;
+    // The foreground is composited through the SAME slab as the background, with its own mode:
+    // a thick PET/CT slab normally wants MEAN on the CT (to suppress noise) and MAX on the PET
+    // (so a small avid node inside the slab is not averaged away). Thickening only the CT would
+    // misrepresent where the uptake is.
+    let fs = sample_slab_tex(ras, u.p2tFg, true, i32(u.slab.w + 0.5));
+    if (fs.hit) {
+      let fv = fs.value;
       let fwin = max(u.fgParams.x, 1e-6);
       let fg = clamp((fv - (u.fgParams.y - fwin * 0.5)) / fwin, 0.0, 1.0);
       var fcol = vec3<f32>(fg);
-      if (u.labelParams.z > 0.5) { fcol = textureLoad(t_lut, vec2<i32>(i32(fg * 255.0), 1), 0).rgb; }
-      let a = u.fgParams.z;
+      // The foreground LUT's ALPHA is a per-value opacity ramp multiplied into the layer opacity.
+      // PET/CT fusion needs it: a hot-metal ramp is black at low uptake, so a constant alpha
+      // washes the CT toward black everywhere the PET is cold. A ramp that is transparent at low
+      // SUV and opaque at high SUV is the convention every clinical viewer uses (OHIF expresses
+      // the same thing as colormap opacity control points). Every existing colour table has
+      // alpha 255 throughout, so this is a no-op for them.
+      var fa = 1.0;
+      if (u.labelParams.z > 0.5) {
+        let ftex = textureLoad(t_lut, vec2<i32>(i32(fg * 255.0), 1), 0);
+        fcol = ftex.rgb;
+        fa = ftex.a;
+      }
+      let a = u.fgParams.z * fa;
       let mode = i32(u.fgParams.w + 0.5);
       if (mode == 0) { col = mix(col, fcol, a); }                       // alpha: fg over bg
       else if (mode == 1) { col = mix(fcol, col, a); }                  // reverse alpha: bg over fg
@@ -2598,23 +2774,56 @@ fn fs_main(v : V) -> @location(0) vec4<f32> {
       }
     }
   }
-  let ov = ov_tex(tex);
   // Slicer-style 2D segmentation: a semi-transparent per-voxel FILL plus a brighter boundary
   // OUTLINE, with independent opacities (params.z = fill, params.w = outline). The outline is
   // screen-space (constant pixel width under zoom), drawn in the segment's own colour along its
   // inner edge \u2014 at both label\u2194label and label\u2194background boundaries.
-  let fillA = clamp(ov.a * u.params.z, 0.0, 1.0);
-  var outA = 0.0;
-  if (u.params.w > 0.0) {
-    let du = u.uvec.xyz / u.size.x * 1.5;   // ~1.5 px right, in RAS
-    let dv = u.vvec.xyz / u.size.y * 1.5;   // ~1.5 px up
-    let n0 = ov_at(ras + du); let n1 = ov_at(ras - du); let n2 = ov_at(ras + dv); let n3 = ov_at(ras - dv);
-    let e = max(max(distance(n0.rgb, ov.rgb) + abs(n0.a - ov.a), distance(n1.rgb, ov.rgb) + abs(n1.a - ov.a)),
-                max(distance(n2.rgb, ov.rgb) + abs(n2.a - ov.a), distance(n3.rgb, ov.rgb) + abs(n3.a - ov.a)));
-    let edge = clamp((e - 0.03) * 12.0, 0.0, 1.0);   // 0 in the interior, 1 at a colour/label edge
-    outA = clamp(ov.a * u.params.w * edge, 0.0, 1.0);
+  //
+  // Each label layer composites over the one below, so a voxel claimed by two segments comes out
+  // MORE OPAQUE than either alone (1-(1-a1)(1-a2)) and in the blend of their colours \u2014 which is
+  // how an overlap reads as an overlap rather than as whichever segment was decoded last. Each
+  // layer is also edge-tested on its OWN labels, so every segment keeps its own contour through
+  // the region it shares; the contours blend only where they coincide.
+  let nL = max(i32(u.size.z), 1);
+  let w = max(u.uvec.w, 1.0);
+  let du = u.uvec.xyz / u.size.x * w;     // w px right, in RAS
+  let dv = u.vvec.xyz / u.size.y * w;     // w px up
+  let dd = 0.70710678;                    // diagonals at the same distance
+  var fillC = vec3<f32>(0.0); var fillA = 0.0;   // premultiplied
+  var edgeC = vec3<f32>(0.0); var edgeA = 0.0;
+  for (var l = 0; l < nL; l = l + 1) {
+    let ov = ov_layer(tex, l);
+    if (ov.a <= 0.0) { continue; }                 // segment hidden, or no label in this layer
+    // The display alpha is folded in PER LAYER, before compositing \u2014 that is what makes an
+    // overlap more opaque: one layer gives exactly a, two give 1-(1-a)^2.
+    let fa = clamp(ov.a * u.params.z, 0.0, 1.0);
+    fillC = ov.rgb * fa + fillC * (1.0 - fa);
+    fillA = fa + fillA * (1.0 - fa);
+    if (u.params.w <= 0.0) { continue; }
+    // The contour is the band of voxels within w SCREEN pixels of a boundary, so it keeps the
+    // same visual weight at every zoom. Eight neighbours, not four: at four, a boundary running
+    // diagonally is only sampled across its corners and the line thins and breaks up as w grows.
+    // A neighbour is a DIFFERENT segment iff its overlay texel differs at all. The overlay is
+    // sampled NEAREST from a crisp per-voxel bake, so every texel is an exact palette entry and
+    // an exact comparison is the label test: two touching segments whose colours happen to be
+    // close still get a boundary, where a distance threshold used to merge them into one blob.
+    // A hidden segment (palette alpha 0) differs from a visible neighbour, so the visible one
+    // keeps its contour there; and its own voxels have ov.a = 0, so it draws nothing itself.
+    let n0 = ov_at(ras + du, l); let n1 = ov_at(ras - du, l);
+    let n2 = ov_at(ras + dv, l); let n3 = ov_at(ras - dv, l);
+    let n4 = ov_at(ras + (du + dv) * dd, l); let n5 = ov_at(ras + (du - dv) * dd, l);
+    let n6 = ov_at(ras - (du + dv) * dd, l); let n7 = ov_at(ras - (du - dv) * dd, l);
+    if (any(n0 != ov) || any(n1 != ov) || any(n2 != ov) || any(n3 != ov) ||
+        any(n4 != ov) || any(n5 != ov) || any(n6 != ov) || any(n7 != ov)) {
+      let ea = clamp(ov.a * u.params.w, 0.0, 1.0);
+      edgeC = ov.rgb * ea + edgeC * (1.0 - ea);
+      edgeA = ea + edgeA * (1.0 - ea);
+    }
   }
-  col = mix(col, ov.rgb, max(fillA, outA));
+  // Fill first, then the contours over it (the contour of a segment reads over its own fill and
+  // over anything it overlaps).
+  if (fillA > 0.0) { col = mix(col, fillC / fillA, fillA); }
+  if (edgeA > 0.0) { col = mix(col, edgeC / edgeA, edgeA); }
   return vec4<f32>(srgb2physical(col), 1.0);
 }
 `
@@ -2632,8 +2841,8 @@ var SliceRenderer = class {
   sampler;
   nnSampler;
   ubuf;
-  u = new Float32Array(80);
-  // p2t(16) origin(4) uvec(4) vvec(4) params(4) size(4) | p2tFg(16) fgParams(4) p2tLabel(16) labelParams(4)
+  u = new Float32Array(88);
+  // p2t(16) origin(4) uvec(4) vvec(4) params(4) size(4) | p2tFg(16) fgParams(4) p2tLabel(16) labelParams(4) bgColor(4)
   bind;
   // Adaptive downsample (moving frames): render the reslice into a low-res target, then bilinear-blit
   // it up to the view — the 2D analogue of SceneRenderer.renderUpscaled. Lets a slice cell degrade
@@ -2755,14 +2964,14 @@ var SliceRenderer = class {
     this.dev.queue.writeTexture({ texture: this.lutTex, origin: [0, 0] }, bg ?? gray, { bytesPerRow: 256 * 4 }, [256, 1]);
     this.dev.queue.writeTexture({ texture: this.lutTex, origin: [0, 1] }, fg ?? gray, { bytesPerRow: 256 * 4 }, [256, 1]);
     this.u[35] = bg ? 1 : 0;
-    this.u[58] = fg ? 1 : 0;
+    this.u[74] = fg ? 1 : 0;
     if (this.scalarTex) this.rebind();
   }
   /** Label layer: a label volume (integer values in a float texture) coloured through a colour table
    *  (rgba8 entries, index = label value), blended at `opacity`. Pass null to remove. */
   setLabelLayer(tex, p2t, table, opacity) {
     this.labelVolTex = tex ?? void 0;
-    if (p2t) this.u.set(p2t, 60);
+    if (p2t) this.u.set(p2t, 56);
     const n = table ? table.length / 4 : 0;
     if (table && n > 0) {
       if (!this.labelLutTex || this.labelLutTex.width !== n) {
@@ -2771,8 +2980,8 @@ var SliceRenderer = class {
       }
       this.dev.queue.writeTexture({ texture: this.labelLutTex }, table, { bytesPerRow: n * 4 }, [n, 1]);
     }
-    this.u[76] = tex && table ? opacity : 0;
-    this.u[77] = n;
+    this.u[72] = tex && table ? opacity : 0;
+    this.u[73] = n;
     if (this.scalarTex) this.rebind();
   }
   emptyOverlay;
@@ -2796,6 +3005,15 @@ var SliceRenderer = class {
     const n = this.basisOf(orient).nDir;
     const { lo, hi } = this.extentAlong(n);
     return Math.max(0, Math.min(1, (dot3(ras, n) - lo) / Math.max(hi - lo, 1e-6)));
+  }
+  /** Slide a RAS point along the plane's current normal, only if needed, so that its scrub position
+   *  lies inside the volume — the mm-space form of setPlane's 0..1 clamp, for a caller stepping a
+   *  focus point through the slices of an anatomical OR oblique basis. In-plane coordinates are kept. */
+  clampAlongNormal(orient, ras) {
+    const n = this.basisOf(orient).nDir;
+    const { lo, hi } = this.extentAlong(n);
+    const have = dot3(ras, n), want = Math.max(lo, Math.min(hi, have));
+    return [ras[0] + n[0] * (want - have), ras[1] + n[1] * (want - have), ras[2] + n[2] * (want - have)];
   }
   basisOf(orient) {
     return this.basisOverride[orient] ?? BASES[orient];
@@ -2836,10 +3054,10 @@ var SliceRenderer = class {
   /** Colour the overlay from a u8 label volume + the 256x2 palette (row 1 = colour/opacity),
    *  instead of a pre-coloured rgba volume. Same geometry requirement as setTextures. Pass
    *  nulls to go back to the rgba overlay. */
-  setLabelOverlay(labels, palette) {
+  setLabelOverlay(labels, palette, layers = 1) {
     this.labels = labels ?? void 0;
     this.palette = palette ?? void 0;
-    this.u[34] = labels && palette ? 1 : 0;
+    this.u[34] = labels && palette ? Math.max(1, layers) : 0;
     if (this.scalarTex) this.rebind();
   }
   rebind() {
@@ -2871,6 +3089,34 @@ var SliceRenderer = class {
     this.u[28] = win;
     this.u[29] = lev;
   }
+  /** Colour shown outside the volume (the isotropic-mm letterbox). Default black. Set it to white
+   *  for a standalone PET panel, which is read as inverted grey on white. */
+  setBackground(r, g, b) {
+    this.u[76] = r;
+    this.u[77] = g;
+    this.u[78] = b;
+    this.u[79] = 1;
+  }
+  /** Thick-slab compositing through the background volume.
+   *
+   *  `thicknessMm` 0 (or mode "single") is an ordinary one-sample slice. `mode` follows the
+   *  conventional projections: "max" is a MIP, "mean" an average-intensity projection (the usual
+   *  choice for thin CT slabs), "min" a MinIP. `steps` defaults to roughly one sample per
+   *  half-millimetre, clamped, which is dense enough not to alias a 4 mm PET grid. */
+  setSlab(thicknessMm, mode = "mean", steps, fgMode = mode) {
+    const t = Math.max(0, thicknessMm);
+    const code = (x) => t <= 0 || x === "single" ? 0 : x === "max" ? 1 : x === "mean" ? 2 : 3;
+    const m = code(mode);
+    const n = m === 0 ? 1 : Math.max(2, Math.min(512, steps ?? Math.ceil(t * 2) + 1));
+    this.u[80] = t;
+    this.u[81] = m;
+    this.u[82] = n;
+    this.u[83] = code(fgMode);
+  }
+  /** Current slab thickness in mm (0 = single slice). */
+  slabThicknessMm() {
+    return this.u[81] > 0 ? this.u[80] : 0;
+  }
   /** Overlay FILL opacity (per-voxel coloured regions). 0 hides the fill. */
   setOverlayOpacity(o) {
     this.u[30] = o;
@@ -2883,6 +3129,12 @@ var SliceRenderer = class {
   setOverlayOutline(on) {
     this.u[31] = on ? 1 : 0;
   }
+  /** Overlay outline width, in SCREEN pixels (constant under zoom). Rides in uvec.w, which the
+   *  per-frame uniform update writes alongside the view vectors. */
+  setOutlineWidth(px) {
+    this.outlineWidth = Math.max(1, px);
+  }
+  outlineWidth = 2;
   /** Physical size (mm) of the square view for the current plane (isotropic, letterboxed).
    *  Matches Slicer's FitSliceToBackground: the field of view is exactly the volume's
    *  extent along the limiting in-plane axis — NO extra margin. (Verified against
@@ -2960,6 +3212,17 @@ var SliceRenderer = class {
   /** Reset pan/zoom for an orientation to the fitted view. */
   resetView(orient) {
     this.viewState[orient] = { panU: 0, panV: 0, zoom: 1 };
+  }
+  /** Centre the in-plane view on `centerRAS` WITHOUT touching zoom — move the view, don't refit it.
+   *  setMirrorFrame sets both because it mirrors a slice node's centre AND field of view; an app
+   *  that is following a target from one place to another wants only the pan. */
+  recenter(orient, centerRAS) {
+    const b = this.basisOf(orient);
+    const volC = [(this.rasLo[0] + this.rasHi[0]) / 2, (this.rasLo[1] + this.rasHi[1]) / 2, (this.rasLo[2] + this.rasHi[2]) / 2];
+    const d = [centerRAS[0] - volC[0], centerRAS[1] - volC[1], centerRAS[2] - volC[2]];
+    const vs = this.viewState[orient];
+    vs.panU = d[0] * b.uDir[0] + d[1] * b.uDir[1] + d[2] * b.uDir[2];
+    vs.panV = d[0] * b.vDir[0] + d[1] * b.vDir[1] + d[2] * b.vDir[2];
   }
   /** Snapshot per-orientation pan+zoom (e.g. to persist a view across reloads). */
   getViewState() {
@@ -3055,13 +3318,17 @@ var SliceRenderer = class {
     this.u[20] = b.uDir[0] * uS;
     this.u[21] = b.uDir[1] * uS;
     this.u[22] = b.uDir[2] * uS;
-    this.u[23] = 0;
+    this.u[23] = this.outlineWidth;
     this.u[24] = b.vDir[0] * vS;
     this.u[25] = b.vDir[1] * vS;
     this.u[26] = b.vDir[2] * vS;
     this.u[27] = 0;
     this.u[32] = w;
     this.u[33] = h;
+    this.u[84] = b.nDir[0];
+    this.u[85] = b.nDir[1];
+    this.u[86] = b.nDir[2];
+    this.u[87] = 0;
     this.dev.queue.writeBuffer(this.ubuf, 0, this.u);
     const enc = this.dev.createCommandEncoder();
     const pass = enc.beginRenderPass({ colorAttachments: [{ view, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }] });
@@ -3260,6 +3527,21 @@ var ImageField = class {
   volumeTexture() {
     return this.volTex;
   }
+  /** Overwrite `depth` z-slices of the volume starting at `z`, in place. The bind group holds a
+   *  stable view of volTex, so a render after this picks the new voxels up with no rebuild —
+   *  which is what lets a volume be allocated first and filled as its slices arrive. `data` is
+   *  one slab in the texture's own dtype (f32 unless the volume was created from a Uint8Array). */
+  updateSlab(z, data, depth = 1) {
+    const [nx, ny, nz] = this.dims;
+    if (z < 0 || z + depth > nz) return;
+    const bpe = data instanceof Uint8Array ? 1 : 4;
+    this.dev.queue.writeTexture(
+      { texture: this.volTex, origin: { x: 0, y: 0, z } },
+      data,
+      { offset: 0, bytesPerRow: nx * bpe, rowsPerImage: ny },
+      [nx, ny, depth]
+    );
+  }
   /** r8unorm volumes sample /255, so clim is packed /normScale in the shader; a slice plane sharing this
    *  texture must use the same factor. 1 for f32 volumes. */
   normScaleOf() {
@@ -3395,6 +3677,13 @@ var SegmentField = class {
   interfaceMode;
   voxelMm = 1;
   providesSkip;
+  /** The band-limited SOLID path: sdf mode, outer boundary, with the attr texture that carries the
+   *  band-limited label field. This is the only variant that uses the interval crossing test. */
+  outerSolid;
+  /** Interval sampling (Field): the shader is handed the ray distance back to THIS field's previous
+   *  sample, so consecutive intervals tile the ray exactly — what makes the crossing test immune to
+   *  the per-step ray jitter and to an empty-space leap. */
+  intervalSampling;
   constructor(tex, dims, spacing, opts) {
     this.tex = tex;
     const center = opts.center ?? [0, 0, 0];
@@ -3421,12 +3710,28 @@ var SegmentField = class {
     this.interfaceMode = this.mode === "sdf" && (opts.interfaceMode ?? false);
     this.attrTex = this.mode === "sdf" ? opts.attrTexture : void 0;
     this.bindingCount = this.attrTex ? 2 : 1;
+    this.outerSolid = this.mode === "sdf" && !this.interfaceMode && !!this.attrTex;
+    this.intervalSampling = this.outerSolid;
   }
   /** Field-level opacity (multiplies every segment's per-label opacity in the shader). Live global
    *  segmentation opacity — the caller does scene.syncUniforms() + redraw to apply. */
   setOpacity(o) {
     this.opacity = Math.max(0, Math.min(1, o));
   }
+  /** Render the sdf field as VOXEL CUBES instead of its smooth iso-surface (sdf mode only).
+   *  What "no smoothing" should mean for a labelmap: one cube per voxel, flat-shaded per face. */
+  setVoxelMode(on) {
+    this.voxelMode = on;
+  }
+  voxelMode = false;
+  /** Reconstruction width σ (VOXELS) of the band-limited label field the sdf surface is the 0.5
+   *  level set of. The field itself is baked by JfaSdfBaker (attr.b); the renderer only needs σ to
+   *  keep the sphere-trace skip from leaping over a surface that has moved off the sharp one.
+   *  Caller does scene.syncUniforms(). */
+  setSmoothingVox(sigmaVoxels) {
+    this.sigmaVox = Math.max(0, sigmaVoxels);
+  }
+  sigmaVox = 0;
   uniformFloats() {
     return 36;
   }
@@ -3459,8 +3764,27 @@ fn skip_seg${s}(wp : vec3<f32>) -> f32 {
     let q = abs(transform_point_seg${s}(wp) - cen) - ext;
     return max(0.0, length(max(q, vec3<f32>(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0));
   }
-  let d = abs(textureSampleLevel(t_seg${s}, s_lin, t, 0.0).a);                  // |distance to surface| (mm)
-  return max(0.0, d - u_material.seg${s}_params.x - u_material.seg${s}_params.y);   // leap toward the shell (band + 1 voxel safe)
+  let sd = textureSampleLevel(t_seg${s}, s_lin, t, 0.0).a;                      // SIGNED distance to the labelmap surface (mm)
+  // An UNSEEDED voxel \u2014 one the jump flood never reached a seed from \u2014 reports 1e3 mm. That is not a
+  // distance, it is "unknown", and leaping on it sails through whatever surface is really there,
+  // which is how a partial re-flood used to come back as a flat cut across the shell. No real SDF
+  // grid here spans 500 mm, so treat anything beyond that as unknown and march instead of leaping.
+  if (abs(sd) > 500.0) { return 0.0; }
+  // params.w = \u03C3 in mm. The rendered surface is the band-limited field's 0.5 level set, which sits
+  // within ~\u03C3 of this sharp one, so the leap has to stop that much short of it or a \u03C3-wide feature
+  // can be jumped clean over.
+  var leap = max(0.0, abs(sd) - u_material.seg${s}_params.x - u_material.seg${s}_params.y - u_material.seg${s}_params.w);
+${this.clippable && this.outerSolid ? `  // INSIDE the solid, a clip plane is a surface too (the cut face). Leaping on |sd| alone would sail
+  // past it \u2014 the ray enters through the clip, sees a big interior distance, and jumps to the far
+  // wall, so the cap never gets sampled. Clamp the leap to the nearest plane while inside.
+  if (sd < 0.0) {
+    let ccount = u32(u_material.clip_count.x);
+    for (var ci = 0u; ci < ccount; ci = ci + 1u) {
+      let cp = u_material.clip_planes[ci];
+      leap = min(leap, abs(dot(wp, cp.xyz) + cp.w));
+    }
+  }` : ``}
+  return leap;
 }`
     );
   }
@@ -3472,7 +3796,7 @@ fn skip_seg${s}(wp : vec3<f32>) -> f32 {
       `  seg${s}_shade : vec4<f32>,`,
       // ka, kd, ks, shininess
       `  seg${s}_params : vec4<f32>,`,
-      // band_mm, voxel_mm, _, _
+      // band_mm, voxel_mm, voxel_cubes, smoothing_mm
       `  seg${s}_bmin : vec4<f32>,`,
       // aabb min (RAS) — for a contract-valid skip outside the texture
       `  seg${s}_bmax : vec4<f32>,`
@@ -3518,8 +3842,8 @@ fn attr_seg${s}(wp : vec3<f32>) -> vec2<f32> {   // per-segment (.x = opacity, .
   let t = t4.xyz;
   if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { return vec2<f32>(0.0); }
   return textureSampleLevel(t_attr${s}, s_lin, t, 0.0).rg;
-}` : ""}${this.interfaceMode ? `
-fn bdist_seg${s}(wp : vec3<f32>) -> f32 {   // SMOOTH (seam-blurred) interface distance from attr.b \u2014 for the normal only
+}` : ""}${this.interfaceMode && this.attrTex ? `
+fn bdist_seg${s}(wp : vec3<f32>) -> f32 {   // SMOOTHED interface distance from attr.b (interface mode)
   let t4 = u_material.seg${s}_p2t * vec4<f32>(transform_point_seg${s}(wp), 1.0);
   let t = clamp(t4.xyz, vec3<f32>(0.0), vec3<f32>(1.0));
   return textureSampleLevel(t_attr${s}, s_lin, t, 0.0).b;
@@ -3529,7 +3853,16 @@ fn pres_seg${s}(wp : vec3<f32>) -> f32 {   // CRISP in-segment presence (attr.a)
   let t = t4.xyz;
   if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { return 0.0; }
   return textureSampleLevel(t_attr${s}, s_lin, t, 0.0).a;
-}
+}` : ""}${this.outerSolid ? `
+fn pfield_seg${s}(wp : vec3<f32>) -> f32 {
+  // THE BAND-LIMITED LABEL FIELD: p = G_\u03C3 * 1(label != 0), carried in attr.b (JfaSdfBaker finalize
+  // writes the 0/1 indicator there, the attr blur low-passes it at the smoothing \u03C3). Clamped to the
+  // texture edge so a gradient tap just outside the padded grid reads real background instead of a
+  // cull sentinel. The surface is the p = 0.5 level set of this, and nothing else.
+  let t4 = u_material.seg${s}_p2t * vec4<f32>(transform_point_seg${s}(wp), 1.0);
+  let t = clamp(t4.xyz, vec3<f32>(0.0), vec3<f32>(1.0));
+  return textureSampleLevel(t_attr${s}, s_lin, t, 0.0).b;
+}` : ""}${this.interfaceMode ? `
 fn g1_seg${s}(c : f32, wp : vec3<f32>, dir : vec3<f32>, h : f32) -> f32 {
   // One-sided difference of the SMOOTH interface distance along dir, picking the STEEPER side. The
   // unsigned distance has a V-crease at the surface: a central difference straddling it cancels (fake
@@ -3541,9 +3874,202 @@ fn g1_seg${s}(c : f32, wp : vec3<f32>, dir : vec3<f32>, h : f32) -> f32 {
   let dm = c - bdist_seg${s}(wp - dir * h);
   return select(dm, dp, abs(dp) > abs(dm)) / h;
 }` : ""}
-// Shell (surface) contribution at wp: crisp Phong shell around sdf=0. Weighted by (1-mode) so it
-// morphs smoothly into the volume contribution across a blurred surface\u2194volume boundary.
-fn surface_seg${s}(wp : vec3<f32>, rd : vec3<f32>, sdf : f32, band : f32, step : f32, seg_op : f32, op0 : f32) -> vec4<f32> {
+// VOXEL CUBES (params.z): the labelmap AS SEGMENTED, one cube per voxel, flat-shaded per face.
+//
+// This exists because reading the distance field with LINEAR sampling cannot produce it. The zero
+// level set of a Euclidean distance field is a smooth surface, and its gradient \u2014 the shading
+// normal \u2014 has RIDGES along the medial lines where the distances from neighbouring source voxels
+// meet. Turning the blur off therefore does not reveal voxels; it reveals those ridges, which is
+// what "no smoothing" used to look like.
+//
+// So this path never interpolates: it reads the same texture with textureLoad at the voxel the
+// sample falls in. That voxel is solid iff ITS OWN CENTRE is inside (.a < 0), the surface is the
+// cube faces of the solid voxels, and the normal is the face normal \u2014 constant across each face,
+// which is what makes a face read as a face. A face whose neighbour is also solid is interior and
+// draws nothing, so the result is the outside of the voxel set, not a lattice.
+//
+// It is still the same ray-march through the same field: no geometry is built, and the opacity
+// uses the same shell profile as the smooth path, measured to the cube face instead of to the
+// iso-surface, so the opacity controls behave identically at every smoothing setting.
+fn solid_seg${s}(ix : vec3<i32>) -> bool {
+  // "Is this voxel part of the segmentation?" \u2014 which channel answers that depends on the field.
+  // The signed (outer) field says it with the sign of the distance; the multi-material INTERFACE
+  // field's distance is UNSIGNED (it measures to the nearest label change, not to the outside),
+  // so there it is the crisp per-voxel presence in the attr texture that knows. Reading the sign
+  // of an unsigned field is how voxel mode first came out completely empty on every nested
+  // segmentation \u2014 which is every segmentation with a tumour inside an organ.
+${this.interfaceMode && this.attrTex ? `  return textureLoad(t_attr${s}, ix, 0).a > 0.5;` : `  return textureLoad(t_seg${s}, ix, 0).a < 0.0;`}
+}
+fn voxels_seg${s}(wp : vec3<f32>, rd : vec3<f32>, band : f32, step : f32, seg_op : f32, op0 : f32) -> vec4<f32> {
+  let t4 = u_material.seg${s}_p2t * vec4<f32>(transform_point_seg${s}(wp), 1.0);
+  let t = t4.xyz;
+  if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { return vec4<f32>(0.0); }
+  let dimsf = vec3<f32>(textureDimensions(t_seg${s}));
+  let ci = floor(t * dimsf - vec3<f32>(0.5) + vec3<f32>(0.5));   // the voxel this sample is in
+  let idx = vec3<i32>(ci);
+  let me = textureLoad(t_seg${s}, idx, 0);
+  if (!solid_seg${s}(idx)) { return vec4<f32>(0.0); }  // this voxel's centre is outside the segmentation
+  // A face perpendicular to texture axis k has texture-space normal e_k; a normal maps from
+  // texture to world by the TRANSPOSE of the world\u2192texture linear part (row k of p2t).
+  let M = u_material.seg${s}_p2t;
+  var rows = array<vec3<f32>, 3>(
+    normalize(vec3<f32>(M[0][0], M[1][0], M[2][0])),
+    normalize(vec3<f32>(M[0][1], M[1][1], M[2][1])),
+    normalize(vec3<f32>(M[0][2], M[1][2], M[2][2])));
+  var offs = array<vec3<i32>, 6>(
+    vec3<i32>(1, 0, 0), vec3<i32>(-1, 0, 0), vec3<i32>(0, 1, 0),
+    vec3<i32>(0, -1, 0), vec3<i32>(0, 0, 1), vec3<i32>(0, 0, -1));
+  // Which faces of this cube are EXPOSED (their neighbour is outside)? Of those, shade the one
+  // the ray meets most squarely. Picking the geometrically nearest face instead leaves the
+  // surface stippled: a ray crossing near a cube's edge is often nearest an INTERIOR face, and
+  // that sample then draws nothing even though the cube is visible there.
+  let lim = vec3<i32>(dimsf) - vec3<i32>(1);
+  var bestDot = -2.0;
+  var n = vec3<f32>(0.0);
+  var exposed = false;
+  var open = array<bool, 6>(false, false, false, false, false, false);
+  for (var f = 0; f < 6; f = f + 1) {
+    if (solid_seg${s}(clamp(idx + offs[f], vec3<i32>(0), lim))) { continue; }   // interior face
+    open[f] = true;
+    exposed = true;
+    let sgn = select(-1.0, 1.0, (f & 1) == 0);
+    let nw = rows[f >> 1] * sgn;
+    let dd = -dot(nw, rd);
+    if (dd > bestDot) { bestDot = dd; n = nw; }
+  }
+  if (!exposed) { return vec4<f32>(0.0); }             // fully buried voxel \u2014 the shell is one cube thick
+  // Which face did the ray actually come IN through? That \u2014 not the face most square to the
+  // camera \u2014 is what makes a cube read as a cube: the step faces catch the light differently
+  // from the faces around them, which is the whole visual signal that this is voxels. Slab
+  // entry test in voxel space; if that face turns out to be interior (possible when the march
+  // steps past a thin feature), fall back to the exposed face the ray meets most squarely.
+  let rv = vec3<f32>(
+    dot(vec3<f32>(M[0][0], M[1][0], M[2][0]), rd),
+    dot(vec3<f32>(M[0][1], M[1][1], M[2][1]), rd),
+    dot(vec3<f32>(M[0][2], M[1][2], M[2][2]), rd)) * dimsf;
+  let r = t * dimsf - vec3<f32>(0.5) - ci;             // position within the voxel, [-0.5, 0.5]
+  var tIn = -1e9;
+  var face = -1;
+  if (abs(rv.x) > 1e-6) { let tk = (-0.5 * sign(rv.x) - r.x) / rv.x; if (tk > tIn) { tIn = tk; face = select(1, 0, rv.x < 0.0); } }
+  if (abs(rv.y) > 1e-6) { let tk = (-0.5 * sign(rv.y) - r.y) / rv.y; if (tk > tIn) { tIn = tk; face = select(3, 2, rv.y < 0.0); } }
+  if (abs(rv.z) > 1e-6) { let tk = (-0.5 * sign(rv.z) - r.z) / rv.z; if (tk > tIn) { tIn = tk; face = select(5, 4, rv.z < 0.0); } }
+  if (face >= 0 && open[face]) {
+    n = rows[face >> 1] * select(-1.0, 1.0, (face & 1) == 0);
+  }
+${this.attrTex ? `  let at = textureLoad(t_attr${s}, idx, 0);
+  let vop = at.r;                                      // per-segment opacity, this voxel's own
+  let vcol = me.rgb / max(vop, 1e-3);                  // un-premultiply` : `  let vop = seg_op;
+  let vcol = me.rgb;`}
+  let T = clamp(op0 * vop, 0.0, 1.0);
+  if (T <= 0.0) { return vec4<f32>(0.0); }
+  // Optical depth calibrated so crossing ONE voxel accumulates exactly T \u2014 the cube-sized
+  // equivalent of the shell profile the smooth path uses, so the opacity controls mean the same
+  // thing at every smoothing setting.
+  let vox = max(u_material.seg${s}_params.y, 1e-4);
+  let rate = max(abs(dot(rd, n)), 1e-3);
+  let tau = -log(1.0 - min(T, 0.9999)) * (step * rate) / vox;
+  let op = 1.0 - exp(-tau);
+  if (op <= 0.0004) { return vec4<f32>(0.0); }
+  let ka = u_material.seg${s}_shade.x; let kd = u_material.seg${s}_shade.y;
+  let ldn = max(dot(-rd, n), 0.0);
+  // Faces need to differ in brightness by WHICH WAY THEY FACE, not by how square they are to the
+  // camera. A head-lit cube surface viewed down one of its own axes has every visible face at the
+  // same angle to the light, and with ka+kd \u2248 1 they all clip to the same flat colour \u2014 which is
+  // exactly what "voxel mode" looked like before this: a flat silhouette with stepped edges.
+  // A fixed overhead sky term (superior-facing brightest, inferior darkest, sides between) makes
+  // each face of each cube read separately from any viewpoint, which is the whole point of the
+  // mode. No specular: a highlight across flat faces reads as curvature.
+  let sky = 0.55 + 0.45 * clamp(0.5 + 0.5 * n.z, 0.0, 1.0);
+  var lit = vcol * sky * (ka + kd * ldn);
+  lit = srgb2physical(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)));
+  return vec4<f32>(lit * op, op);
+}
+// Surface contribution at wp: a crisp Phong surface. Weighted by (1-mode) so it morphs smoothly
+// into the volume contribution across a blurred surface\u2194volume boundary.
+fn surface_seg${s}(wp : vec3<f32>, rd : vec3<f32>, ds : f32, sdf : f32, band : f32, step : f32, seg_op : f32, op0 : f32) -> vec4<f32> {
+  if (u_material.seg${s}_params.z > 0.5) { return voxels_seg${s}(wp, rd, band, step, seg_op, op0); }
+${this.outerSolid ? `  // A BAND-LIMITED SOLID, found by an INTERVAL CROSSING TEST.
+  //
+  // A labelmap is a SAMPLED indicator function, and its voxel steps are above the grid's Nyquist
+  // limit \u2014 they are aliasing, not anatomy. So the faithful surface is the 0.5 level set of that
+  // indicator RECONSTRUCTED with a kernel at the limit: p = G_\u03C3 * 1(label != 0), which the baker
+  // low-passes into attr.b and the smoothing control sets the \u03C3 of. Reconstructing with plain
+  // trilinear interpolation instead (what \u03C3\u21920 gives) reproduces the ALIASED surface \u2014 flat voxel
+  // faces and chamfered edges, which is the chunk. Band-limited, the surface still passes through
+  // the voxel faces but carries no energy above Nyquist, which is the smooth.
+  //
+  // This MOVES the geometry with \u03C3, which earlier versions refused to do because smoothing the
+  // signed DISTANCE closed the disc space between two vertebrae and fused them. A BOUNDED
+  // indicator cannot: at the centre of a 4-voxel gap p \u2248 2\xB7\u03A6(-2) \u2248 0.05, nowhere near 0.5. What it
+  // does cost is the curvature term, \u2248 \u03C3\xB2/2R inward on a convex ridge of radius R \u2014 a quarter of a
+  // voxel at \u03C3=1 on a 2-voxel vertebral process. Bounded and predictable, which is the trade a
+  // smoothing control is supposed to offer.
+  //
+  // WHY A CROSSING TEST AND NOT A SHELL BAND. A band wants the PERPENDICULAR distance to the
+  // surface, and the only way to get that from a scalar field is (0.5 - p)/|grad p| \u2014 which falls
+  // apart exactly where |grad p| collapses: concave creases where two surfaces meet, and thin
+  // features. There the estimated distance diverges, no sample falls inside the band, and an
+  // OPAQUE segment renders dusty, with background showing through it. (Measured on a sphere with a
+  // plate through it: 5-7% of interior pixels leaking, up to 31% on a single pixel; the shell-band
+  // design leaked 8-15%.) The test p > 0.5 has no such failure: it is well defined everywhere, so
+  // asking whether THIS interval contains the crossing cannot miss a surface, at any \u03C3, curvature or
+  // incidence. Field.intervalSampling hands us the exact distance back to this field's previous
+  // sample, so consecutive intervals tile the ray with no gap and no overlap \u2014 which is what makes
+  // the test exact under the per-step ray jitter, and across an empty-space leap.
+  let p1 = pfield_seg${s}(wp);
+  let back = wp - rd * max(ds, 1.0e-4);
+  let p0 = pfield_seg${s}(back);
+  let in1 = p1 > 0.5;
+  let in0 = p0 > 0.5;
+  var capNormal = vec3<f32>(0.0);
+  var prevClipped = false;` : ``}${this.outerSolid && this.clippable ? `
+  // SOLID: where a clip plane cuts the body, the body has a FACE there. The ray enters the kept
+  // half-space already inside the solid \u2014 no surface crossing \u2014 so the cut would be a hole into a
+  // bubble unless we treat that entry as a face of its own, with the plane's normal. The previous
+  // sample is the test: if it was on the discarded side, this interval crossed the plane.
+  let ccount = u32(u_material.clip_count.x);
+  for (var ci = 0u; ci < ccount; ci = ci + 1u) {
+    let cp = u_material.clip_planes[ci];
+    if (dot(back, cp.xyz) + cp.w < 0.0) { prevClipped = true; capNormal = -cp.xyz; }
+  }` : ``}${this.outerSolid ? `
+  let surfaceCross = in1 != in0;
+  if (!(surfaceCross || (in1 && prevClipped))) { return vec4<f32>(0.0); }
+  // Where in the interval: linear in p, which is exact to first order and sub-voxel in practice.
+  let u = select(1.0, clamp((0.5 - p0) / (p1 - p0), 0.0, 1.0), surfaceCross);
+  let wc = back + (wp - back) * u;
+  let T = clamp(op0 * seg_op, 0.0, 1.0);
+  if (T <= 0.0) { return vec4<f32>(0.0); }
+  // Normal from a FULL-VOXEL central difference of p. attr.b is read trilinearly, so the field is
+  // only C0 and its gradient jumps at every voxel-face plane; differencing inside a single cell
+  // (h = half a voxel) reports that cell's own gradient and the jumps show up as a rectangular
+  // lattice of dark creases over the surface \u2014 a maze, worst at small \u03C3 where the field is
+  // steepest. A full-voxel difference straddles the discontinuity and averages it out. Geometry
+  // and normal now come from the SAME field, which is what stops a stepped silhouette from being
+  // lit like a smooth one.
+  let hg = max(u_material.seg${s}_params.y, step);
+  let gp = vec3<f32>(
+    pfield_seg${s}(wc + vec3<f32>(hg,0,0)) - pfield_seg${s}(wc - vec3<f32>(hg,0,0)),
+    pfield_seg${s}(wc + vec3<f32>(0,hg,0)) - pfield_seg${s}(wc - vec3<f32>(0,hg,0)),
+    pfield_seg${s}(wc + vec3<f32>(0,0,hg)) - pfield_seg${s}(wc - vec3<f32>(0,0,hg))) / (2.0 * hg);
+  let glen = length(gp);
+  // p increases INWARD, so the outward normal is -grad p. On a cap (entered through a clip plane
+  // with no crossing) the face is the plane, so its normal is the plane's.
+  var n = select(capNormal, -gp / max(glen, 1.0e-6), surfaceCross && glen > 1.0e-5);
+  if (dot(n, n) < 0.25) { n = -rd; }     // degenerate: face the camera rather than drop the sample
+  if (dot(n, -rd) < 0.0) { n = -n; }
+  // ONE crossing = exactly the target opacity T, by construction \u2014 no band, no profile integral,
+  // no dependence on the sample step or the incidence angle. Front and back faces of a translucent
+  // segment still compose to 1-(1-T)\xB2, as a pair of polydata surfaces would.
+  let op = T;
+  let ka = u_material.seg${s}_shade.x; let kd = u_material.seg${s}_shade.y;
+  let ks = u_material.seg${s}_shade.z; let sh = u_material.seg${s}_shade.w;
+  let ldn = max(dot(-rd, n), 0.0);
+  let refl = normalize(2.0 * ldn * n + rd);
+  let rdv = max(dot(refl, -rd), 0.0);
+  let col = col_seg${s}(wc);
+  var lit = col * ka + col * (kd * ldn) + vec3<f32>(ks * pow(rdv, max(sh, 1.0)));
+  lit = srgb2physical(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)));
+  return vec4<f32>(lit * op, op);` : `
   let d_mm = abs(sdf);
   if (d_mm > band + step) { return vec4<f32>(0.0); }
   let T = clamp(op0 * seg_op, 0.0, 1.0);      // TARGET surface opacity (per-segment \xD7 field)
@@ -3559,7 +4085,7 @@ ${this.interfaceMode ? `  let hg = 1.5 * step;
     vgrad_seg${s}(wp + vec3<f32>(0,h,0)) - vgrad_seg${s}(wp - vec3<f32>(0,h,0)),
     vgrad_seg${s}(wp + vec3<f32>(0,0,h)) - vgrad_seg${s}(wp - vec3<f32>(0,0,h))) / (2.0 * h);`}
   let glen = length(g);
-  if (glen < 1e-5) { return vec4<f32>(0.0); }
+  if (glen < 1.0e-5) { return vec4<f32>(0.0); }
   var n = g / glen;
   if (dot(n, -rd) < 0.0) { n = -n; }
   // SURFACE opacity (Slicer polydata parity): the shell is a THIN surface of opacity T, not a solid
@@ -3571,11 +4097,7 @@ ${this.interfaceMode ? `  let hg = 1.5 * step;
   // built-in silhouette AA).
   let a = max(1.0 - d_mm / band, 0.0);
   if (a <= 0.0) { return vec4<f32>(0.0); }
-  // Convert ray-step to d_mm-distance. Outer: RAW gradient projection |dot(rd,g)| = |d(d_mm)/ds|
-  // (includes |grad sdf|, which the distance blur pulls below 1). Interface: the re-signed gradient has
-  // an arbitrary magnitude (a sign jump at the interface), so use the UNIT normal cosine |dot(rd,n)| \u2014
-  // still \u21920 at grazing (silhouette AA), and keeps opacity thickness-consistent.
-  let rate = max(abs(dot(rd, ${this.interfaceMode ? "n" : "g"})), 1e-3);
+  let rate = max(abs(dot(rd, ${this.interfaceMode ? "n" : "g"})), 1.0e-3);
   let tau = -log(1.0 - min(T, 0.9999)) * (a / band) * (step * rate);
   var op = 1.0 - exp(-tau);
 ${this.interfaceMode ? `  op = op * pres_seg${s}(wp);   // gate to GENUINELY in-segment voxels \u2014 kills the bled colour/opacity halo beyond the real edge` : ""}
@@ -3588,9 +4110,9 @@ ${this.interfaceMode ? `  op = op * pres_seg${s}(wp);   // gate to GENUINELY in-
   let col = col_seg${s}(wp);
   var lit = col * ka + col * (kd * ldn) + vec3<f32>(ks * pow(rdv, max(sh, 1.0)));
   lit = srgb2physical(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)));
-  return vec4<f32>(lit * op, op);
+  return vec4<f32>(lit * op, op);`}
 }
-fn sample_field_seg${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
+fn sample_field_seg${s}(wp : vec3<f32>, rd : vec3<f32>${this.intervalSampling ? ", ds : f32" : ""}) -> vec4<f32> {
   let op0 = u_material.seg${s}_color.a;
   if (op0 <= 0.0) { return vec4<f32>(0.0); }
   let sdf = v_seg${s}(wp);
@@ -3613,9 +4135,9 @@ ${this.attrTex ? `  let at = attr_seg${s}(wp);        // (opacity, shading mode)
     }
   }
   if (mode < 0.999) {
-    acc += (1.0 - mode) * surface_seg${s}(wp, rd, sdf, band, step, seg_op, op0);
+    acc += (1.0 - mode) * surface_seg${s}(wp, rd, ${this.intervalSampling ? "ds" : "step"}, sdf, band, step, seg_op, op0);
   }
-  return acc;` : `  return surface_seg${s}(wp, rd, sdf, band, step, 1.0, op0);`}
+  return acc;` : `  return surface_seg${s}(wp, rd, step, sdf, band, step, 1.0, op0);`}
 }`
       );
     }
@@ -3696,6 +4218,8 @@ fn sample_field_seg${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
     out[off + 23] = this.shade[3];
     out[off + 24] = this.bandMm;
     out[off + 25] = this.voxelMm;
+    out[off + 26] = this.voxelMode ? 1 : 0;
+    out[off + 27] = this.sigmaVox * this.voxelMm;
     out[off + 28] = this.box[0][0];
     out[off + 29] = this.box[0][1];
     out[off + 30] = this.box[0][2];
@@ -4167,11 +4691,24 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   // abutted (looked like half-opacity). The shader divides by the per-segment opacity to recover the
   // true colour, so a 0-opacity region contributes nothing to the blend.
   textureStore(t_out, c, vec4<f32>(pal.rgb * pal.a, sdf));
-  // .r = opacity, .g = shading mode, .b = distance (seam-blurred \u2192 SMOOTH distance for the interface-mode
-  // normal; sdfTex.a stays sharp for shell membership), .a = CRISP presence (1 inside a real segment, 0
-  // background) \u2014 the FULLBLUR carries it unblurred so the shader can tell a genuine in-segment voxel
-  // from one that merely caught BLED colour/opacity outside any segment, and gate the shell to the real edge.
-  textureStore(t_attr, c, vec4<f32>(pal.a, mode, sdf, select(0.0, 1.0, ins)));
+  // .r = opacity, .g = shading mode, .a = CRISP presence (1 inside a real segment, 0 background) \u2014
+  // the FULLBLUR carries .a unblurred so the shader can tell a genuine in-segment voxel from one that
+  // merely caught BLED colour/opacity outside any segment, and gate the shell to the real edge.
+  //
+  // .b is the BAND-LIMITED LABEL FIELD, and in outer mode it is what the surface IS. It starts as the
+  // crisp 0/1 presence and FULLBLUR low-passes it, so the shader reads p = G_\u03C3 * 1(label\u22600) and takes
+  // the surface to be its p = 0.5 level set. A labelmap is a SAMPLED indicator function: its voxel
+  // staircase is ALIASING, not data, and the faithful surface is that indicator reconstructed with a
+  // kernel at the grid's Nyquist limit \u2014 which is what the smoothing control now sets. Thresholding a
+  // BOUNDED field at 0.5 also cannot do what blurring the unbounded SIGNED DISTANCE did (fuse two
+  // vertebrae across a disc space): in the middle of a 4-voxel gap p \u2248 2\xB7\u03A6(-2) \u2248 0.05, nowhere near
+  // 0.5, so the gap stays open at every \u03C3 in range.
+  //
+  // Interface ("all") mode keeps the blurred DISTANCE here instead: its field is UNSIGNED (distance to
+  // the nearest label change), so a union indicator says nothing about the internal interfaces that
+  // mode exists to show, and its normal still comes from the smoothed distance.
+  let bchan = select(select(0.0, 1.0, ins), sdf, u.params.y > 0.5);
+  textureStore(t_attr, c, vec4<f32>(pal.a, mode, bchan, select(0.0, 1.0, ins)));
 }`
 );
 var BLUR_WGSL2 = (
@@ -4261,7 +4798,7 @@ function gaussHalfKernel2(sigma) {
   for (let i = 0; i <= radius; i++) w[i] = raw[i] / total;
   return { radius, w };
 }
-var JfaSdfBaker = class {
+var JfaSdfBaker = class _JfaSdfBaker {
   // 0 = outer boundary (signed); 1 = any label change (unsigned, multi-material)
   constructor(dev, labelTex, dims, ijkToRAS, smoothSigmaVoxels = 1, pad = 2, boundaryMode = "outer") {
     this.labelTex = labelTex;
@@ -4282,8 +4819,7 @@ var JfaSdfBaker = class {
     this.seed = [mk("rgba32float", seedUsage), mk("rgba32float", seedUsage)];
     this.sdfTex = mk("rgba16float", GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC);
     this.attrTex = mk("rgba16float", GPUTextureUsage.COPY_DST);
-    this.attrScratch = mk("rgba16float", GPUTextureUsage.COPY_SRC);
-    this.sdfScratch = mk("rgba16float", GPUTextureUsage.COPY_SRC);
+    this.scratch = mk("rgba16float", GPUTextureUsage.COPY_SRC);
     this.uni = dev.createBuffer({ size: 112, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.palBuf = dev.createBuffer({ size: 256 * 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.modeBuf = dev.createBuffer({ size: 256 * 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -4307,12 +4843,14 @@ var JfaSdfBaker = class {
   // rgba16float: .rgb = per-label colour, .a = signed dist (mm) — sampled by SegmentField
   attrTex;
   // rgba16float: .r = per-segment opacity, .g = shading mode — sampled by SegmentField
-  attrScratch;
-  // rgba16float attr-blur ping-pong
+  // ONE blur scratch, shared by the colour, distance and attribute blurs. They are the same format
+  // and size and blurStage runs them one at a time, so a second copy was 8 B per voxel of pure
+  // duplication — 12% of this pipeline, which is the difference between fitting a device and losing
+  // it. Named `scratch` rather than per-target so it cannot drift back into two.
+  scratch;
+  // rgba16float blur ping-pong (shared)
   lastSeed = 0;
   // seed buffer the last sweep finalized from
-  sdfScratch;
-  // rgba16float blur ping-pong
   uni;
   palBuf;
   // 256 × vec4 label→colour palette (.a = opacity)
@@ -4339,6 +4877,28 @@ var JfaSdfBaker = class {
   // dispatch, seeds, blur and readback all run on the PADDED grid; `dims`/`ijkToRAS` become the padded
   // grid's, and `sdfDims()`/`sdfIjkToRAS()` expose them to the SegmentField.
   bmode;
+  /** GPU bytes this baker holds, and what it WOULD hold for a given label grid.
+   *
+   *  The JFA is the memory-hungry part of the pipeline by a wide margin: the seed ping-pong is two
+   *  rgba32float volumes (32 B/voxel between them) and there are four more rgba16float volumes
+   *  (sdf, attr, and a scratch for each). On the PADDED grid that is 68 B per voxel including the
+   *  r32uint master the caller owns — so a 250³ grid is 1.06 GB, per segmentation. Two of them side
+   *  by side is how a comparison view walks off the end of a laptop's VRAM: the device is lost and
+   *  the canvas goes white, with no error a user can act on. Callers size their grid against this
+   *  (see render/gpu-budget.ts) instead of finding out the hard way. */
+  static bytesPerVoxel() {
+    return 2 * 16 + 8 + 8 + 8 + 4;
+  }
+  /** Bytes for a label grid of `dims` once padded by `pad` voxels on every side. */
+  static estimateBytes(dims, pad = 2) {
+    const n = (dims[0] + 2 * pad) * (dims[1] + 2 * pad) * (dims[2] + 2 * pad);
+    return n * _JfaSdfBaker.bytesPerVoxel();
+  }
+  /** Bytes this instance actually holds. */
+  byteSize() {
+    const n = this.dims[0] * this.dims[1] * this.dims[2];
+    return n * _JfaSdfBaker.bytesPerVoxel();
+  }
   /** The resident colorized-SDF texture (rgba16float: .rgb = per-label colour, .a = signed mm).
    *  Identity stable across bakes → the SceneRenderer bind group stays valid; a live edit updates in
    *  place. */
@@ -4418,19 +4978,42 @@ var JfaSdfBaker = class {
     i32v[27] = 0;
     this.dev.queue.writeBuffer(this.uni, 0, ab);
   }
-  /** FAST bake for LIVE editing: plain JFA (approximate) + a light distance-only blur (crisp colour
-   *  seams). Cheap, so it keeps up with an in-progress stroke; the seams stay voxel-jagged until the
-   *  edit settles and refine() runs. */
+  /** Distance-blur σ, in VOXELS, applied to the signed distance on every bake/refine (0 = none).
+   *  The zero level set barely moves, so the silhouette stays where the labelmap put it; what the
+   *  blur smooths is the GRADIENT, i.e. the shading normal — which is what turns a voxel-faceted
+   *  "golf ball" into a surface. Takes effect on the next bake(); the caller decides when that is,
+   *  since a sweep is ~20 compute passes. */
+  setSmoothing(sigmaVoxels) {
+    this.smoothSigma = Math.max(0, sigmaVoxels);
+  }
+  smoothing() {
+    return this.smoothSigma;
+  }
+  /** σ for the COLOUR-seam blur, which is NOT the geometry σ and must not follow it up.
+   *
+   *  The seam blur exists for one narrow job: the region colour is flooded per voxel, so the border
+   *  between two labels is a voxel staircase in COLOUR even when the surface is smooth. A fraction of
+   *  a voxel of blur hides that. Tying it to the geometry σ (it used to be min(1, σ)) meant that
+   *  asking for a smoother SURFACE also dissolved the label boundaries — and a boundary is the entire
+   *  signal in a comparison view. It showed up worst on the SPINEPS disc layer: a near-white disc
+   *  between two saturated vertebra colours, blurred a full voxel, reads as a milky smear over both
+   *  bones instead of a disc. Capped well below a voxel, the seam stays a seam. */
+  seamSigma() {
+    return Math.min(0.4, this.smoothSigma);
+  }
+  /** FAST bake for LIVE editing: plain JFA (approximate) + the attr blur that band-limits the label
+   *  field (no colour-seam blur). Cheap, so it keeps up with an in-progress stroke; the colour seams
+   *  stay voxel-jagged until the edit settles and refine() runs. */
   bake() {
     this.sweep([], this.smoothSigma, 0);
   }
   /** REFINE for a STATIC labelmap (run once the edit settles): JFA+2 extra passes → a near-exact
    *  Voronoi/SDF (fixes the small JFA mistakes near close/overlapping segments) and a colour-seam blur
-   *  so neighbouring-label boundaries are smooth, not a voxel staircase. Distance blur stays at the
-   *  same σ (dropping it re-introduces Voronoi facets — crispness comes from the render band, not from
-   *  under-smoothing). Higher quality lives in the resident texture, so camera renders stay cheap. */
+   *  so neighbouring-label boundaries are smooth, not a voxel staircase. The attr blur stays at the
+   *  caller's σ — it is the geometry, not a quality knob. Higher quality lives in the resident
+   *  texture, so camera renders stay cheap. */
   refine() {
-    this.sweep([2, 1], this.smoothSigma, 1);
+    this.sweep([2, 1], this.smoothSigma, this.seamSigma());
   }
   /** REGION-LIMITED refine: re-flood ONLY `regionIjk` (padded-grid coords) after a labelmap edit
    *  confined to it — a per-vertebra visibility flip re-bakes a few % of the grid instead of the
@@ -4439,7 +5022,7 @@ var JfaSdfBaker = class {
    *  taps read valid exterior seeds (surfaces just outside the region flood in correctly).
    *  Exterior distances that referenced a surface REMOVED inside the region go stale, but only
    *  ≫band away from any visible shell — invisible, and the next full sweep cleans them. */
-  refineRegion(regionIjk) {
+  refineRegion(regionIjk, maxStep = Infinity) {
     const dev = this.dev, [dx, dy, dz] = this.dims;
     const lo = [Math.max(0, regionIjk.lo[0]), Math.max(0, regionIjk.lo[1]), Math.max(0, regionIjk.lo[2])];
     const hi = [Math.min(dx, regionIjk.hi[0]), Math.min(dy, regionIjk.hi[1]), Math.min(dz, regionIjk.hi[2])];
@@ -4466,10 +5049,7 @@ var JfaSdfBaker = class {
       p2.end();
     }
     dev.queue.submit([enc.finish()]);
-    const maxDim = Math.max(rx, ry, rz);
-    const steps = [];
-    for (let s = 1 << Math.floor(Math.log2(Math.max(2, maxDim - 1))); s >= 1; s >>= 1) steps.push(s);
-    steps.push(2, 1);
+    const steps = [...this.steps.filter((v) => v <= maxStep), 2, 1];
     for (const step of steps) {
       this.writeUni(step, lo);
       const dst = src ^ 1;
@@ -4505,14 +5085,13 @@ var JfaSdfBaker = class {
     p.dispatchWorkgroups(g[0], g[1], g[2]);
     p.end();
     dev.queue.submit([enc.finish()]);
-    this.blurStage(this.blurPipe, this.smoothSigma, this.sdfTex, this.sdfScratch, region);
-    this.blurStage(this.colBlurPipe, 1, this.sdfTex, this.sdfScratch, region);
-    this.blurStage(this.fullBlurPipe, 1, this.attrTex, this.attrScratch, region);
+    if (this.seamSigma() > 0) this.blurStage(this.colBlurPipe, this.seamSigma(), this.sdfTex, this.scratch, region);
+    if (this.smoothSigma > 0) this.blurStage(this.fullBlurPipe, this.smoothSigma, this.attrTex, this.scratch, region);
   }
   /** ATTR-ONLY rebake for palette/opacity changes (per-segment visibility): the distance field
    *  doesn't move, so re-run ONLY the finalize (from the last sweep's seed) with its sdf writes
    *  routed to the scratch texture (discarded — the blurred resident sdfTex stays pristine) and
-   *  re-blur the attribute seams. ~4 passes instead of the ~20-pass init+JFA+blur sweep, which is
+   *  re-blur the attributes. ~4 passes instead of the ~20-pass init+JFA+blur sweep, which is
    *  what makes per-vertebra focus switching real-time. */
   rebakeAttr(blurSeams = false, regionIjk) {
     const dev = this.dev, [dx, dy, dz] = this.dims;
@@ -4527,7 +5106,7 @@ var JfaSdfBaker = class {
     const bf = dev.createBindGroup({ layout: this.finalPipe.getBindGroupLayout(0), entries: [
       { binding: 0, resource: this.seed[this.lastSeed].createView() },
       { binding: 1, resource: this.labelTex.createView() },
-      { binding: 2, resource: this.sdfScratch.createView() },
+      { binding: 2, resource: this.scratch.createView() },
       // sdf writes discarded
       { binding: 3, resource: { buffer: this.uni } },
       { binding: 4, resource: { buffer: this.palBuf } },
@@ -4540,12 +5119,41 @@ var JfaSdfBaker = class {
     p.dispatchWorkgroups(gx, gy, gz);
     p.end();
     dev.queue.submit([enc.finish()]);
-    if (blurSeams) this.blurStage(this.fullBlurPipe, 1, this.attrTex, this.attrScratch, region);
+    if (this.smoothSigma > 0) this.blurStage(this.fullBlurPipe, this.smoothSigma, this.attrTex, this.scratch, region);
+  }
+  /** Re-apply the SMOOTHING only: the distance field does not depend on σ, so re-running the JFA
+   *  for a smoothing change is both wasteful and WRONG — the fast bake's approximate flood differs
+   *  from the refined one by a fraction of a voxel, so the surface visibly shifted back and forth
+   *  as the control moved. This re-derives the attributes and the colour from the EXISTING seeds
+   *  (so the distance is bit-identical) and re-blurs them at the new σ. */
+  resmooth() {
+    const dev = this.dev;
+    this.writeUni(0, [0, 0, 0]);
+    const enc = dev.createCommandEncoder();
+    const bf = dev.createBindGroup({ layout: this.finalPipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: this.seed[this.lastSeed].createView() },
+      { binding: 1, resource: this.labelTex.createView() },
+      { binding: 2, resource: this.sdfTex.createView() },
+      // re-derive colour + the SHARP distance
+      { binding: 3, resource: { buffer: this.uni } },
+      { binding: 4, resource: { buffer: this.palBuf } },
+      { binding: 5, resource: this.attrTex.createView() },
+      { binding: 6, resource: { buffer: this.modeBuf } }
+    ] });
+    const p = enc.beginComputePass();
+    p.setPipeline(this.finalPipe);
+    p.setBindGroup(0, bf);
+    p.dispatchWorkgroups(this.g[0], this.g[1], this.g[2]);
+    p.end();
+    dev.queue.submit([enc.finish()]);
+    const seam = this.seamSigma();
+    if (seam > 0) this.blurStage(this.colBlurPipe, seam, this.sdfTex, this.scratch);
+    if (this.smoothSigma > 0) this.blurStage(this.fullBlurPipe, this.smoothSigma, this.attrTex, this.scratch);
   }
   /** Blur the attribute seams of the CURRENT attr texture in place (no re-finalize) — the
    *  cheapest possible settle after a run of rebakeAttr(false) visibility steps. */
   blurAttrOnly() {
-    this.blurStage(this.fullBlurPipe, 1, this.attrTex, this.attrScratch);
+    if (this.smoothSigma > 0) this.blurStage(this.fullBlurPipe, this.smoothSigma, this.attrTex, this.scratch);
   }
   /** One full sweep: init → JFA (schedule + extra) → finalize → blur .a → optional blur .rgb. */
   sweep(extraSteps, distSigma, colorSigma) {
@@ -4600,9 +5208,8 @@ var JfaSdfBaker = class {
     p.dispatchWorkgroups(gx, gy, gz);
     p.end();
     dev.queue.submit([enc.finish()]);
-    if (distSigma > 0) this.blurStage(this.blurPipe, distSigma, this.sdfTex, this.sdfScratch);
-    if (colorSigma > 0) this.blurStage(this.colBlurPipe, colorSigma, this.sdfTex, this.sdfScratch);
-    if (colorSigma > 0) this.blurStage(this.fullBlurPipe, colorSigma, this.attrTex, this.attrScratch);
+    if (colorSigma > 0) this.blurStage(this.colBlurPipe, colorSigma, this.sdfTex, this.scratch);
+    if (distSigma > 0) this.blurStage(this.fullBlurPipe, distSigma, this.attrTex, this.scratch);
   }
   /** 3 separable Gaussian passes with the given pipeline (which channels it blurs), tex↔scratch,
    *  ending in scratch → copied back to `tex` so its identity stays stable for the renderer. */
@@ -4654,11 +5261,1126 @@ var JfaSdfBaker = class {
     this.seed[1].destroy();
     this.sdfTex.destroy();
     this.attrTex.destroy();
-    this.attrScratch.destroy();
-    this.sdfScratch.destroy();
+    this.scratch.destroy();
     this.uni.destroy();
     this.palBuf.destroy();
     this.modeBuf.destroy();
+  }
+};
+
+// render/label-surface-bake.ts
+var DEFAULT_LABEL_SURFACE_BAKE = {
+  sigmaVoxels: 0.85,
+  outer: "twicing",
+  keepDeepest: true,
+  fillGaps: true,
+  thinRule: true
+};
+var LABEL_SURFACE_BLOCK = 4;
+var U_STRUCT = (
+  /* wgsl */
+  `
+struct U {
+  ijkToRAS : mat4x4<f32>,   // padded grid -> RAS (column-major)
+  dims : vec4<u32>,          // padded grid dims; w = pad
+  params : vec4<f32>,        // x = jump-flood step (voxels)
+  origin : vec4<i32>,        // dispatch origin (always 0 here)
+  ldims : vec4<u32>,         // label grid dims; w = flags (1 keep deepest, 2 thin rule)
+  sigma : vec4<f32>,         // xyz = \u03C3 per axis (voxels), w = \u03C3 (mm)
+  gap : vec4<f32>,           // xyz = widest gap filled per axis (voxels), w = outer mode (0 twicing, 1 blur, 2 mask, 3 sharp)
+  spacing : vec4<f32>,       // xyz = spacing (mm), w = band (mm): distances are clamped to it
+};`
+);
+var U_BYTES = 176;
+var LABELS_WGSL = (
+  /* wgsl */
+  `
+fn rawLabel(c : vec3<i32>) -> u32 {
+  let lc = c - vec3<i32>(i32(u.dims.w));
+  if (any(lc < vec3<i32>(0)) || any(lc >= vec3<i32>(u.ldims.xyz))) { return 0u; }
+  return textureLoad(t_label, lc, 0).r;
+}
+fn shownLabel(c : vec3<i32>) -> u32 {
+  let l = rawLabel(c);
+  if (l == 0u || l > 255u) { return 0u; }
+  return select(0u, l, textureLoad(t_pal, vec2<i32>(i32(l), 0), 0).a > 0.0);
+}`
+);
+var GRID_GUARD = (
+  /* wgsl */
+  `
+  let c = vec3<i32>(gid);
+  if (any(c >= vec3<i32>(u.dims.xyz))) { return; }`
+);
+var LABEL_SURFACE_MAX_DIM = 1024;
+var SEED_PACK_WGSL = (
+  /* wgsl */
+  `
+const NO_SEED = 0xffffffffu;
+fn seedPack(lo : vec3<i32>, axis : i32) -> u32 {
+  let l = vec3<u32>(max(lo, vec3<i32>(0)));
+  return l.x | (l.y << 10u) | (l.z << 20u) | (u32(axis) << 30u);
+}
+// Grid position of a seed: half a voxel along its axis from its lower voxel.
+fn seedPos(s : u32) -> vec3<f32> {
+  var p = vec3<f32>(f32(s & 1023u), f32((s >> 10u) & 1023u), f32((s >> 20u) & 1023u));
+  let a = min(s >> 30u, 2u);
+  p[a] = p[a] + 0.5;
+  return p;
+}
+// Squared distance (mm\xB2) from grid voxel c to seed s.
+fn seedDist2(c : vec3<i32>, s : u32) -> f32 {
+  let d = (u.ijkToRAS * vec4<f32>(seedPos(s) - vec3<f32>(c), 0.0)).xyz;
+  return dot(d, d);
+}`
+);
+var SHARE_PACK_WGSL = (
+  /* wgsl */
+  `
+fn sharePack(own : i32, other : i32, share : f32, near : bool) -> u32 {
+  return u32(own) | (u32(other) << 8u) | (u32(round(clamp(share, 0.0, 1.0) * 32767.0)) << 16u) | select(0u, 0x80000000u, near);
+}
+fn shareUnpack(p : u32) -> vec4<f32> {
+  return vec4<f32>(f32(p & 255u), f32((p >> 8u) & 255u), f32((p >> 16u) & 32767u) / 32767.0, f32(p >> 31u));
+}`
+);
+var MASK_WGSL = (
+  /* wgsl */
+  `${U_STRUCT}
+@group(0) @binding(0) var t_label : texture_3d<u32>;
+@group(0) @binding(1) var t_pal : texture_2d<f32>;
+@group(0) @binding(2) var t_out : texture_storage_3d<r32uint, write>;
+@group(0) @binding(3) var<uniform> u : U;
+${LABELS_WGSL}
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {${GRID_GUARD}
+  var inside = shownLabel(c) != 0u;
+  for (var axis = 0; axis < 3; axis = axis + 1) {
+    if (inside) { break; }
+    let maxGap = i32(u.gap[axis] + 0.5);
+    if (maxGap <= 0) { continue; }
+    var e = vec3<i32>(0);
+    e[axis] = 1;
+    var plus = 0;
+    var minus = 0;
+    for (var i = 1; i <= 8; i = i + 1) {
+      if (i > maxGap) { break; }
+      if (plus == 0 && shownLabel(c + e * i) != 0u) { plus = i; }
+      if (minus == 0 && shownLabel(c - e * i) != 0u) { minus = i; }
+    }
+    inside = plus > 0 && minus > 0 && plus + minus - 1 <= maxGap;
+  }
+  textureStore(t_out, c, vec4<u32>(select(0u, 1u, inside), 0u, 0u, 0u));
+}`
+);
+var SEED_WGSL = (
+  /* wgsl */
+  `${U_STRUCT}
+@group(0) @binding(0) var t_mask : texture_3d<u32>;
+@group(0) @binding(1) var t_seed_out : texture_storage_3d<r32uint, write>;
+@group(0) @binding(2) var<uniform> u : U;
+${SEED_PACK_WGSL}
+fn insideAt(c : vec3<i32>) -> bool {
+  if (any(c < vec3<i32>(0)) || any(c >= vec3<i32>(u.dims.xyz))) { return false; }
+  return textureLoad(t_mask, c, 0).r != 0u;
+}
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {${GRID_GUARD}
+  let inside = insideAt(c);
+  var best = 1.0e30;
+  var seed = NO_SEED;
+  for (var axis = 0; axis < 3; axis = axis + 1) {
+    var e = vec3<i32>(0);
+    e[axis] = 1;
+    let fd = 0.5 * u.spacing[axis];
+    let pd = insideAt(c + e) != inside;
+    let md = insideAt(c - e) != inside;
+    if (fd < best && (pd || md)) {
+      best = fd;
+      seed = seedPack(select(c - e, c, pd), axis);   // the face to +e is c's; the face to -e is (c - e)'s
+    }
+  }
+  textureStore(t_seed_out, c, vec4<u32>(seed, 0u, 0u, 0u));
+}`
+);
+var JFA_WGSL2 = (
+  /* wgsl */
+  `${U_STRUCT}
+@group(0) @binding(0) var t_in : texture_3d<u32>;
+@group(0) @binding(1) var t_out : texture_storage_3d<r32uint, write>;
+@group(0) @binding(2) var<uniform> u : U;
+${SEED_PACK_WGSL}
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {${GRID_GUARD}
+  let step = i32(u.params.x);
+  let dmax = vec3<i32>(u.dims.xyz) - vec3<i32>(1);
+  var best = textureLoad(t_in, c, 0).r;
+  var bestD = select(1.0e30, seedDist2(c, best), best != NO_SEED);
+  for (var dz = -1; dz <= 1; dz = dz + 1) {
+    for (var dy = -1; dy <= 1; dy = dy + 1) {
+      for (var dx = -1; dx <= 1; dx = dx + 1) {
+        if (dx == 0 && dy == 0 && dz == 0) { continue; }
+        let sd = textureLoad(t_in, clamp(c + vec3<i32>(dx, dy, dz) * step, vec3<i32>(0), dmax), 0).r;
+        if (sd != NO_SEED) {
+          let d = seedDist2(c, sd);
+          if (d < bestD) { bestD = d; best = sd; }
+        }
+      }
+    }
+  }
+  textureStore(t_out, c, vec4<u32>(best, 0u, 0u, 0u));
+}`
+);
+var FINAL_WGSL2 = (
+  /* wgsl */
+  `${U_STRUCT}
+@group(0) @binding(0) var t_seed : texture_3d<u32>;
+@group(0) @binding(1) var t_mask : texture_3d<u32>;
+@group(0) @binding(2) var t_dist : texture_storage_3d<r32float, write>;
+@group(0) @binding(3) var t_ind : texture_storage_3d<r32float, write>;
+@group(0) @binding(4) var<uniform> u : U;
+${SEED_PACK_WGSL}
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {${GRID_GUARD}
+  let s = textureLoad(t_seed, c, 0).r;
+  let band = u.spacing.w;
+  let d = select(band, min(sqrt(seedDist2(c, s)), band), s != NO_SEED);
+  let inside = textureLoad(t_mask, c, 0).r != 0u;
+  textureStore(t_dist, c, vec4<f32>(select(d, -d, inside), 0.0, 0.0, 0.0));
+  textureStore(t_ind, c, vec4<f32>(select(0.0, 1.0, inside), 0.0, 0.0, 0.0));
+}`
+);
+var BLUR_WGSL3 = (
+  /* wgsl */
+  `
+struct BU { dims : vec4<u32>, axis_r : vec4<u32>, w : array<vec4<f32>, 4> };
+@group(0) @binding(0) var t_in : texture_3d<f32>;
+@group(0) @binding(1) var t_out : texture_storage_3d<r32float, write>;
+@group(0) @binding(2) var<uniform> b : BU;
+fn wt(i : u32) -> f32 { return b.w[i >> 2u][i & 3u]; }
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let c = vec3<i32>(gid);
+  if (any(c >= vec3<i32>(b.dims.xyz))) { return; }
+  let dmax = vec3<i32>(b.dims.xyz) - vec3<i32>(1);
+  var av = vec3<i32>(0);
+  av[b.axis_r.x] = 1;
+  var sum = wt(0u) * textureLoad(t_in, c, 0).r;
+  let R = i32(b.axis_r.y);
+  for (var i = 1; i <= R; i = i + 1) {
+    sum = sum + wt(u32(i)) * (textureLoad(t_in, clamp(c + av * i, vec3<i32>(0), dmax), 0).r
+                            + textureLoad(t_in, clamp(c - av * i, vec3<i32>(0), dmax), 0).r);
+  }
+  textureStore(t_out, c, vec4<f32>(sum, 0.0, 0.0, 0.0));
+}`
+);
+var BU_BYTES = 96;
+var COMBINE_WGSL = (
+  /* wgsl */
+  `${U_STRUCT}
+@group(0) @binding(0) var t_dist : texture_3d<f32>;
+@group(0) @binding(1) var t_g1 : texture_3d<f32>;
+@group(0) @binding(2) var t_g2 : texture_3d<f32>;
+@group(0) @binding(3) var t_out : texture_storage_3d<rgba16float, write>;
+@group(0) @binding(4) var<uniform> u : U;
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {${GRID_GUARD}
+  let d = textureLoad(t_dist, c, 0).r;
+  let mode = u32(u.gap.w + 0.5);
+  var s = d;
+  if (mode == 0u) {
+    // Twicing: G smooths away the staircase but moves curved surfaces inwards (\u03C3\xB2/2 \xD7 curvature) and
+    // removes thin structures; 2\xB7G\xB7f \u2212 G\xB7G\xB7f cancels that to first order.
+    s = 2.0 * textureLoad(t_g1, c, 0).r - textureLoad(t_g2, c, 0).r;
+  } else if (mode == 1u) {
+    s = textureLoad(t_g1, c, 0).r;
+  } else if (mode == 2u) {
+    // The blurred inside/outside mask, crossing one half on the surface. Scaled to about a distance in
+    // mm (the mask's slope across the edge is about 1/(\u03C3\xB7sqrt(2\u03C0))) so normals and the bisection see a
+    // field of the same size as the others; only its sign and direction are used.
+    let minSp = min(u.spacing.x, min(u.spacing.y, u.spacing.z));
+    s = (0.5 - textureLoad(t_g1, c, 0).r) * max(2.5 * u.sigma.w, 1.25 * minSp);
+  }
+  if (mode <= 1u && (u.ldims.w & 1u) != 0u && d < 0.0 && s > 0.5 * d) {
+    // The deepest voxel of a structure (a local minimum of the distance) stays inside, so a structure
+    // painted in one thick slice is not smoothed out of existence.
+    let dmax = vec3<i32>(u.dims.xyz) - vec3<i32>(1);
+    var deepest = true;
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+      for (var dy = -1; dy <= 1; dy = dy + 1) {
+        for (var dx = -1; dx <= 1; dx = dx + 1) {
+          if (deepest) {
+            let n = clamp(c + vec3<i32>(dx, dy, dz), vec3<i32>(0), dmax);
+            deepest = textureLoad(t_dist, n, 0).r >= d - 1.0e-3;
+          }
+        }
+      }
+    }
+    if (deepest) { s = 0.5 * d; }
+  }
+  textureStore(t_out, c, vec4<f32>(s, d, 0.0, 0.0));
+}`
+);
+var SEGMENT_WGSL = (
+  /* wgsl */
+  `${U_STRUCT}
+@group(0) @binding(0) var t_label : texture_3d<u32>;
+@group(0) @binding(1) var t_pal : texture_2d<f32>;
+@group(0) @binding(2) var t_out : texture_storage_3d<r32uint, write>;
+@group(0) @binding(3) var<uniform> u : U;
+@group(0) @binding(4) var t_seed : texture_3d<u32>;
+${LABELS_WGSL}
+${SEED_PACK_WGSL}
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {${GRID_GUARD}
+  var l = shownLabel(c);
+  if (l == 0u) {
+    var nd = 1.0e30;
+    for (var dz = -2; dz <= 2; dz = dz + 1) {
+      for (var dy = -2; dy <= 2; dy = dy + 1) {
+        for (var dx = -2; dx <= 2; dx = dx + 1) {
+          let o = vec3<i32>(dx, dy, dz);
+          let nl = shownLabel(c + o);
+          if (nl != 0u) {
+            let dd = length(vec3<f32>(o) * u.spacing.xyz);
+            if (dd < nd) { nd = dd; l = nl; }
+          }
+        }
+      }
+    }
+  }
+  if (l == 0u) {
+    let sd = textureLoad(t_seed, c, 0).r;
+    if (sd != NO_SEED) {
+      let lo = vec3<i32>(i32(sd & 1023u), i32((sd >> 10u) & 1023u), i32((sd >> 20u) & 1023u));
+      var e = vec3<i32>(0);
+      e[min(sd >> 30u, 2u)] = 1;
+      l = shownLabel(lo);
+      if (l == 0u) { l = shownLabel(lo + e); }
+    }
+  }
+  textureStore(t_out, c, vec4<u32>(l, 0u, 0u, 0u));
+}`
+);
+var INTERFACE_WGSL = (
+  /* wgsl */
+  `${U_STRUCT}
+@group(0) @binding(0) var t_seg : texture_3d<u32>;
+@group(0) @binding(1) var t_out : texture_storage_3d<r32uint, write>;
+@group(0) @binding(2) var<uniform> u : U;
+${SHARE_PACK_WGSL}
+fn segAt(c : vec3<i32>) -> i32 {
+  return i32(textureLoad(t_seg, clamp(c, vec3<i32>(0), vec3<i32>(u.dims.xyz) - vec3<i32>(1)), 0).r);
+}
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {${GRID_GUARD}
+  let own = segAt(c);
+  var first = own;
+  var near = false;
+  for (var dz = -1; dz <= 1; dz = dz + 1) {
+    for (var dy = -1; dy <= 1; dy = dy + 1) {
+      for (var dx = -1; dx <= 1; dx = dx + 1) {
+        let l = segAt(c + vec3<i32>(dx, dy, dz));
+        if (l != 0) {
+          if (first == 0) { first = l; } else if (l != first) { near = true; }
+        }
+      }
+    }
+  }
+  if (!near || own == 0) {
+    textureStore(t_out, c, vec4<u32>(sharePack(own, 0, 1.0, near), 0u, 0u, 0u));
+    return;
+  }
+  var ownShare = 0.0;
+  var ol = array<i32, 4>(0, 0, 0, 0);
+  var os = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
+  let sg = max(min(u.sigma.xyz, vec3<f32>(1.0)), vec3<f32>(1.0e-3));
+  for (var dz = -2; dz <= 2; dz = dz + 1) {
+    for (var dy = -2; dy <= 2; dy = dy + 1) {
+      for (var dx = -2; dx <= 2; dx = dx + 1) {
+        let o = vec3<i32>(dx, dy, dz);
+        let l = segAt(c + o);
+        if (l == 0) { continue; }
+        let q = vec3<f32>(o) / sg;
+        let w = exp(-0.5 * dot(q, q));
+        if (l == own) { ownShare = ownShare + w; continue; }
+        for (var k = 0; k < 4; k = k + 1) {
+          if (ol[k] == l || ol[k] == 0) { ol[k] = l; os[k] = os[k] + w; break; }
+        }
+      }
+    }
+  }
+  var other = 0;
+  var oshare = -1.0;
+  for (var k = 0; k < 4; k = k + 1) {
+    if (ol[k] > 0 && os[k] > oshare) { other = ol[k]; oshare = os[k]; }
+  }
+  let share = ownShare / max(ownShare + max(oshare, 0.0), 1.0e-6);
+  textureStore(t_out, c, vec4<u32>(sharePack(own, other, share, true), 0u, 0u, 0u));
+}`
+);
+var THIN_WGSL = (
+  /* wgsl */
+  `${U_STRUCT}
+@group(0) @binding(0) var t_label : texture_3d<u32>;
+@group(0) @binding(1) var t_pal : texture_2d<f32>;
+@group(0) @binding(2) var t_seg : texture_3d<u32>;
+@group(0) @binding(3) var t_in : texture_3d<u32>;
+@group(0) @binding(4) var t_out : texture_storage_3d<rgba16float, write>;
+@group(0) @binding(5) var<uniform> u : U;
+${LABELS_WGSL}
+${SHARE_PACK_WGSL}
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {${GRID_GUARD}
+  var v = shareUnpack(textureLoad(t_in, c, 0).r);
+  if ((u.ldims.w & 2u) != 0u && v.a > 0.5 && v.b < 0.5) {
+    let own = textureLoad(t_seg, c, 0).r;
+    if (own != 0u && shownLabel(c) == own) {
+      let dmax = vec3<i32>(u.dims.xyz) - vec3<i32>(1);
+      var sticks = false;
+      for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+          for (var dx = -1; dx <= 1; dx = dx + 1) {
+            if (!sticks) {
+              let n = clamp(c + vec3<i32>(dx, dy, dz), vec3<i32>(0), dmax);
+              sticks = textureLoad(t_seg, n, 0).r == own && shareUnpack(textureLoad(t_in, n, 0).r).b >= v.b + 0.35;
+            }
+          }
+        }
+      }
+      if (!sticks) { v.b = 0.75; }
+    }
+  }
+  textureStore(t_out, c, v);
+}`
+);
+var BLOCK_WGSL = (
+  /* wgsl */
+  `${U_STRUCT}
+@group(0) @binding(0) var t_if : texture_3d<f32>;
+@group(0) @binding(1) var t_out : texture_storage_3d<r32uint, write>;
+@group(0) @binding(2) var<uniform> u : U;
+const BS = ${LABEL_SURFACE_BLOCK};
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let b = vec3<i32>(gid);
+  let dimsI = vec3<i32>(u.dims.xyz);
+  if (any(b >= (dimsI + vec3<i32>(BS - 1)) / BS)) { return; }
+  let first = b * BS;
+  var found = false;
+  for (var dz = -1; dz <= BS; dz = dz + 1) {
+    for (var dy = -1; dy <= BS; dy = dy + 1) {
+      for (var dx = -1; dx <= BS; dx = dx + 1) {
+        let v = first + vec3<i32>(dx, dy, dz);
+        if (!found && all(v >= vec3<i32>(0)) && all(v < dimsI)) { found = textureLoad(t_if, v, 0).a > 0.5; }
+      }
+    }
+  }
+  textureStore(t_out, b, vec4<u32>(select(0u, 1u, found), 0u, 0u, 0u));
+}`
+);
+var LabelSurfaceBaker = class {
+  constructor(dev, labelTex, labelDims, labelIjkToRAS, opts = {}, pad = 3) {
+    this.labelTex = labelTex;
+    this.dev = dev;
+    this.opts = { ...DEFAULT_LABEL_SURFACE_BAKE, ...opts };
+    this.pad = pad;
+    this.labelDims = [labelDims[0], labelDims[1], labelDims[2]];
+    this.dims = [labelDims[0] + 2 * pad, labelDims[1] + 2 * pad, labelDims[2] + 2 * pad];
+    const m = labelIjkToRAS.slice();
+    for (let r = 0; r < 3; r++) m[r * 4 + 3] -= pad * (m[r * 4] + m[r * 4 + 1] + m[r * 4 + 2]);
+    this.ijkToRAS = m;
+    const col = (c) => Math.hypot(m[c], m[4 + c], m[8 + c]);
+    this.spacing = [col(0), col(1), col(2)];
+    this.blockDims = this.dims.map((d) => Math.ceil(d / LABEL_SURFACE_BLOCK));
+    if (this.dims.some((d) => d > LABEL_SURFACE_MAX_DIM)) {
+      throw new Error(`LabelSurfaceBaker: padded grid ${this.dims.join("\xD7")} exceeds ${LABEL_SURFACE_MAX_DIM} voxels on a side`);
+    }
+    const S = GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING;
+    const mk = (format, label, size = this.dims, extra = 0) => dev.createTexture({ label, size, dimension: "3d", format, usage: S | extra });
+    this.mask = mk("r32uint", "lsb mask, then segment");
+    this.seed = [mk("r32uint", "lsb seed 0, then raw shares"), mk("r32uint", "lsb seed 1")];
+    this.dist = mk("r32float", "lsb distance");
+    this.g1 = mk("r32float", "lsb G\xB7f");
+    this.g2 = mk("r32float", "lsb indicator, then G\xB7G\xB7f");
+    this.scratch = mk("r32float", "lsb blur scratch");
+    this.surf = mk("rgba16float", "lsb surface", this.dims, GPUTextureUsage.COPY_SRC);
+    this.ifB = mk("rgba16float", "lsb shares", this.dims, GPUTextureUsage.COPY_SRC);
+    this.block = mk("r32uint", "lsb wall blocks", this.blockDims);
+    this.palTex = dev.createTexture({ label: "lsb palette", size: [256, 1], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+    const maxDim = Math.max(...this.dims);
+    const steps = [];
+    for (let s = 1 << Math.floor(Math.log2(maxDim - 1)); s >= 1; s >>= 1) steps.push(s);
+    this.steps = [...steps, 2, 1];
+    const ub = (size) => dev.createBuffer({ size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.uni = ub(U_BYTES);
+    this.jfaUni = this.steps.map(() => ub(U_BYTES));
+    this.blurUni = [ub(BU_BYTES), ub(BU_BYTES), ub(BU_BYTES)];
+    const pipe = (code, label) => dev.createComputePipeline({ label, layout: "auto", compute: { module: dev.createShaderModule({ label, code }), entryPoint: "main" } });
+    this.pipes = {
+      mask: pipe(MASK_WGSL, "lsb mask"),
+      seed: pipe(SEED_WGSL, "lsb seed"),
+      jfa: pipe(JFA_WGSL2, "lsb jfa"),
+      final: pipe(FINAL_WGSL2, "lsb final"),
+      blur: pipe(BLUR_WGSL3, "lsb blur"),
+      combine: pipe(COMBINE_WGSL, "lsb combine"),
+      segment: pipe(SEGMENT_WGSL, "lsb segment"),
+      interface: pipe(INTERFACE_WGSL, "lsb interface"),
+      thin: pipe(THIN_WGSL, "lsb thin"),
+      block: pipe(BLOCK_WGSL, "lsb block")
+    };
+  }
+  /** The PADDED grid every texture here lives on, and its voxel → RAS matrix (row-major). */
+  dims;
+  ijkToRAS;
+  pad;
+  labelDims;
+  spacing;
+  dev;
+  opts;
+  palette = new Uint8Array(256 * 4);
+  palTex;
+  mask;
+  // inside/outside, then (after the distance) the segment of each voxel
+  seed;
+  // the flood's ping-pong; seed[0] then holds the raw shares
+  dist;
+  g1;
+  g2;
+  // the indicator, then G·G·f
+  scratch;
+  surf;
+  ifB;
+  block;
+  blockDims;
+  uni;
+  jfaUni;
+  blurUni;
+  steps;
+  pipes;
+  /** GPU bytes per padded-grid voxel, counting the r32uint master the EditableSegmentation owns, as
+   *  JfaSdfBaker.bytesPerVoxel() does (52), so the two compare directly. */
+  static bytesPerVoxel() {
+    return 4 + 2 * 4 + 4 * 4 + 8 + 8 + 4;
+  }
+  options() {
+    return { ...this.opts };
+  }
+  /** Takes effect on the next bake(). */
+  setOptions(o) {
+    this.opts = { ...this.opts, ...o };
+  }
+  /** σ in mm (of the largest spacing — of the source image, if resampled — as Slicer's SmoothingFactor is). */
+  sigmaMm() {
+    return Math.max(0, this.opts.sigmaVoxels) * Math.max(...this.opts.sourceSpacingMm ?? this.spacing);
+  }
+  /** How far the rendered surface can be from the sharp one — the margin the empty-space skip keeps. */
+  skipMarginMm() {
+    return Math.max(...this.spacing) + 3.5 * this.sigmaMm();
+  }
+  /** Palette entry (rgb 0..1, opacity 0..1). Returns true if the label was shown before and not now,
+   *  or the other way round — that changes the surface and needs a bake(); a colour or an opacity
+   *  change alone needs only flushPalette(). */
+  setLabel(id, rgb, opacity) {
+    if (id < 1 || id > 255) return false;
+    const o = id * 4, wasShown = this.palette[o + 3] > 0;
+    if (rgb) for (let i = 0; i < 3; i++) this.palette[o + i] = Math.round(Math.max(0, Math.min(1, rgb[i])) * 255);
+    if (opacity !== null) {
+      const a = Math.max(0, Math.min(1, opacity));
+      this.palette[o + 3] = a > 0 ? Math.max(1, Math.round(a * 255)) : 0;
+    }
+    return wasShown !== this.palette[o + 3] > 0;
+  }
+  labelOpacity(id) {
+    return this.palette[id * 4 + 3] / 255;
+  }
+  flushPalette() {
+    this.dev.queue.writeTexture({ texture: this.palTex }, this.palette, { bytesPerRow: 256 * 4 }, [256, 1]);
+  }
+  surfaceTexture() {
+    return this.surf;
+  }
+  sharesTexture() {
+    return this.ifB;
+  }
+  blockTexture() {
+    return this.block;
+  }
+  paletteTexture() {
+    return this.palTex;
+  }
+  writeU(buf, step, mode) {
+    const ab = new ArrayBuffer(U_BYTES);
+    const f = new Float32Array(ab), u = new Uint32Array(ab);
+    f.set(transpose4(this.ijkToRAS), 0);
+    u[16] = this.dims[0];
+    u[17] = this.dims[1];
+    u[18] = this.dims[2];
+    u[19] = this.pad;
+    f[20] = step;
+    u[28] = this.labelDims[0];
+    u[29] = this.labelDims[1];
+    u[30] = this.labelDims[2];
+    u[31] = (this.opts.keepDeepest ? 1 : 0) | (this.opts.thinRule ? 2 : 0);
+    const smm = this.sigmaMm();
+    const src = this.opts.sourceSpacingMm ?? this.spacing;
+    for (let a = 0; a < 3; a++) {
+      f[32 + a] = smm / this.spacing[a];
+      const gapMm = Math.min(4, Math.floor(smm / src[a] + 1e-6)) * src[a];
+      f[36 + a] = this.opts.fillGaps ? Math.min(8, Math.floor(gapMm / this.spacing[a] + 1e-6)) : 0;
+      f[40 + a] = this.spacing[a];
+    }
+    f[35] = smm;
+    f[39] = mode;
+    f[43] = Math.min(400, 64 * Math.max(...this.spacing));
+    this.dev.queue.writeBuffer(buf, 0, ab);
+  }
+  pass(enc, name, resources, groups) {
+    const pipe = this.pipes[name];
+    const entries = resources.map((r, i) => r instanceof GPUBuffer ? { binding: i, resource: { buffer: r } } : { binding: i, resource: r.createView() });
+    const bg = this.dev.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries });
+    const p = enc.beginComputePass({ label: `lsb ${name}` });
+    p.setPipeline(pipe);
+    p.setBindGroup(0, bg);
+    p.dispatchWorkgroups(Math.ceil(groups[0] / 4), Math.ceil(groups[1] / 4), Math.ceil(groups[2] / 4));
+    p.end();
+  }
+  /** Separable Gaussian at the current σ (per axis), src -> dst (x), dst -> scratch (y), scratch -> dst (z). */
+  blur(enc, src, dst) {
+    const chain = [[src, dst], [dst, this.scratch], [this.scratch, dst]];
+    chain.forEach(([a, b], axis) => this.pass(enc, "blur", [a, b, this.blurUni[axis]], this.dims));
+  }
+  writeBlurUniforms() {
+    const smm = this.sigmaMm();
+    for (let axis = 0; axis < 3; axis++) {
+      const { radius, w } = gaussHalfKernel2(Math.max(smm / this.spacing[axis], 1e-3));
+      const ab = new ArrayBuffer(BU_BYTES);
+      const u = new Uint32Array(ab), f = new Float32Array(ab);
+      u[0] = this.dims[0];
+      u[1] = this.dims[1];
+      u[2] = this.dims[2];
+      u[4] = axis;
+      u[5] = radius;
+      f.set(w, 8);
+      this.dev.queue.writeBuffer(this.blurUni[axis], 0, ab);
+    }
+  }
+  /** The whole pipeline, in one submit: mask → face seeds → jump flood → distance → smoothing →
+   *  surface → segments → shares → thin rule → wall blocks. Uploads the palette first. */
+  bake() {
+    this.flushPalette();
+    const smm = this.sigmaMm();
+    const outer = this.opts.outer;
+    const smoothed = smm > 0;
+    const mode = outer === "mask" ? 2 : !smoothed ? 3 : outer === "blur" ? 1 : 0;
+    this.writeU(this.uni, 0, mode);
+    this.steps.forEach((s, i) => this.writeU(this.jfaUni[i], s, mode));
+    if (smoothed) this.writeBlurUniforms();
+    const enc = this.dev.createCommandEncoder({ label: "label surface bake" });
+    const D = this.dims;
+    this.pass(enc, "mask", [this.labelTex, this.palTex, this.mask, this.uni], D);
+    this.pass(enc, "seed", [this.mask, this.seed[0], this.uni], D);
+    let src = 0;
+    this.steps.forEach((_, i) => {
+      this.pass(enc, "jfa", [this.seed[src], this.seed[src ^ 1], this.jfaUni[i]], D);
+      src ^= 1;
+    });
+    this.pass(enc, "final", [this.seed[src], this.mask, this.dist, this.g2, this.uni], D);
+    let g1 = this.dist, g2 = this.dist;
+    if (outer === "mask") {
+      g1 = this.g2;
+      if (smoothed) {
+        this.blur(enc, this.g2, this.g1);
+        g1 = this.g1;
+      }
+    } else if (smoothed) {
+      this.blur(enc, this.dist, this.g1);
+      g1 = this.g1;
+      if (outer === "twicing") {
+        this.blur(enc, this.g1, this.g2);
+        g2 = this.g2;
+      }
+    }
+    this.pass(enc, "combine", [this.dist, g1, g2, this.surf, this.uni], D);
+    this.pass(enc, "segment", [this.labelTex, this.palTex, this.mask, this.uni, this.seed[src]], D);
+    this.pass(enc, "interface", [this.mask, this.seed[0], this.uni], D);
+    this.pass(enc, "thin", [this.labelTex, this.palTex, this.mask, this.seed[0], this.ifB, this.uni], D);
+    this.pass(enc, "block", [this.ifB, this.block, this.uni], this.blockDims);
+    this.dev.queue.submit([enc.finish()]);
+  }
+  /** Read the surface texture back: s = the surface function (negative inside), d = the sharp signed
+   *  distance, both mm, x-fastest on the padded grid. For tests. */
+  async readSurface() {
+    const [dx, dy, dz] = this.dims;
+    const bpr = Math.ceil(dx * 8 / 256) * 256, rowU16 = bpr / 2;
+    const buf = this.dev.createBuffer({ size: bpr * dy * dz, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const enc = this.dev.createCommandEncoder();
+    enc.copyTextureToBuffer({ texture: this.surf }, { buffer: buf, bytesPerRow: bpr, rowsPerImage: dy }, [dx, dy, dz]);
+    this.dev.queue.submit([enc.finish()]);
+    await buf.mapAsync(GPUMapMode.READ);
+    const h = new Uint16Array(buf.getMappedRange());
+    const h2f = (x) => {
+      const sg = x & 32768 ? -1 : 1, e = (x & 31744) >> 10, fr = x & 1023;
+      if (e === 0) return sg * 2 ** -14 * (fr / 1024);
+      if (e === 31) return fr ? NaN : sg * Infinity;
+      return sg * 2 ** (e - 15) * (1 + fr / 1024);
+    };
+    const s = new Float32Array(dx * dy * dz), d = new Float32Array(dx * dy * dz);
+    for (let z = 0; z < dz; z++) for (let y = 0; y < dy; y++) for (let x = 0; x < dx; x++) {
+      const i = (z * dy + y) * dx + x, j = (z * dy + y) * rowU16 + x * 4;
+      s[i] = h2f(h[j]);
+      d[i] = h2f(h[j + 1]);
+    }
+    buf.unmap();
+    buf.destroy();
+    return { s, d };
+  }
+  destroy() {
+    for (const t of [this.mask, ...this.seed, this.dist, this.g1, this.g2, this.scratch, this.surf, this.ifB, this.block, this.palTex]) t.destroy();
+    for (const b of [this.uni, ...this.jfaUni, ...this.blurUni]) b.destroy();
+  }
+};
+
+// render/label-surface-field.ts
+var LabelSurfaceField = class {
+  constructor(baker, opts = {}) {
+    this.baker = baker;
+    this.p2t = patientToTextureFromIjkToRAS(baker.ijkToRAS, baker.dims);
+    this.box = volumeAABBFromIjkToRAS(baker.ijkToRAS, baker.dims);
+    this.minSp = Math.min(...baker.spacing);
+    this.maxSp = Math.max(...baker.spacing);
+    this.opacity = opts.opacity ?? 1;
+    this.shade = opts.shade ?? [0.2, 0.85, 0.3, 32];
+    this.walls = opts.walls ?? true;
+    this.bothFaces = opts.bothFaces ?? true;
+    this.seamPx = opts.seamPx ?? 1;
+    this.clippable = opts.clippable ?? false;
+  }
+  kind = "lsf";
+  bindingCount = 4;
+  // surface (3d, linear), shares (3d), wall blocks (3d u32), palette (2d)
+  clippable;
+  providesSkip = true;
+  intervalSampling = true;
+  p2t;
+  box;
+  minSp;
+  maxSp;
+  opacity;
+  shade;
+  walls;
+  bothFaces;
+  seamPx;
+  setOpacity(o) {
+    this.opacity = Math.max(0, Math.min(1, o));
+  }
+  setWalls(on) {
+    this.walls = on;
+  }
+  setBothFaces(on) {
+    this.bothFaces = on;
+  }
+  setSeamPx(px) {
+    this.seamPx = Math.max(0, px);
+  }
+  uniformFloats() {
+    return 40;
+  }
+  // p2t(16) + dims(4) + opts(4) + shade(4) + skip(4) + bmin(4) + bmax(4)
+  aabb() {
+    return this.box;
+  }
+  // Half a voxel, as SegmentField (the renderer steps at 0.7 of this), so the two cost the same per
+  // step. Smoothing can leave a one-voxel sheet a fraction of a voxel thick; the shader probes inside
+  // a step that could hold one (sample_field), rather than every step being that fine.
+  sampleStep() {
+    return 0.5 * this.minSp;
+  }
+  structMembers(s) {
+    return [
+      `  lsf${s}_p2t : mat4x4<f32>,`,
+      `  lsf${s}_dims : vec4<f32>,`,
+      // padded grid dims, min spacing (mm)
+      `  lsf${s}_opts : vec4<f32>,`,
+      // opacity, walls, both faces, seam px
+      `  lsf${s}_shade : vec4<f32>,`,
+      // ka, kd, ks, shininess
+      `  lsf${s}_skip : vec4<f32>,`,
+      // margin (mm), max spacing, block size, min spacing
+      `  lsf${s}_bmin : vec4<f32>,`,
+      `  lsf${s}_bmax : vec4<f32>,`
+    ].join("\n");
+  }
+  declareBindings(s, base) {
+    return [
+      `@group(0) @binding(${base}) var t_lsd${s} : texture_3d<f32>;`,
+      `@group(0) @binding(${base + 1}) var t_lsl${s} : texture_3d<f32>;`,
+      `@group(0) @binding(${base + 2}) var t_lsb${s} : texture_3d<u32>;`,
+      `@group(0) @binding(${base + 3}) var t_lsp${s} : texture_2d<f32>;`
+    ].join("\n");
+  }
+  skipWGSL(s) {
+    return (
+      /* wgsl */
+      `
+fn skip_lsf${s}(wp : vec3<f32>) -> f32 {
+  let t = lsf${s}_tex(wp);
+  if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) {
+    // Outside the grid: leap only to its box.
+    let cen = (u_material.lsf${s}_bmin.xyz + u_material.lsf${s}_bmax.xyz) * 0.5;
+    let ext = (u_material.lsf${s}_bmax.xyz - u_material.lsf${s}_bmin.xyz) * 0.5;
+    let q = abs(transform_point_lsf${s}(wp) - cen) - ext;
+    return max(0.0, length(max(q, vec3<f32>(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0));
+  }
+  // The SHARP distance (.g): smoothing moves the rendered surface by up to the margin from it.
+  let sharp = textureSampleLevel(t_lsd${s}, s_lin, t, 0.0).g;
+  if (abs(sharp) > 500.0) { return 0.0; }
+  var leap = max(0.0, abs(sharp) - u_material.lsf${s}_skip.x);
+  if (sharp < 0.0 && u_material.lsf${s}_opts.y > 0.5 && leap > 0.0) {
+    // Inside: the next thing may be a wall. A block that holds no voxel near a wall (in it or one voxel
+    // around it) holds no wall, so the ray may leap to the edge of the block it is in.
+    let gp = t * u_material.lsf${s}_dims.xyz - vec3<f32>(0.5);
+    let nv = clamp(vec3<i32>(floor(gp + vec3<f32>(0.5))), vec3<i32>(0), vec3<i32>(u_material.lsf${s}_dims.xyz) - vec3<i32>(1));
+    let b = nv / ${LABEL_SURFACE_BLOCK};
+    if (textureLoad(t_lsb${s}, b, 0).r != 0u) { return 0.0; }
+    let lo = vec3<f32>(b * ${LABEL_SURFACE_BLOCK}) - vec3<f32>(0.5);
+    let dv = min(gp - lo, lo + vec3<f32>(${LABEL_SURFACE_BLOCK}.0) - gp);
+    leap = min(leap, max(0.0, min(dv.x, min(dv.y, dv.z))) * u_material.lsf${s}_skip.w);
+  }${this.clippable ? `
+  if (sharp < 0.0) {
+    // Inside, a clip plane is a face too (the cap): do not leap past one.
+    let ccount = u32(u_material.clip_count.x);
+    for (var ci = 0u; ci < ccount; ci = ci + 1u) {
+      let cp = u_material.clip_planes[ci];
+      leap = min(leap, abs(dot(wp, cp.xyz) + cp.w));
+    }
+  }` : ""}
+  return leap;
+}`
+    );
+  }
+  samplingWGSL(s) {
+    const P = `lsf${s}`;
+    return (
+      /* wgsl */
+      `
+fn ${P}_tex(wp : vec3<f32>) -> vec3<f32> {
+  return (u_material.${P}_p2t * vec4<f32>(transform_point_${P}(wp), 1.0)).xyz;
+}
+fn ${P}_gp(wp : vec3<f32>) -> vec3<f32> { return ${P}_tex(wp) * u_material.${P}_dims.xyz - vec3<f32>(0.5); }
+// The surface function (negative inside). Outside the grid: outside the surface.
+fn ${P}_surf(wp : vec3<f32>) -> f32 {
+  let t = ${P}_tex(wp);
+  if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { return 1.0e3; }
+  return textureSampleLevel(t_lsd${s}, s_lin, t, 0.0).r;
+}
+// At a texture coordinate, clamped to the grid edge \u2014 for gradient taps (the padded edge is background).
+fn ${P}_surft(t : vec3<f32>) -> f32 {
+  return textureSampleLevel(t_lsd${s}, s_lin, clamp(t, vec3<f32>(0.0), vec3<f32>(1.0)), 0.0).r;
+}
+// A gradient taken along the GRID axes (per voxel) to a world direction. Normals are differenced over
+// one voxel per axis: on an anisotropic grid (5 mm slices) a tap a fraction of a slice apart reads the
+// slope of one trilinear cell, which jumps at every slice plane \u2014 bands across the surface, one per
+// slice. A one-voxel span averages that jump out. (On an isotropic grid this is what it always was.)
+fn ${P}_gridToWorld(g : vec3<f32>) -> vec3<f32> {
+  let m = u_material.${P}_p2t;
+  let p3 = mat3x3<f32>(m[0].xyz, m[1].xyz, m[2].xyz);
+  return transpose(p3) * (u_material.${P}_dims.xyz * g);
+}
+fn ${P}_pal(l : i32) -> vec4<f32> { return textureLoad(t_lsp${s}, vec2<i32>(clamp(l, 0, 255), 0), 0); }
+
+// Up to four segments near a point and their shares (label 0 = empty slot).
+struct LsfShares${s} { l : array<i32, 4>, w : array<f32, 4> };
+fn ${P}_add(sh : ptr<function, LsfShares${s}>, l : i32, a : f32) {
+  for (var k = 0; k < 4; k = k + 1) {
+    if ((*sh).l[k] == l || (*sh).l[k] == 0) { (*sh).l[k] = l; (*sh).w[k] = (*sh).w[k] + a; return; }
+  }
+}
+// The shares of the segments at a grid position: each of the 8 voxels around it gives its trilinear
+// weight to its own segment and, near a wall, part of it to the other segment, in proportion of the
+// shares baked there. Labels are never interpolated, so there is always a definite segment at a point.
+fn ${P}_shares(gp : vec3<f32>) -> LsfShares${s} {
+  var sh : LsfShares${s};
+  for (var k = 0; k < 4; k = k + 1) { sh.l[k] = 0; sh.w[k] = 0.0; }
+  let dimsI = vec3<i32>(u_material.${P}_dims.xyz);
+  let base = floor(gp);
+  let f = gp - base;
+  var total = 0.0;
+  for (var c = 0; c < 8; c = c + 1) {
+    let o = vec3<i32>(c & 1, (c >> 1u) & 1, c >> 2u);
+    let v = clamp(vec3<i32>(base) + o, vec3<i32>(0), dimsI - vec3<i32>(1));
+    let e = textureLoad(t_lsl${s}, v, 0);
+    let own = i32(e.r + 0.5);
+    if (own == 0) { continue; }
+    let aw = mix(vec3<f32>(1.0) - f, f, vec3<f32>(o));
+    let w = max(aw.x * aw.y * aw.z, 1.0e-4);
+    total = total + w;
+    let other = i32(e.g + 0.5);
+    if (other == 0) { ${P}_add(&sh, own, w); }
+    else { ${P}_add(&sh, own, w * e.b); ${P}_add(&sh, other, w * (1.0 - e.b)); }
+  }
+  if (total > 0.0) { for (var k = 0; k < 4; k = k + 1) { sh.w[k] = sh.w[k] / total; } }
+  return sh;
+}
+fn ${P}_shareOf(sh : LsfShares${s}, l : i32) -> f32 {
+  var r = 0.0;
+  for (var k = 0; k < 4; k = k + 1) { if (l > 0 && sh.l[k] == l) { r = sh.w[k]; } }
+  return r;
+}
+// The segment with the largest share, not counting one (0 if none).
+fn ${P}_largest(sh : LsfShares${s}, excl : i32) -> i32 {
+  var l = 0;
+  var w = -1.0;
+  for (var k = 0; k < 4; k = k + 1) {
+    if (sh.l[k] > 0 && sh.l[k] != excl && sh.w[k] > w) { l = sh.l[k]; w = sh.w[k]; }
+  }
+  return l;
+}
+// The segment at a point; in a block with no wall it is that of the nearest voxel (one texel read).
+fn ${P}_label(wp : vec3<f32>) -> i32 {
+  let gp = ${P}_gp(wp);
+  let nv = clamp(vec3<i32>(floor(gp + vec3<f32>(0.5))), vec3<i32>(0), vec3<i32>(u_material.${P}_dims.xyz) - vec3<i32>(1));
+  if (textureLoad(t_lsb${s}, nv / ${LABEL_SURFACE_BLOCK}, 0).r == 0u) { return i32(textureLoad(t_lsl${s}, nv, 0).r + 0.5); }
+  return ${P}_largest(${P}_shares(gp), 0);
+}
+fn ${P}_diffG(gp : vec3<f32>, la : i32, lb : i32) -> f32 {
+  let sh = ${P}_shares(gp);
+  return ${P}_shareOf(sh, la) - ${P}_shareOf(sh, lb);
+}
+fn ${P}_diff(wp : vec3<f32>, la : i32, lb : i32) -> f32 { return ${P}_diffG(${P}_gp(wp), la, lb); }
+fn ${P}_over(acc : vec4<f32>, c : vec4<f32>) -> vec4<f32> { return acc + (1.0 - acc.a) * c; }
+// Lit exactly as SegmentField lights its surfaces, so the two renderers differ only in geometry and colour.
+fn ${P}_lit(col : vec3<f32>, nIn : vec3<f32>, rd : vec3<f32>, a : f32) -> vec4<f32> {
+  var n = nIn;
+  if (dot(n, -rd) < 0.0) { n = -n; }
+  let ka = u_material.${P}_shade.x; let kd = u_material.${P}_shade.y;
+  let ks = u_material.${P}_shade.z; let shn = u_material.${P}_shade.w;
+  let ldn = max(dot(-rd, n), 0.0);
+  let refl = normalize(2.0 * ldn * n + rd);
+  let rdv = max(dot(refl, -rd), 0.0);
+  var lit = col * ka + col * (kd * ldn) + vec3<f32>(ks * pow(rdv, max(shn, 1.0)));
+  lit = srgb2physical(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)));
+  return vec4<f32>(lit * a, a);
+}
+// The colour of a point of the outer surface: its own segment's, turning to the neighbour's across
+// about seamPx pixels at the seam (the share difference changes by about one per voxel), weighted by
+// the two opacities so a nearly transparent neighbour hardly tints an opaque segment's edge.
+fn ${P}_faceColor(wc : vec3<f32>, l : i32, sh : LsfShares${s}) -> vec3<f32> {
+  let pc = ${P}_pal(l);
+  var col = pc.rgb;
+  let nb = ${P}_largest(sh, l);
+  if (nb > 0) {
+    let diff = ${P}_shareOf(sh, l) - ${P}_shareOf(sh, nb);
+    let seam = u_material.${P}_opts.w;
+    var wgt = select(0.0, 1.0, diff >= 0.0);
+    if (seam > 0.0) {
+      let pxVox = distance(u_cam.eye.xyz, wc) / max(u_cam.size.z, 1.0e-6) / max(u_material.${P}_dims.w, 1.0e-6);
+      wgt = clamp(0.5 + 0.5 * diff / max(pxVox * seam, 1.0e-3), 0.0, 1.0);
+    }
+    let nc = ${P}_pal(nb);
+    let nw = (1.0 - wgt) * nc.a;
+    col = mix(col, nc.rgb, nw / max(wgt * pc.a + nw, 1.0e-6));
+  }
+  return col;
+}
+// A face of the outer surface at wc, of segment l \u2014 or, given a normal (a clip cap), a face with that normal.
+fn ${P}_surfaceFace(wc : vec3<f32>, rd : vec3<f32>, l : i32, nGiven : vec3<f32>) -> vec4<f32> {
+  if (l <= 0) { return vec4<f32>(0.0); }
+  let a = ${P}_pal(l).a * u_material.${P}_opts.x;
+  if (a <= 0.0) { return vec4<f32>(0.0); }
+  var n = nGiven;
+  if (dot(n, n) < 0.25) {
+    // \xB1 half a voxel along each grid axis (one voxel in all; not more: a structure may be one voxel thick).
+    let t = ${P}_tex(wc);
+    let hd = vec3<f32>(0.5) / u_material.${P}_dims.xyz;
+    let gi = vec3<f32>(
+      ${P}_surft(t + vec3<f32>(hd.x, 0.0, 0.0)) - ${P}_surft(t - vec3<f32>(hd.x, 0.0, 0.0)),
+      ${P}_surft(t + vec3<f32>(0.0, hd.y, 0.0)) - ${P}_surft(t - vec3<f32>(0.0, hd.y, 0.0)),
+      ${P}_surft(t + vec3<f32>(0.0, 0.0, hd.z)) - ${P}_surft(t - vec3<f32>(0.0, 0.0, hd.z)));
+    let g = ${P}_gridToWorld(gi);
+    n = select(-rd, normalize(g), length(g) > 1.0e-6);
+  }
+  return ${P}_lit(${P}_faceColor(wc, l, ${P}_shares(${P}_gp(wc))), n, rd, a);
+}
+// The wall where the ray passes from segment la (at pa) into lb (at pb): where their shares are
+// equal. Two faces: la's (the segment the ray leaves), then lb's.
+fn ${P}_wall(pa : vec3<f32>, pb : vec3<f32>, la : i32, lb : i32, rd : vec3<f32>) -> vec4<f32> {
+  let ca = ${P}_pal(la);
+  let cb = ${P}_pal(lb);
+  let aA = ca.a * u_material.${P}_opts.x;
+  let aB = cb.a * u_material.${P}_opts.x;
+  let omitA = u_material.${P}_opts.z < 0.5 && aA < 0.999 && aB >= 0.999;
+  if ((aA <= 0.0 || omitA) && aB <= 0.0) { return vec4<f32>(0.0); }
+  // Bisect on the share difference (positive at pa, negative at pb), then interpolate the last bracket.
+  var a = 0.0;
+  var b = 1.0;
+  var da = 1.0e-4;
+  var db = -1.0e-4;
+  for (var i = 0; i < 8; i = i + 1) {
+    // i = 0, 1: the two ends; then the bisection.
+    let m = select(0.5 * (a + b), f32(i), i < 2);
+    let dm = ${P}_diff(mix(pa, pb, m), la, lb);
+    if (i == 0) { da = max(dm, 1.0e-4); } else if (i == 1) { db = min(dm, -1.0e-4); }
+    else if (dm > 0.0) { a = m; da = dm; } else { b = m; db = dm; }
+  }
+  let pw = mix(pa, pb, a + (b - a) * clamp(da / max(da - db, 1.0e-6), 0.0, 1.0));
+  // The normal: the gradient of the share difference, from four points at the vertices of a tetrahedron
+  // 0.7 voxel out along each grid axis.
+  let gpw = ${P}_gp(pw);
+  var tet = array<vec3<f32>, 4>(vec3<f32>(1.0, -1.0, -1.0), vec3<f32>(-1.0, -1.0, 1.0), vec3<f32>(-1.0, 1.0, -1.0), vec3<f32>(1.0, 1.0, 1.0));
+  var gg = vec3<f32>(0.0);
+  for (var v = 0; v < 4; v = v + 1) { gg = gg + tet[v] * ${P}_diffG(gpw + 0.7 * tet[v], lb, la); }
+  let g = ${P}_gridToWorld(gg);
+  let n = select(-rd, normalize(g), length(g) > 1.0e-6);
+  var acc = vec4<f32>(0.0);
+  if (aA > 0.0 && !omitA) { acc = ${P}_over(acc, ${P}_lit(ca.rgb, n, rd, aA)); }
+  if (aB > 0.0) { acc = ${P}_over(acc, ${P}_lit(cb.rgb, n, rd, aB)); }
+  return acc;
+}
+// The outer surface between pa and pb, which are on opposite sides of it: bisect, then interpolate
+// the last bracket.
+fn ${P}_cross(pa : vec3<f32>, pb : vec3<f32>, sa0 : f32, sb0 : f32) -> vec3<f32> {
+  let inA = sa0 < 0.0;
+  var a = 0.0;
+  var b = 1.0;
+  var sa = sa0;
+  var sb = sb0;
+  for (var i = 0; i < 6; i = i + 1) {
+    let m = 0.5 * (a + b);
+    let sm = ${P}_surf(mix(pa, pb, m));
+    if ((sm < 0.0) == inA) { a = m; sa = sm; } else { b = m; sb = sm; }
+  }
+  let den = sa - sb;
+  let fr = select(0.5, clamp(sa / den, 0.0, 1.0), abs(den) > 1.0e-9);
+  return mix(pa, pb, a + (b - a) * fr);
+}
+// What a sample's stretch of ray crosses, in ray order: outer faces (kind 1: at p0, of segment l0),
+// walls (kind 2: from p0 in l0 to p1 in l1) and clip caps (kind 3: at p0, of l0, normal p1). Collected first and shaded in ONE loop, so the
+// shading code is in the shader once \u2014 inlined at several call sites it was large enough to slow
+// every step of the march, not just the ones that hit something.
+struct LsfEvents${s} { n : i32, kind : array<i32, 4>, p0 : array<vec3<f32>, 4>, p1 : array<vec3<f32>, 4>, l0 : array<i32, 4>, l1 : array<i32, 4> };
+fn ${P}_push(ev : ptr<function, LsfEvents${s}>, kind : i32, p0 : vec3<f32>, p1 : vec3<f32>, l0 : i32, l1 : i32) {
+  let i = (*ev).n;
+  if (i < 4) { (*ev).kind[i] = kind; (*ev).p0[i] = p0; (*ev).p1[i] = p1; (*ev).l0[i] = l0; (*ev).l1[i] = l1; (*ev).n = i + 1; }
+}
+// The events on the stretch pa -> pb, which crosses the outer surface at most once.
+fn ${P}_events(pa : vec3<f32>, pb : vec3<f32>, sa : f32, sb : f32, ev : ptr<function, LsfEvents${s}>) {
+  let inA = sa < 0.0;
+  let inB = sb < 0.0;
+  if (!inA && !inB) { return; }
+  let walls = u_material.${P}_opts.y > 0.5;
+  var la = 0;
+  var lb = 0;
+  if (walls && inA) { la = ${P}_label(pa); }
+  if (walls && inB) { lb = ${P}_label(pb); }
+  if (inA != inB) {
+    let wc = ${P}_cross(pa, pb, sa, sb);
+    let lc = ${P}_label(wc);
+    if (inB) {
+      // Into the surface, then perhaps through a wall before pb.
+      ${P}_push(ev, 1, wc, wc, lc, 0);
+      if (walls && lc > 0 && lb > 0 && lb != lc) { ${P}_push(ev, 2, wc, pb, lc, lb); }
+    } else if (walls && la > 0 && lc > 0 && la != lc) {
+      // Through a wall, then out of the segment the ray is in.
+      ${P}_push(ev, 2, pa, wc, la, lc);
+      ${P}_push(ev, 1, wc, wc, lc, 0);
+    } else {
+      ${P}_push(ev, 1, wc, wc, select(lc, la, la > 0), 0);
+    }
+    return;
+  }
+  // Inside at both ends: a wall if the segment changed \u2014 or two, if a segment thinner than the step
+  // lies between (the middle is in another segment).
+  if (!walls || la == 0 || lb == 0) { return; }
+  if (la != lb) { ${P}_push(ev, 2, pa, pb, la, lb); return; }
+  let pm = 0.5 * (pa + pb);
+  let lm = ${P}_label(pm);
+  if (lm != 0 && lm != la) { ${P}_push(ev, 2, pa, pm, la, lm); ${P}_push(ev, 2, pm, pb, lm, la); }
+}
+fn sample_field_${P}(wp : vec3<f32>, rd : vec3<f32>, ds : f32) -> vec4<f32> {
+  if (u_material.${P}_opts.x <= 0.0) { return vec4<f32>(0.0); }
+  var L = max(ds, 1.0e-4);
+  var back = wp - rd * L;
+  var cap = vec3<f32>(0.0);${this.clippable ? `
+  // The stretch may start on the cut-away side of a clip plane (wp is on the kept side, or this would
+  // not be called): start it at the plane, and if the plane is inside a segment, that is a face (cap).
+  let ccount = u32(u_material.clip_count.x);
+  var fc = -1.0;
+  for (var ci = 0u; ci < ccount; ci = ci + 1u) {
+    let cp = u_material.clip_planes[ci];
+    let db = dot(back, cp.xyz) + cp.w;
+    if (db < 0.0) {
+      let f = -db / max(dot(wp, cp.xyz) + cp.w - db, 1.0e-9);
+      if (f > fc) { fc = f; cap = -cp.xyz; }
+    }
+  }
+  if (fc >= 0.0) { let f = min(fc, 1.0); back = mix(back, wp, f); L = max(L * (1.0 - f), 1.0e-4); }` : ""}
+  let s1 = ${P}_surf(wp);
+  let s0 = ${P}_surf(back);
+  var pts = array<vec3<f32>, 3>(back, wp, wp);
+  var ss = array<f32, 3>(s0, s1, s1);
+  var stretches = 1;
+  if (s0 >= 0.0 && s1 >= 0.0) {
+    // Outside at both ends. A structure thinner than the step can still lie between, but only if the
+    // two distances to the surface add up to less than the stretch; then look at three points inside it.
+    stretches = 0;
+    if (s0 + s1 < 1.5 * L) {
+      for (var k = 1; k <= 3; k = k + 1) {
+        let pk = back + rd * (L * f32(k) * 0.25);
+        let sk = ${P}_surf(pk);
+        if (sk < 0.0) { pts[1] = pk; ss[1] = sk; stretches = 2; break; }
+      }
+    }
+    if (stretches == 0) { return vec4<f32>(0.0); }
+  }
+  var ev : LsfEvents${s};
+  ev.n = 0;${this.clippable ? `
+  if (dot(cap, cap) > 0.25 && s0 < 0.0) { ${P}_push(&ev, 3, back, cap, ${P}_label(back), 0); }` : ""}
+  for (var j = 0; j < stretches; j = j + 1) { ${P}_events(pts[j], pts[j + 1], ss[j], ss[j + 1], &ev); }
+  var acc = vec4<f32>(0.0);
+  for (var i = 0; i < ev.n; i = i + 1) {
+    var c = vec4<f32>(0.0);
+    if (ev.kind[i] == 2) { c = ${P}_wall(ev.p0[i], ev.p1[i], ev.l0[i], ev.l1[i], rd); }
+    else { c = ${P}_surfaceFace(ev.p0[i], rd, ev.l0[i], select(vec3<f32>(0.0), ev.p1[i], ev.kind[i] == 3)); }
+    acc = ${P}_over(acc, c);
+  }
+  return acc;
+}`
+    );
+  }
+  fillUniforms(out, off) {
+    out.set(this.p2t, off);
+    const d = this.baker.dims;
+    out[off + 16] = d[0];
+    out[off + 17] = d[1];
+    out[off + 18] = d[2];
+    out[off + 19] = this.minSp;
+    out[off + 20] = this.opacity;
+    out[off + 21] = this.walls ? 1 : 0;
+    out[off + 22] = this.bothFaces ? 1 : 0;
+    out[off + 23] = this.seamPx;
+    out[off + 24] = this.shade[0];
+    out[off + 25] = this.shade[1];
+    out[off + 26] = this.shade[2];
+    out[off + 27] = this.shade[3];
+    out[off + 28] = this.baker.skipMarginMm();
+    out[off + 29] = this.maxSp;
+    out[off + 30] = LABEL_SURFACE_BLOCK;
+    out[off + 31] = this.minSp;
+    out[off + 32] = this.box[0][0];
+    out[off + 33] = this.box[0][1];
+    out[off + 34] = this.box[0][2];
+    out[off + 36] = this.box[1][0];
+    out[off + 37] = this.box[1][1];
+    out[off + 38] = this.box[1][2];
+  }
+  bindEntries(_s, base) {
+    return [
+      { binding: base, resource: this.baker.surfaceTexture().createView() },
+      { binding: base + 1, resource: this.baker.sharesTexture().createView() },
+      { binding: base + 2, resource: this.baker.blockTexture().createView() },
+      { binding: base + 3, resource: this.baker.paletteTexture().createView() }
+    ];
   }
 };
 
@@ -4697,19 +6419,51 @@ function invertAffine(m) {
     1
   ];
 }
-var SegmentationLogic = class {
+var SegmentationLogic = class _SegmentationLogic {
   constructor(device, seg, opts = {}) {
     this.seg = seg;
-    this.renderMode = opts.renderMode ?? "sdf";
+    this.device = device;
+    let mode = opts.renderMode ?? "label";
+    if (mode === "label" && seg.dims.some((d) => d + 6 > LABEL_SURFACE_MAX_DIM)) {
+      console.warn(`SegmentationLogic: ${seg.dims.join("\xD7")} is too large for the label renderer; using sdf`);
+      mode = "sdf";
+    }
+    this.renderMode = mode;
     this.sigma = opts.sigmaVoxels ?? 1;
     this.bandMm = opts.bandMm;
     this.opacity = opts.opacity ?? 1;
     this.refineDelayMs = opts.refineDelayMs ?? 180;
     this.boundaryMode = opts.boundaryMode ?? "outer";
     this.clippable = opts.clippable ?? false;
+    this.regionReflood = opts.regionReflood ?? false;
+    this.lsRender = { ...this.lsRender, ...opts.labelRender };
+    if (this.renderMode === "label") {
+      this.lsb = new LabelSurfaceBaker(
+        device,
+        seg.masterTexture(),
+        seg.dims,
+        seg.ijkToRAS,
+        { ...opts.labelBake, sigmaVoxels: this.sigma, sourceSpacingMm: opts.sourceSpacingMm }
+      );
+      this.setLabelColor(1, opts.color ?? [0.3, 0.85, 0.55]);
+      this.bakeLabels();
+      this.unsubDirty = seg.onDirty(() => {
+        this.labelsDirty = true;
+        if (this.bakePending) return;
+        this.bakePending = true;
+        queueMicrotask(() => {
+          this.bakePending = false;
+          if (this.labelsDirty) {
+            this.bakeLabels();
+            this.notify();
+          }
+        });
+      });
+      return;
+    }
     this.setLabelColor(1, opts.color ?? [0.3, 0.85, 0.55]);
     if (this.renderMode === "sdf") {
-      this.sdf = new JfaSdfBaker(device, seg.masterTexture(), seg.dims, seg.ijkToRAS, 1, 2, this.boundaryMode);
+      this.sdf = new JfaSdfBaker(device, seg.masterTexture(), seg.dims, seg.ijkToRAS, this.sigma, 2, this.boundaryMode);
     } else {
       this.baker = new ColorizeBaker(device, seg.masterTexture(), seg.dims);
       this.presenceTex = this.baker.output();
@@ -4724,7 +6478,18 @@ var SegmentationLogic = class {
   }
   renderMode;
   clippable;
-  attrSettleTimer;
+  lsb;
+  // label path
+  lsf;
+  lsRender = { walls: true, bothFaces: true, seamPx: 1 };
+  visibilityDirty = false;
+  // label: a segment was shown or hidden since the last bake
+  labelsDirty = false;
+  // label: the labelmap was edited since the last bake
+  bakePending = false;
+  // label: a bake is queued for the end of this task
+  /** label mode: GPU time of the last bake, ms (to queue completion; 0 until the first one lands). */
+  lastBakeMs = 0;
   sdf;
   // sdf path
   baker;
@@ -4738,16 +6503,36 @@ var SegmentationLogic = class {
   modePalette = new Float32Array(256 * 4);
   // label id → (.x = shading mode: 0 surface / 1 volume) — sdf only
   segField;
+  device;
   redrawCbs = [];
   unsubDirty;
   refineTimer;
   refineDelayMs;
   // quiescence before the settle-refine (sdf mode; capability-tuned)
   boundaryMode;
+  regionReflood;
+  notify() {
+    for (const cb of this.redrawCbs) cb();
+  }
+  /** label: one full bake (palette included), timed to queue completion. */
+  bakeLabels() {
+    const t0 = performance.now();
+    this.lsb.bake();
+    this.visibilityDirty = false;
+    this.labelsDirty = false;
+    this.device.queue.onSubmittedWorkDone().then(() => {
+      this.lastBakeMs = performance.now() - t0;
+    });
+  }
   /** Assign a display colour to a label id (0..255). Keeps the current opacity (defaults to 1 =
-   *  opaque). Takes effect on the next rebake. */
+   *  opaque). Takes effect on the next rebake (label mode: refineNow(), a palette write). */
   setLabelColor(id, rgb) {
     if (id < 1 || id > 255) return;
+    if (this.lsb) {
+      const first = this.lsb.labelOpacity(id) === 0;
+      if (this.lsb.setLabel(id, rgb, first ? 1 : null)) this.visibilityDirty = true;
+      return;
+    }
     const o = id * 4;
     this.palette[o] = rgb[0];
     this.palette[o + 1] = rgb[1];
@@ -4758,10 +6543,15 @@ var SegmentationLogic = class {
    *  rendering (see through outer segments to inner ones). Rebake/refine to apply. */
   setLabelOpacity(id, opacity) {
     if (id < 1 || id > 255) return;
+    if (this.lsb) {
+      if (this.lsb.setLabel(id, null, opacity)) this.visibilityDirty = true;
+      return;
+    }
     this.palette[id * 4 + 3] = Math.max(0, Math.min(1, opacity));
   }
   /** Per-segment shading (sdf mode): "surface" = crisp SDF shell (surface model), "volume" = DVR fill
-   *  of the interior (translucent cloud). Rebake/refine to apply. */
+   *  of the interior (translucent cloud). Rebake/refine to apply. The label renderer draws every
+   *  segment as a surface and ignores this. */
   setLabelShading(id, shading) {
     if (id < 1 || id > 255) return;
     this.modePalette[id * 4] = shading === "volume" ? 1 : 0;
@@ -4786,6 +6576,12 @@ var SegmentationLogic = class {
   /** Run the settle-refine now (JFA+2 + tighter distance blur + colour-seam blur), then redraw.
    *  Public so a test — or an app that knows the edit is done — can force the high-quality bake. */
   refineNow() {
+    if (this.lsb) {
+      if (this.visibilityDirty || this.labelsDirty) this.bakeLabels();
+      else this.lsb.flushPalette();
+      this.notify();
+      return;
+    }
     if (this.refineTimer !== void 0) {
       clearTimeout(this.refineTimer);
       this.refineTimer = void 0;
@@ -4803,8 +6599,24 @@ var SegmentationLogic = class {
    *  With `regionRAS` (the bbox of the labels whose opacity changed): the finalize AND the
    *  seam blur run region-limited in one shot — full settled quality lands immediately, no
    *  two-phase. Without it: full-volume fast pass + a debounced full-volume seam blur. */
-  /** RAS bbox → padded-SDF-grid ijk bbox with an M-voxel margin (shell band + blur radii). */
-  regionToIjk(regionRAS, M = 8) {
+  /** RAS bbox → padded-SDF-grid ijk bbox with an M-voxel HALO.
+   *
+   *  The halo is not just room for the shell band and the blur radii. A region re-flood reuses the
+   *  previous flood's seeds outside the box, and a seed OUTSIDE the box that pointed at a surface
+   *  just DELETED inside it is stale — a voxel in the box that taps it inherits a phantom surface
+   *  that is no longer there. Re-initialising over a wide halo rebuilds those seeds, so the halo has
+   *  to be at least as wide as the spacing to the next real structure (~15-20 mm between vertebrae);
+   *  at 8 voxels it was not, and one arrow step left a sliver of the hidden level on screen. The box
+   *  is still a few per cent of the grid, so this costs essentially nothing (measured: a level step
+   *  stays ~14 ms against ~390 ms for a full rebake). */
+  static HALO = 32;
+  // voxels of re-initialised ring around a region patch
+  /** Largest JFA step a region patch may use: capped so a tap (reach = 2·step - 1) stays inside the
+   *  halo this patch re-seeded, and can never read a seed left over from an older bake. */
+  static haloMaxStep() {
+    return 1 << Math.floor(Math.log2((_SegmentationLogic.HALO + 1) / 2));
+  }
+  regionToIjk(regionRAS, M = _SegmentationLogic.HALO) {
     const inv = invertAffine(this.sdf.sdfIjkToRAS());
     const lo = [Infinity, Infinity, Infinity];
     const hi = [-Infinity, -Infinity, -Infinity];
@@ -4829,8 +6641,20 @@ var SegmentationLogic = class {
    *  refine quality — JFA re-flood, finalize, seam blurs — over just the region, immediately.
    *  Small regions bake in ~ms, so stepping through per-label visibility stays real-time. */
   rebakeShellRegion(regionRAS) {
+    if (this.lsb) {
+      this.bakeLabels();
+      this.notify();
+      return;
+    }
     if (!this.sdf) {
       this.rebake();
+      return;
+    }
+    const region = this.regionToIjk(regionRAS);
+    const core = this.regionToIjk(regionRAS, 0);
+    const reach = 2 * _SegmentationLogic.haloMaxStep();
+    if (!this.regionReflood || [0, 1, 2].some((d) => core.hi[d] - core.lo[d] > reach)) {
+      this.refineNow();
       return;
     }
     if (this.refineTimer !== void 0) {
@@ -4839,10 +6663,14 @@ var SegmentationLogic = class {
     }
     this.sdf.setPalette(this.palette);
     this.sdf.setModePalette(this.modePalette);
-    this.sdf.refineRegion(this.regionToIjk(regionRAS));
+    this.sdf.refineRegion(region, _SegmentationLogic.haloMaxStep());
     for (const cb of this.redrawCbs) cb();
   }
   refreshOpacity(regionRAS) {
+    if (this.lsb) {
+      this.refineNow();
+      return;
+    }
     if (!this.sdf) {
       this.rebake();
       return;
@@ -4853,20 +6681,17 @@ var SegmentationLogic = class {
       for (const cb of this.redrawCbs) cb();
       return;
     }
-    this.sdf.rebakeAttr(false);
+    this.sdf.rebakeAttr(true);
     for (const cb of this.redrawCbs) cb();
-    if (this.attrSettleTimer !== void 0) clearTimeout(this.attrSettleTimer);
-    this.attrSettleTimer = setTimeout(() => {
-      this.attrSettleTimer = void 0;
-      if (this.sdf) {
-        this.sdf.blurAttrOnly();
-        for (const cb of this.redrawCbs) cb();
-      }
-    }, 600);
   }
-  /** A SegmentField bound to the shared render texture — hand this to the SceneRenderer once; edits
-   *  update it in place. Colour comes from the texture (per-label); the uniform supplies opacity. */
+  /** The field to hand to the SceneRenderer once; edits update its textures in place. label mode: a
+   *  LabelSurfaceField; otherwise a SegmentField whose colour comes from the texture (per-label) and
+   *  whose uniform supplies the global opacity. */
   field() {
+    if (this.lsb) {
+      if (!this.lsf) this.lsf = new LabelSurfaceField(this.lsb, { ...this.lsRender, opacity: this.opacity, clippable: this.clippable });
+      return this.lsf;
+    }
     if (!this.segField) {
       const tex = this.sdf ? this.sdf.sdfTexture() : this.presenceTex;
       const voxelMm = Math.min(...this.seg.spacingMm());
@@ -4886,6 +6711,8 @@ var SegmentationLogic = class {
         // per-segment opacity (sdf)
         interfaceMode
       });
+      this.segField.setVoxelMode(this.renderMode === "sdf" && this.sigma <= 0);
+      this.segField.setSmoothingVox(this.sigma);
     }
     return this.segField;
   }
@@ -4894,6 +6721,68 @@ var SegmentationLogic = class {
   setGlobalOpacity(o) {
     this.opacity = o;
     this.segField?.setOpacity(o);
+    this.lsf?.setOpacity(o);
+  }
+  /** label mode: the bake options (σ, outer surface, deepest voxel, gap fill, thin rule). */
+  bakeOptions() {
+    return this.lsb?.options();
+  }
+  /** label mode: change bake options and re-bake. */
+  setBakeOptions(o) {
+    if (!this.lsb) return;
+    if (o.sigmaVoxels !== void 0) this.sigma = Math.max(0, o.sigmaVoxels);
+    this.lsb.setOptions(o);
+    this.bakeLabels();
+    this.notify();
+  }
+  /** label mode: walls / both faces / seam width (uniforms; the caller syncs the scene on redraw). */
+  renderOptions() {
+    return { ...this.lsRender };
+  }
+  setRenderOptions(o) {
+    this.lsRender = { ...this.lsRender, ...o };
+    if (this.lsf) {
+      this.lsf.setWalls(this.lsRender.walls);
+      this.lsf.setBothFaces(this.lsRender.bothFaces);
+      this.lsf.setSeamPx(this.lsRender.seamPx);
+    }
+    this.notify();
+  }
+  /** GPU bytes the render path holds, counting the master labelmap. */
+  byteSize() {
+    if (this.lsb) {
+      const [x2, y2, z2] = this.lsb.dims;
+      return x2 * y2 * z2 * LabelSurfaceBaker.bytesPerVoxel();
+    }
+    if (this.sdf) return this.sdf.byteSize();
+    const [x, y, z] = this.seg.dims;
+    return x * y * z * (8 + 4);
+  }
+  /** Surface smoothing, σ in VOXELS (0 = none) — the RECONSTRUCTION WIDTH of the band-limited label
+   *  field. In sdf/outer mode the rendered surface is the 0.5 level set of p = G_σ * 1(label != 0):
+   *  σ ≈ 0.5 is the grid's Nyquist limit, the most faithful rendition of the labels that is not
+   *  aliased; below that it approaches the trilinear (voxel-faceted) reconstruction and at 0 it
+   *  switches to literal cubes; above it the surface is deliberately modelled, trading ≈ σ²/2R of
+   *  inward motion on convex features for smoothness. In interface ("all") mode σ still only blurs
+   *  the shading distance. In surface (Gaussian presence) mode it is the presence-field Gaussian.
+   *
+   *  Re-bakes immediately (fast path, so a slider stays responsive) and schedules the settle
+   *  refine, exactly as an edit does. */
+  setSmoothing(sigmaVoxels) {
+    if (this.lsb) {
+      this.setBakeOptions({ sigmaVoxels });
+      return;
+    }
+    this.sigma = Math.max(0, sigmaVoxels);
+    this.sdf?.setSmoothing(this.sigma);
+    this.segField?.setSmoothingVox(this.sigma);
+    this.segField?.setVoxelMode(this.renderMode === "sdf" && this.sigma <= 0);
+    if (this.sdf) this.sdf.resmooth();
+    else this.baker.bakeInto(this.presenceTex, this.palette, this.sigma);
+    for (const cb of this.redrawCbs) cb();
+  }
+  smoothing() {
+    return this.sigma;
   }
   /** Notified after every edit (post-rebake) so the app can redraw. */
   onRedraw(cb) {
@@ -4905,6 +6794,7 @@ var SegmentationLogic = class {
     this.sdf?.destroy();
     this.baker?.destroy();
     this.presenceTex?.destroy();
+    this.lsb?.destroy();
   }
 };
 
@@ -5364,7 +7254,6 @@ var RemindScene = class {
     const editable = new EditableSegmentation(dev, cap.dims, { ijkToRAS: cap.ijkToRAS });
     editable.loadLabelmap(cap.lab);
     const logic = new SegmentationLogic(dev, editable, {
-      renderMode: "sdf",
       boundaryMode: "outer",
       opacity: 1,
       clippable: true
@@ -5387,15 +7276,21 @@ var RemindScene = class {
     row.scene.setBackground(0.03, 0.04, 0.07);
   }
   // ── linked patient-space navigation ────────────────────────────────────────
-  /** Where a RAS focus point falls in this row's own bbox, as the 0..1 scrub offset. */
-  offset01(row, orient, focus) {
-    const a = orient === "axial" ? 2 : orient === "coronal" ? 1 : 0;
-    const lo = row.rasLo[a], hi = row.rasHi[a];
-    return hi === lo ? 0.5 : Math.max(0, Math.min(1, (focus[a] - lo) / (hi - lo)));
-  }
-  /** Point every loaded row's in-plane view at the same patient-space frame. */
-  applyFrame(orient, centerRAS, fovMm) {
-    for (const r of this.readyRows()) r.slice.setMirrorFrame(orient, centerRAS, fovMm, fovMm);
+  // The scrub position of a RAS focus point is each row's own SliceRenderer.offset01Along:
+  // it projects the point on the plane's CURRENT normal, so a row addresses the same slice
+  // whether the basis is anatomical or a volume's oblique frame. (An axis-aligned fraction of
+  // the row's bbox — what this used to be — put rows with different boxes on different oblique
+  // planes the moment a native frame was chosen.)
+  /** Point every loaded row's in-plane view at the same patient-space frame: `fovMm` is the
+   *  span across the canvas HEIGHT (the same vertical convention as the 3D camera's viewAngle)
+   *  and `aspectWH` is that canvas's width/height. The aspect has to go in: setMirrorFrame
+   *  bakes the fitted span at the frame's aspect into a per-row zoom, and the renderer unbakes
+   *  it at the canvas's aspect — for a non-square cell those only cancel when the two aspects
+   *  agree. Passing a square fov into tall cells left every row at a DIFFERENT scale (2x for
+   *  ReMIND-044's 44 x 100 mm sagittal US against a 287 x 217 mm MR), so a pan shared in mm
+   *  moved the ultrasound across the MR with every axial scroll. */
+  applyFrame(orient, centerRAS, fovMm, aspectWH = 1) {
+    for (const r of this.readyRows()) r.slice.setMirrorFrame(orient, centerRAS, fovMm * aspectWH, fovMm);
   }
   frameBases = null;
   frameKey = null;
@@ -5811,8 +7706,15 @@ async function main() {
   const userTookOver = () => {
     autoFrame = false;
   };
+  const aspectFor = (o) => {
+    for (const r of cmpRows) {
+      const c = cv.get(canvasKey(r, o, "b"));
+      if (c && c.clientHeight > 0 && c.clientWidth > 0) return c.clientWidth / c.clientHeight;
+    }
+    return 1;
+  };
   const applyFrames = () => {
-    for (const o of ORIENTS) sc.applyFrame(o, viewCenter, fovMm);
+    for (const o of ORIENTS) sc.applyFrame(o, viewCenter, fovMm, aspectFor(o));
   };
   let link3d = true;
   const camDist = () => Math.hypot(
@@ -5847,7 +7749,7 @@ async function main() {
   const drawSliceTo = (row, o, id) => {
     const c = cv.get(id);
     if (!c || !c.width || row.state !== "ready" || !shown[o]) return;
-    row.slice.setPlane(o, sc.offset01(row, o, focus));
+    row.slice.setPlane(o, row.slice.offset01Along(o, focus));
     row.slice.renderToView(cx.get(id).getCurrentTexture().createView({ format: srgb }), c.width, c.height);
   };
   const draw3dTo = (row, id) => {
@@ -5914,7 +7816,7 @@ async function main() {
           const s = rasToScreen3D(camera, xhair.ras, w, h);
           if (s) drawCross(o.g, s.x * w, s.y * h);
         } else {
-          const pr = row.slice.rasToView(k, sc.offset01(row, k, focus), xhair.ras, w / h);
+          const pr = row.slice.rasToView(k, row.slice.offset01Along(k, focus), xhair.ras, w / h);
           if (pr.u >= 0 && pr.u <= 1 && pr.v >= 0 && pr.v <= 1) drawCross(o.g, pr.u * w, pr.v * h);
         }
       }
@@ -5948,8 +7850,8 @@ async function main() {
   const adoptFrame = (row, o, canvas) => {
     const aspect = aspectOf(canvas);
     userTookOver();
-    viewCenter = row.slice.viewToRas(o, sc.offset01(row, o, focus), 0.5, 0.5, aspect);
-    fovMm = row.slice.spanMmFor(o) / Math.max(1e-6, row.slice.zoom(o));
+    viewCenter = row.slice.viewToRas(o, row.slice.offset01Along(o, focus), 0.5, 0.5, aspect);
+    fovMm = row.slice.mirrorFrame(o, aspect).fovY;
     applyFrames();
     syncCameraToFov();
   };
@@ -5963,13 +7865,9 @@ async function main() {
         step: (fwd) => {
           const row = leader();
           if (row?.state !== "ready") return;
-          const axis = o === "axial" ? 2 : o === "coronal" ? 1 : 0;
-          const f = [...focus];
-          f[axis] = Math.max(row.rasLo[axis], Math.min(
-            row.rasHi[axis],
-            f[axis] + Math.max(0.2, row.vol.vox) * (fwd ? 1 : -1)
-          ));
-          focus = f;
+          const n = row.slice.basisOf(o).nDir;
+          const d = Math.max(0.2, row.vol.vox) * (fwd ? 1 : -1);
+          focus = row.slice.clampAlongNormal(o, [focus[0] + n[0] * d, focus[1] + n[1] * d, focus[2] + n[2] * d]);
         },
         redraw: () => {
           const row = leader();
@@ -5986,7 +7884,7 @@ async function main() {
         if (!isShiftHover(e) || row?.state !== "ready") return;
         if (!xhair.visible) xhair.toggle(true);
         const { u, v, aspect } = uvOf(canvas, e);
-        const ras = row.slice.viewToRas(o, sc.offset01(row, o, focus), u, v, aspect);
+        const ras = row.slice.viewToRas(o, row.slice.offset01Along(o, focus), u, v, aspect);
         xhair.set(ras);
         jumpTo(ras);
       });
@@ -6325,6 +8223,7 @@ async function main() {
         canvas.height = h;
       }
     }
+    applyFrames();
     renderJumps();
     requestDraw();
   };
@@ -6444,7 +8343,7 @@ async function main() {
     fov: () => fovMm,
     offsets: () => sc.readyRows().map((r) => ({
       key: r.key,
-      off: Object.fromEntries(ORIENTS.map((o) => [o, sc.offset01(r, o, focus)]))
+      off: Object.fromEntries(ORIENTS.map((o) => [o, r.slice.offset01Along(o, focus)]))
     })),
     camera: () => ({
       position: [...camera.position],
@@ -6490,8 +8389,8 @@ async function main() {
       const r = sc.row(k);
       if (r?.state !== "ready") return null;
       return {
-        fov: r.slice.spanMmFor(o) / Math.max(1e-6, r.slice.zoom(o)),
-        center: r.slice.viewToRas(o, sc.offset01(r, o, focus), 0.5, 0.5, 1)
+        fov: r.slice.mirrorFrame(o, aspectFor(o)).fovY,
+        center: r.slice.viewToRas(o, r.slice.offset01Along(o, focus), 0.5, 0.5, 1)
       };
     },
     link3d: () => link3d,

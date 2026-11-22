@@ -2274,6 +2274,21 @@ var ImageField = class {
   volumeTexture() {
     return this.volTex;
   }
+  /** Overwrite `depth` z-slices of the volume starting at `z`, in place. The bind group holds a
+   *  stable view of volTex, so a render after this picks the new voxels up with no rebuild —
+   *  which is what lets a volume be allocated first and filled as its slices arrive. `data` is
+   *  one slab in the texture's own dtype (f32 unless the volume was created from a Uint8Array). */
+  updateSlab(z, data, depth = 1) {
+    const [nx, ny, nz] = this.dims;
+    if (z < 0 || z + depth > nz) return;
+    const bpe = data instanceof Uint8Array ? 1 : 4;
+    this.dev.queue.writeTexture(
+      { texture: this.volTex, origin: { x: 0, y: 0, z } },
+      data,
+      { offset: 0, bytesPerRow: nx * bpe, rowsPerImage: ny },
+      [nx, ny, depth]
+    );
+  }
   /** r8unorm volumes sample /255, so clim is packed /normScale in the shader; a slice plane sharing this
    *  texture must use the same factor. 1 for f32 volumes. */
   normScaleOf() {
@@ -2409,6 +2424,13 @@ var SegmentField = class {
   interfaceMode;
   voxelMm = 1;
   providesSkip;
+  /** The band-limited SOLID path: sdf mode, outer boundary, with the attr texture that carries the
+   *  band-limited label field. This is the only variant that uses the interval crossing test. */
+  outerSolid;
+  /** Interval sampling (Field): the shader is handed the ray distance back to THIS field's previous
+   *  sample, so consecutive intervals tile the ray exactly — what makes the crossing test immune to
+   *  the per-step ray jitter and to an empty-space leap. */
+  intervalSampling;
   constructor(tex, dims, spacing, opts) {
     this.tex = tex;
     const center = opts.center ?? [0, 0, 0];
@@ -2435,12 +2457,28 @@ var SegmentField = class {
     this.interfaceMode = this.mode === "sdf" && (opts.interfaceMode ?? false);
     this.attrTex = this.mode === "sdf" ? opts.attrTexture : void 0;
     this.bindingCount = this.attrTex ? 2 : 1;
+    this.outerSolid = this.mode === "sdf" && !this.interfaceMode && !!this.attrTex;
+    this.intervalSampling = this.outerSolid;
   }
   /** Field-level opacity (multiplies every segment's per-label opacity in the shader). Live global
    *  segmentation opacity — the caller does scene.syncUniforms() + redraw to apply. */
   setOpacity(o) {
     this.opacity = Math.max(0, Math.min(1, o));
   }
+  /** Render the sdf field as VOXEL CUBES instead of its smooth iso-surface (sdf mode only).
+   *  What "no smoothing" should mean for a labelmap: one cube per voxel, flat-shaded per face. */
+  setVoxelMode(on) {
+    this.voxelMode = on;
+  }
+  voxelMode = false;
+  /** Reconstruction width σ (VOXELS) of the band-limited label field the sdf surface is the 0.5
+   *  level set of. The field itself is baked by JfaSdfBaker (attr.b); the renderer only needs σ to
+   *  keep the sphere-trace skip from leaping over a surface that has moved off the sharp one.
+   *  Caller does scene.syncUniforms(). */
+  setSmoothingVox(sigmaVoxels) {
+    this.sigmaVox = Math.max(0, sigmaVoxels);
+  }
+  sigmaVox = 0;
   uniformFloats() {
     return 36;
   }
@@ -2473,8 +2511,27 @@ fn skip_seg${s}(wp : vec3<f32>) -> f32 {
     let q = abs(transform_point_seg${s}(wp) - cen) - ext;
     return max(0.0, length(max(q, vec3<f32>(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0));
   }
-  let d = abs(textureSampleLevel(t_seg${s}, s_lin, t, 0.0).a);                  // |distance to surface| (mm)
-  return max(0.0, d - u_material.seg${s}_params.x - u_material.seg${s}_params.y);   // leap toward the shell (band + 1 voxel safe)
+  let sd = textureSampleLevel(t_seg${s}, s_lin, t, 0.0).a;                      // SIGNED distance to the labelmap surface (mm)
+  // An UNSEEDED voxel \u2014 one the jump flood never reached a seed from \u2014 reports 1e3 mm. That is not a
+  // distance, it is "unknown", and leaping on it sails through whatever surface is really there,
+  // which is how a partial re-flood used to come back as a flat cut across the shell. No real SDF
+  // grid here spans 500 mm, so treat anything beyond that as unknown and march instead of leaping.
+  if (abs(sd) > 500.0) { return 0.0; }
+  // params.w = \u03C3 in mm. The rendered surface is the band-limited field's 0.5 level set, which sits
+  // within ~\u03C3 of this sharp one, so the leap has to stop that much short of it or a \u03C3-wide feature
+  // can be jumped clean over.
+  var leap = max(0.0, abs(sd) - u_material.seg${s}_params.x - u_material.seg${s}_params.y - u_material.seg${s}_params.w);
+${this.clippable && this.outerSolid ? `  // INSIDE the solid, a clip plane is a surface too (the cut face). Leaping on |sd| alone would sail
+  // past it \u2014 the ray enters through the clip, sees a big interior distance, and jumps to the far
+  // wall, so the cap never gets sampled. Clamp the leap to the nearest plane while inside.
+  if (sd < 0.0) {
+    let ccount = u32(u_material.clip_count.x);
+    for (var ci = 0u; ci < ccount; ci = ci + 1u) {
+      let cp = u_material.clip_planes[ci];
+      leap = min(leap, abs(dot(wp, cp.xyz) + cp.w));
+    }
+  }` : ``}
+  return leap;
 }`
     );
   }
@@ -2486,7 +2543,7 @@ fn skip_seg${s}(wp : vec3<f32>) -> f32 {
       `  seg${s}_shade : vec4<f32>,`,
       // ka, kd, ks, shininess
       `  seg${s}_params : vec4<f32>,`,
-      // band_mm, voxel_mm, _, _
+      // band_mm, voxel_mm, voxel_cubes, smoothing_mm
       `  seg${s}_bmin : vec4<f32>,`,
       // aabb min (RAS) — for a contract-valid skip outside the texture
       `  seg${s}_bmax : vec4<f32>,`
@@ -2532,8 +2589,8 @@ fn attr_seg${s}(wp : vec3<f32>) -> vec2<f32> {   // per-segment (.x = opacity, .
   let t = t4.xyz;
   if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { return vec2<f32>(0.0); }
   return textureSampleLevel(t_attr${s}, s_lin, t, 0.0).rg;
-}` : ""}${this.interfaceMode ? `
-fn bdist_seg${s}(wp : vec3<f32>) -> f32 {   // SMOOTH (seam-blurred) interface distance from attr.b \u2014 for the normal only
+}` : ""}${this.interfaceMode && this.attrTex ? `
+fn bdist_seg${s}(wp : vec3<f32>) -> f32 {   // SMOOTHED interface distance from attr.b (interface mode)
   let t4 = u_material.seg${s}_p2t * vec4<f32>(transform_point_seg${s}(wp), 1.0);
   let t = clamp(t4.xyz, vec3<f32>(0.0), vec3<f32>(1.0));
   return textureSampleLevel(t_attr${s}, s_lin, t, 0.0).b;
@@ -2543,7 +2600,16 @@ fn pres_seg${s}(wp : vec3<f32>) -> f32 {   // CRISP in-segment presence (attr.a)
   let t = t4.xyz;
   if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { return 0.0; }
   return textureSampleLevel(t_attr${s}, s_lin, t, 0.0).a;
-}
+}` : ""}${this.outerSolid ? `
+fn pfield_seg${s}(wp : vec3<f32>) -> f32 {
+  // THE BAND-LIMITED LABEL FIELD: p = G_\u03C3 * 1(label != 0), carried in attr.b (JfaSdfBaker finalize
+  // writes the 0/1 indicator there, the attr blur low-passes it at the smoothing \u03C3). Clamped to the
+  // texture edge so a gradient tap just outside the padded grid reads real background instead of a
+  // cull sentinel. The surface is the p = 0.5 level set of this, and nothing else.
+  let t4 = u_material.seg${s}_p2t * vec4<f32>(transform_point_seg${s}(wp), 1.0);
+  let t = clamp(t4.xyz, vec3<f32>(0.0), vec3<f32>(1.0));
+  return textureSampleLevel(t_attr${s}, s_lin, t, 0.0).b;
+}` : ""}${this.interfaceMode ? `
 fn g1_seg${s}(c : f32, wp : vec3<f32>, dir : vec3<f32>, h : f32) -> f32 {
   // One-sided difference of the SMOOTH interface distance along dir, picking the STEEPER side. The
   // unsigned distance has a V-crease at the surface: a central difference straddling it cancels (fake
@@ -2555,9 +2621,202 @@ fn g1_seg${s}(c : f32, wp : vec3<f32>, dir : vec3<f32>, h : f32) -> f32 {
   let dm = c - bdist_seg${s}(wp - dir * h);
   return select(dm, dp, abs(dp) > abs(dm)) / h;
 }` : ""}
-// Shell (surface) contribution at wp: crisp Phong shell around sdf=0. Weighted by (1-mode) so it
-// morphs smoothly into the volume contribution across a blurred surface\u2194volume boundary.
-fn surface_seg${s}(wp : vec3<f32>, rd : vec3<f32>, sdf : f32, band : f32, step : f32, seg_op : f32, op0 : f32) -> vec4<f32> {
+// VOXEL CUBES (params.z): the labelmap AS SEGMENTED, one cube per voxel, flat-shaded per face.
+//
+// This exists because reading the distance field with LINEAR sampling cannot produce it. The zero
+// level set of a Euclidean distance field is a smooth surface, and its gradient \u2014 the shading
+// normal \u2014 has RIDGES along the medial lines where the distances from neighbouring source voxels
+// meet. Turning the blur off therefore does not reveal voxels; it reveals those ridges, which is
+// what "no smoothing" used to look like.
+//
+// So this path never interpolates: it reads the same texture with textureLoad at the voxel the
+// sample falls in. That voxel is solid iff ITS OWN CENTRE is inside (.a < 0), the surface is the
+// cube faces of the solid voxels, and the normal is the face normal \u2014 constant across each face,
+// which is what makes a face read as a face. A face whose neighbour is also solid is interior and
+// draws nothing, so the result is the outside of the voxel set, not a lattice.
+//
+// It is still the same ray-march through the same field: no geometry is built, and the opacity
+// uses the same shell profile as the smooth path, measured to the cube face instead of to the
+// iso-surface, so the opacity controls behave identically at every smoothing setting.
+fn solid_seg${s}(ix : vec3<i32>) -> bool {
+  // "Is this voxel part of the segmentation?" \u2014 which channel answers that depends on the field.
+  // The signed (outer) field says it with the sign of the distance; the multi-material INTERFACE
+  // field's distance is UNSIGNED (it measures to the nearest label change, not to the outside),
+  // so there it is the crisp per-voxel presence in the attr texture that knows. Reading the sign
+  // of an unsigned field is how voxel mode first came out completely empty on every nested
+  // segmentation \u2014 which is every segmentation with a tumour inside an organ.
+${this.interfaceMode && this.attrTex ? `  return textureLoad(t_attr${s}, ix, 0).a > 0.5;` : `  return textureLoad(t_seg${s}, ix, 0).a < 0.0;`}
+}
+fn voxels_seg${s}(wp : vec3<f32>, rd : vec3<f32>, band : f32, step : f32, seg_op : f32, op0 : f32) -> vec4<f32> {
+  let t4 = u_material.seg${s}_p2t * vec4<f32>(transform_point_seg${s}(wp), 1.0);
+  let t = t4.xyz;
+  if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { return vec4<f32>(0.0); }
+  let dimsf = vec3<f32>(textureDimensions(t_seg${s}));
+  let ci = floor(t * dimsf - vec3<f32>(0.5) + vec3<f32>(0.5));   // the voxel this sample is in
+  let idx = vec3<i32>(ci);
+  let me = textureLoad(t_seg${s}, idx, 0);
+  if (!solid_seg${s}(idx)) { return vec4<f32>(0.0); }  // this voxel's centre is outside the segmentation
+  // A face perpendicular to texture axis k has texture-space normal e_k; a normal maps from
+  // texture to world by the TRANSPOSE of the world\u2192texture linear part (row k of p2t).
+  let M = u_material.seg${s}_p2t;
+  var rows = array<vec3<f32>, 3>(
+    normalize(vec3<f32>(M[0][0], M[1][0], M[2][0])),
+    normalize(vec3<f32>(M[0][1], M[1][1], M[2][1])),
+    normalize(vec3<f32>(M[0][2], M[1][2], M[2][2])));
+  var offs = array<vec3<i32>, 6>(
+    vec3<i32>(1, 0, 0), vec3<i32>(-1, 0, 0), vec3<i32>(0, 1, 0),
+    vec3<i32>(0, -1, 0), vec3<i32>(0, 0, 1), vec3<i32>(0, 0, -1));
+  // Which faces of this cube are EXPOSED (their neighbour is outside)? Of those, shade the one
+  // the ray meets most squarely. Picking the geometrically nearest face instead leaves the
+  // surface stippled: a ray crossing near a cube's edge is often nearest an INTERIOR face, and
+  // that sample then draws nothing even though the cube is visible there.
+  let lim = vec3<i32>(dimsf) - vec3<i32>(1);
+  var bestDot = -2.0;
+  var n = vec3<f32>(0.0);
+  var exposed = false;
+  var open = array<bool, 6>(false, false, false, false, false, false);
+  for (var f = 0; f < 6; f = f + 1) {
+    if (solid_seg${s}(clamp(idx + offs[f], vec3<i32>(0), lim))) { continue; }   // interior face
+    open[f] = true;
+    exposed = true;
+    let sgn = select(-1.0, 1.0, (f & 1) == 0);
+    let nw = rows[f >> 1] * sgn;
+    let dd = -dot(nw, rd);
+    if (dd > bestDot) { bestDot = dd; n = nw; }
+  }
+  if (!exposed) { return vec4<f32>(0.0); }             // fully buried voxel \u2014 the shell is one cube thick
+  // Which face did the ray actually come IN through? That \u2014 not the face most square to the
+  // camera \u2014 is what makes a cube read as a cube: the step faces catch the light differently
+  // from the faces around them, which is the whole visual signal that this is voxels. Slab
+  // entry test in voxel space; if that face turns out to be interior (possible when the march
+  // steps past a thin feature), fall back to the exposed face the ray meets most squarely.
+  let rv = vec3<f32>(
+    dot(vec3<f32>(M[0][0], M[1][0], M[2][0]), rd),
+    dot(vec3<f32>(M[0][1], M[1][1], M[2][1]), rd),
+    dot(vec3<f32>(M[0][2], M[1][2], M[2][2]), rd)) * dimsf;
+  let r = t * dimsf - vec3<f32>(0.5) - ci;             // position within the voxel, [-0.5, 0.5]
+  var tIn = -1e9;
+  var face = -1;
+  if (abs(rv.x) > 1e-6) { let tk = (-0.5 * sign(rv.x) - r.x) / rv.x; if (tk > tIn) { tIn = tk; face = select(1, 0, rv.x < 0.0); } }
+  if (abs(rv.y) > 1e-6) { let tk = (-0.5 * sign(rv.y) - r.y) / rv.y; if (tk > tIn) { tIn = tk; face = select(3, 2, rv.y < 0.0); } }
+  if (abs(rv.z) > 1e-6) { let tk = (-0.5 * sign(rv.z) - r.z) / rv.z; if (tk > tIn) { tIn = tk; face = select(5, 4, rv.z < 0.0); } }
+  if (face >= 0 && open[face]) {
+    n = rows[face >> 1] * select(-1.0, 1.0, (face & 1) == 0);
+  }
+${this.attrTex ? `  let at = textureLoad(t_attr${s}, idx, 0);
+  let vop = at.r;                                      // per-segment opacity, this voxel's own
+  let vcol = me.rgb / max(vop, 1e-3);                  // un-premultiply` : `  let vop = seg_op;
+  let vcol = me.rgb;`}
+  let T = clamp(op0 * vop, 0.0, 1.0);
+  if (T <= 0.0) { return vec4<f32>(0.0); }
+  // Optical depth calibrated so crossing ONE voxel accumulates exactly T \u2014 the cube-sized
+  // equivalent of the shell profile the smooth path uses, so the opacity controls mean the same
+  // thing at every smoothing setting.
+  let vox = max(u_material.seg${s}_params.y, 1e-4);
+  let rate = max(abs(dot(rd, n)), 1e-3);
+  let tau = -log(1.0 - min(T, 0.9999)) * (step * rate) / vox;
+  let op = 1.0 - exp(-tau);
+  if (op <= 0.0004) { return vec4<f32>(0.0); }
+  let ka = u_material.seg${s}_shade.x; let kd = u_material.seg${s}_shade.y;
+  let ldn = max(dot(-rd, n), 0.0);
+  // Faces need to differ in brightness by WHICH WAY THEY FACE, not by how square they are to the
+  // camera. A head-lit cube surface viewed down one of its own axes has every visible face at the
+  // same angle to the light, and with ka+kd \u2248 1 they all clip to the same flat colour \u2014 which is
+  // exactly what "voxel mode" looked like before this: a flat silhouette with stepped edges.
+  // A fixed overhead sky term (superior-facing brightest, inferior darkest, sides between) makes
+  // each face of each cube read separately from any viewpoint, which is the whole point of the
+  // mode. No specular: a highlight across flat faces reads as curvature.
+  let sky = 0.55 + 0.45 * clamp(0.5 + 0.5 * n.z, 0.0, 1.0);
+  var lit = vcol * sky * (ka + kd * ldn);
+  lit = srgb2physical(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)));
+  return vec4<f32>(lit * op, op);
+}
+// Surface contribution at wp: a crisp Phong surface. Weighted by (1-mode) so it morphs smoothly
+// into the volume contribution across a blurred surface\u2194volume boundary.
+fn surface_seg${s}(wp : vec3<f32>, rd : vec3<f32>, ds : f32, sdf : f32, band : f32, step : f32, seg_op : f32, op0 : f32) -> vec4<f32> {
+  if (u_material.seg${s}_params.z > 0.5) { return voxels_seg${s}(wp, rd, band, step, seg_op, op0); }
+${this.outerSolid ? `  // A BAND-LIMITED SOLID, found by an INTERVAL CROSSING TEST.
+  //
+  // A labelmap is a SAMPLED indicator function, and its voxel steps are above the grid's Nyquist
+  // limit \u2014 they are aliasing, not anatomy. So the faithful surface is the 0.5 level set of that
+  // indicator RECONSTRUCTED with a kernel at the limit: p = G_\u03C3 * 1(label != 0), which the baker
+  // low-passes into attr.b and the smoothing control sets the \u03C3 of. Reconstructing with plain
+  // trilinear interpolation instead (what \u03C3\u21920 gives) reproduces the ALIASED surface \u2014 flat voxel
+  // faces and chamfered edges, which is the chunk. Band-limited, the surface still passes through
+  // the voxel faces but carries no energy above Nyquist, which is the smooth.
+  //
+  // This MOVES the geometry with \u03C3, which earlier versions refused to do because smoothing the
+  // signed DISTANCE closed the disc space between two vertebrae and fused them. A BOUNDED
+  // indicator cannot: at the centre of a 4-voxel gap p \u2248 2\xB7\u03A6(-2) \u2248 0.05, nowhere near 0.5. What it
+  // does cost is the curvature term, \u2248 \u03C3\xB2/2R inward on a convex ridge of radius R \u2014 a quarter of a
+  // voxel at \u03C3=1 on a 2-voxel vertebral process. Bounded and predictable, which is the trade a
+  // smoothing control is supposed to offer.
+  //
+  // WHY A CROSSING TEST AND NOT A SHELL BAND. A band wants the PERPENDICULAR distance to the
+  // surface, and the only way to get that from a scalar field is (0.5 - p)/|grad p| \u2014 which falls
+  // apart exactly where |grad p| collapses: concave creases where two surfaces meet, and thin
+  // features. There the estimated distance diverges, no sample falls inside the band, and an
+  // OPAQUE segment renders dusty, with background showing through it. (Measured on a sphere with a
+  // plate through it: 5-7% of interior pixels leaking, up to 31% on a single pixel; the shell-band
+  // design leaked 8-15%.) The test p > 0.5 has no such failure: it is well defined everywhere, so
+  // asking whether THIS interval contains the crossing cannot miss a surface, at any \u03C3, curvature or
+  // incidence. Field.intervalSampling hands us the exact distance back to this field's previous
+  // sample, so consecutive intervals tile the ray with no gap and no overlap \u2014 which is what makes
+  // the test exact under the per-step ray jitter, and across an empty-space leap.
+  let p1 = pfield_seg${s}(wp);
+  let back = wp - rd * max(ds, 1.0e-4);
+  let p0 = pfield_seg${s}(back);
+  let in1 = p1 > 0.5;
+  let in0 = p0 > 0.5;
+  var capNormal = vec3<f32>(0.0);
+  var prevClipped = false;` : ``}${this.outerSolid && this.clippable ? `
+  // SOLID: where a clip plane cuts the body, the body has a FACE there. The ray enters the kept
+  // half-space already inside the solid \u2014 no surface crossing \u2014 so the cut would be a hole into a
+  // bubble unless we treat that entry as a face of its own, with the plane's normal. The previous
+  // sample is the test: if it was on the discarded side, this interval crossed the plane.
+  let ccount = u32(u_material.clip_count.x);
+  for (var ci = 0u; ci < ccount; ci = ci + 1u) {
+    let cp = u_material.clip_planes[ci];
+    if (dot(back, cp.xyz) + cp.w < 0.0) { prevClipped = true; capNormal = -cp.xyz; }
+  }` : ``}${this.outerSolid ? `
+  let surfaceCross = in1 != in0;
+  if (!(surfaceCross || (in1 && prevClipped))) { return vec4<f32>(0.0); }
+  // Where in the interval: linear in p, which is exact to first order and sub-voxel in practice.
+  let u = select(1.0, clamp((0.5 - p0) / (p1 - p0), 0.0, 1.0), surfaceCross);
+  let wc = back + (wp - back) * u;
+  let T = clamp(op0 * seg_op, 0.0, 1.0);
+  if (T <= 0.0) { return vec4<f32>(0.0); }
+  // Normal from a FULL-VOXEL central difference of p. attr.b is read trilinearly, so the field is
+  // only C0 and its gradient jumps at every voxel-face plane; differencing inside a single cell
+  // (h = half a voxel) reports that cell's own gradient and the jumps show up as a rectangular
+  // lattice of dark creases over the surface \u2014 a maze, worst at small \u03C3 where the field is
+  // steepest. A full-voxel difference straddles the discontinuity and averages it out. Geometry
+  // and normal now come from the SAME field, which is what stops a stepped silhouette from being
+  // lit like a smooth one.
+  let hg = max(u_material.seg${s}_params.y, step);
+  let gp = vec3<f32>(
+    pfield_seg${s}(wc + vec3<f32>(hg,0,0)) - pfield_seg${s}(wc - vec3<f32>(hg,0,0)),
+    pfield_seg${s}(wc + vec3<f32>(0,hg,0)) - pfield_seg${s}(wc - vec3<f32>(0,hg,0)),
+    pfield_seg${s}(wc + vec3<f32>(0,0,hg)) - pfield_seg${s}(wc - vec3<f32>(0,0,hg))) / (2.0 * hg);
+  let glen = length(gp);
+  // p increases INWARD, so the outward normal is -grad p. On a cap (entered through a clip plane
+  // with no crossing) the face is the plane, so its normal is the plane's.
+  var n = select(capNormal, -gp / max(glen, 1.0e-6), surfaceCross && glen > 1.0e-5);
+  if (dot(n, n) < 0.25) { n = -rd; }     // degenerate: face the camera rather than drop the sample
+  if (dot(n, -rd) < 0.0) { n = -n; }
+  // ONE crossing = exactly the target opacity T, by construction \u2014 no band, no profile integral,
+  // no dependence on the sample step or the incidence angle. Front and back faces of a translucent
+  // segment still compose to 1-(1-T)\xB2, as a pair of polydata surfaces would.
+  let op = T;
+  let ka = u_material.seg${s}_shade.x; let kd = u_material.seg${s}_shade.y;
+  let ks = u_material.seg${s}_shade.z; let sh = u_material.seg${s}_shade.w;
+  let ldn = max(dot(-rd, n), 0.0);
+  let refl = normalize(2.0 * ldn * n + rd);
+  let rdv = max(dot(refl, -rd), 0.0);
+  let col = col_seg${s}(wc);
+  var lit = col * ka + col * (kd * ldn) + vec3<f32>(ks * pow(rdv, max(sh, 1.0)));
+  lit = srgb2physical(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)));
+  return vec4<f32>(lit * op, op);` : `
   let d_mm = abs(sdf);
   if (d_mm > band + step) { return vec4<f32>(0.0); }
   let T = clamp(op0 * seg_op, 0.0, 1.0);      // TARGET surface opacity (per-segment \xD7 field)
@@ -2573,7 +2832,7 @@ ${this.interfaceMode ? `  let hg = 1.5 * step;
     vgrad_seg${s}(wp + vec3<f32>(0,h,0)) - vgrad_seg${s}(wp - vec3<f32>(0,h,0)),
     vgrad_seg${s}(wp + vec3<f32>(0,0,h)) - vgrad_seg${s}(wp - vec3<f32>(0,0,h))) / (2.0 * h);`}
   let glen = length(g);
-  if (glen < 1e-5) { return vec4<f32>(0.0); }
+  if (glen < 1.0e-5) { return vec4<f32>(0.0); }
   var n = g / glen;
   if (dot(n, -rd) < 0.0) { n = -n; }
   // SURFACE opacity (Slicer polydata parity): the shell is a THIN surface of opacity T, not a solid
@@ -2585,11 +2844,7 @@ ${this.interfaceMode ? `  let hg = 1.5 * step;
   // built-in silhouette AA).
   let a = max(1.0 - d_mm / band, 0.0);
   if (a <= 0.0) { return vec4<f32>(0.0); }
-  // Convert ray-step to d_mm-distance. Outer: RAW gradient projection |dot(rd,g)| = |d(d_mm)/ds|
-  // (includes |grad sdf|, which the distance blur pulls below 1). Interface: the re-signed gradient has
-  // an arbitrary magnitude (a sign jump at the interface), so use the UNIT normal cosine |dot(rd,n)| \u2014
-  // still \u21920 at grazing (silhouette AA), and keeps opacity thickness-consistent.
-  let rate = max(abs(dot(rd, ${this.interfaceMode ? "n" : "g"})), 1e-3);
+  let rate = max(abs(dot(rd, ${this.interfaceMode ? "n" : "g"})), 1.0e-3);
   let tau = -log(1.0 - min(T, 0.9999)) * (a / band) * (step * rate);
   var op = 1.0 - exp(-tau);
 ${this.interfaceMode ? `  op = op * pres_seg${s}(wp);   // gate to GENUINELY in-segment voxels \u2014 kills the bled colour/opacity halo beyond the real edge` : ""}
@@ -2602,9 +2857,9 @@ ${this.interfaceMode ? `  op = op * pres_seg${s}(wp);   // gate to GENUINELY in-
   let col = col_seg${s}(wp);
   var lit = col * ka + col * (kd * ldn) + vec3<f32>(ks * pow(rdv, max(sh, 1.0)));
   lit = srgb2physical(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)));
-  return vec4<f32>(lit * op, op);
+  return vec4<f32>(lit * op, op);`}
 }
-fn sample_field_seg${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
+fn sample_field_seg${s}(wp : vec3<f32>, rd : vec3<f32>${this.intervalSampling ? ", ds : f32" : ""}) -> vec4<f32> {
   let op0 = u_material.seg${s}_color.a;
   if (op0 <= 0.0) { return vec4<f32>(0.0); }
   let sdf = v_seg${s}(wp);
@@ -2627,9 +2882,9 @@ ${this.attrTex ? `  let at = attr_seg${s}(wp);        // (opacity, shading mode)
     }
   }
   if (mode < 0.999) {
-    acc += (1.0 - mode) * surface_seg${s}(wp, rd, sdf, band, step, seg_op, op0);
+    acc += (1.0 - mode) * surface_seg${s}(wp, rd, ${this.intervalSampling ? "ds" : "step"}, sdf, band, step, seg_op, op0);
   }
-  return acc;` : `  return surface_seg${s}(wp, rd, sdf, band, step, 1.0, op0);`}
+  return acc;` : `  return surface_seg${s}(wp, rd, step, sdf, band, step, 1.0, op0);`}
 }`
       );
     }
@@ -2710,6 +2965,8 @@ fn sample_field_seg${s}(wp : vec3<f32>, rd : vec3<f32>) -> vec4<f32> {
     out[off + 23] = this.shade[3];
     out[off + 24] = this.bandMm;
     out[off + 25] = this.voxelMm;
+    out[off + 26] = this.voxelMode ? 1 : 0;
+    out[off + 27] = this.sigmaVox * this.voxelMm;
     out[off + 28] = this.box[0][0];
     out[off + 29] = this.box[0][1];
     out[off + 30] = this.box[0][2];
@@ -3562,11 +3819,24 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   // abutted (looked like half-opacity). The shader divides by the per-segment opacity to recover the
   // true colour, so a 0-opacity region contributes nothing to the blend.
   textureStore(t_out, c, vec4<f32>(pal.rgb * pal.a, sdf));
-  // .r = opacity, .g = shading mode, .b = distance (seam-blurred \u2192 SMOOTH distance for the interface-mode
-  // normal; sdfTex.a stays sharp for shell membership), .a = CRISP presence (1 inside a real segment, 0
-  // background) \u2014 the FULLBLUR carries it unblurred so the shader can tell a genuine in-segment voxel
-  // from one that merely caught BLED colour/opacity outside any segment, and gate the shell to the real edge.
-  textureStore(t_attr, c, vec4<f32>(pal.a, mode, sdf, select(0.0, 1.0, ins)));
+  // .r = opacity, .g = shading mode, .a = CRISP presence (1 inside a real segment, 0 background) \u2014
+  // the FULLBLUR carries .a unblurred so the shader can tell a genuine in-segment voxel from one that
+  // merely caught BLED colour/opacity outside any segment, and gate the shell to the real edge.
+  //
+  // .b is the BAND-LIMITED LABEL FIELD, and in outer mode it is what the surface IS. It starts as the
+  // crisp 0/1 presence and FULLBLUR low-passes it, so the shader reads p = G_\u03C3 * 1(label\u22600) and takes
+  // the surface to be its p = 0.5 level set. A labelmap is a SAMPLED indicator function: its voxel
+  // staircase is ALIASING, not data, and the faithful surface is that indicator reconstructed with a
+  // kernel at the grid's Nyquist limit \u2014 which is what the smoothing control now sets. Thresholding a
+  // BOUNDED field at 0.5 also cannot do what blurring the unbounded SIGNED DISTANCE did (fuse two
+  // vertebrae across a disc space): in the middle of a 4-voxel gap p \u2248 2\xB7\u03A6(-2) \u2248 0.05, nowhere near
+  // 0.5, so the gap stays open at every \u03C3 in range.
+  //
+  // Interface ("all") mode keeps the blurred DISTANCE here instead: its field is UNSIGNED (distance to
+  // the nearest label change), so a union indicator says nothing about the internal interfaces that
+  // mode exists to show, and its normal still comes from the smoothed distance.
+  let bchan = select(select(0.0, 1.0, ins), sdf, u.params.y > 0.5);
+  textureStore(t_attr, c, vec4<f32>(pal.a, mode, bchan, select(0.0, 1.0, ins)));
 }`
 );
 var BLUR_WGSL2 = (
@@ -3656,7 +3926,7 @@ function gaussHalfKernel2(sigma) {
   for (let i = 0; i <= radius; i++) w[i] = raw[i] / total;
   return { radius, w };
 }
-var JfaSdfBaker = class {
+var JfaSdfBaker = class _JfaSdfBaker {
   // 0 = outer boundary (signed); 1 = any label change (unsigned, multi-material)
   constructor(dev, labelTex, dims, ijkToRAS, smoothSigmaVoxels = 1, pad = 2, boundaryMode = "outer") {
     this.labelTex = labelTex;
@@ -3677,8 +3947,7 @@ var JfaSdfBaker = class {
     this.seed = [mk("rgba32float", seedUsage), mk("rgba32float", seedUsage)];
     this.sdfTex = mk("rgba16float", GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC);
     this.attrTex = mk("rgba16float", GPUTextureUsage.COPY_DST);
-    this.attrScratch = mk("rgba16float", GPUTextureUsage.COPY_SRC);
-    this.sdfScratch = mk("rgba16float", GPUTextureUsage.COPY_SRC);
+    this.scratch = mk("rgba16float", GPUTextureUsage.COPY_SRC);
     this.uni = dev.createBuffer({ size: 112, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.palBuf = dev.createBuffer({ size: 256 * 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.modeBuf = dev.createBuffer({ size: 256 * 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -3702,12 +3971,14 @@ var JfaSdfBaker = class {
   // rgba16float: .rgb = per-label colour, .a = signed dist (mm) — sampled by SegmentField
   attrTex;
   // rgba16float: .r = per-segment opacity, .g = shading mode — sampled by SegmentField
-  attrScratch;
-  // rgba16float attr-blur ping-pong
+  // ONE blur scratch, shared by the colour, distance and attribute blurs. They are the same format
+  // and size and blurStage runs them one at a time, so a second copy was 8 B per voxel of pure
+  // duplication — 12% of this pipeline, which is the difference between fitting a device and losing
+  // it. Named `scratch` rather than per-target so it cannot drift back into two.
+  scratch;
+  // rgba16float blur ping-pong (shared)
   lastSeed = 0;
   // seed buffer the last sweep finalized from
-  sdfScratch;
-  // rgba16float blur ping-pong
   uni;
   palBuf;
   // 256 × vec4 label→colour palette (.a = opacity)
@@ -3734,6 +4005,28 @@ var JfaSdfBaker = class {
   // dispatch, seeds, blur and readback all run on the PADDED grid; `dims`/`ijkToRAS` become the padded
   // grid's, and `sdfDims()`/`sdfIjkToRAS()` expose them to the SegmentField.
   bmode;
+  /** GPU bytes this baker holds, and what it WOULD hold for a given label grid.
+   *
+   *  The JFA is the memory-hungry part of the pipeline by a wide margin: the seed ping-pong is two
+   *  rgba32float volumes (32 B/voxel between them) and there are four more rgba16float volumes
+   *  (sdf, attr, and a scratch for each). On the PADDED grid that is 68 B per voxel including the
+   *  r32uint master the caller owns — so a 250³ grid is 1.06 GB, per segmentation. Two of them side
+   *  by side is how a comparison view walks off the end of a laptop's VRAM: the device is lost and
+   *  the canvas goes white, with no error a user can act on. Callers size their grid against this
+   *  (see render/gpu-budget.ts) instead of finding out the hard way. */
+  static bytesPerVoxel() {
+    return 2 * 16 + 8 + 8 + 8 + 4;
+  }
+  /** Bytes for a label grid of `dims` once padded by `pad` voxels on every side. */
+  static estimateBytes(dims, pad = 2) {
+    const n = (dims[0] + 2 * pad) * (dims[1] + 2 * pad) * (dims[2] + 2 * pad);
+    return n * _JfaSdfBaker.bytesPerVoxel();
+  }
+  /** Bytes this instance actually holds. */
+  byteSize() {
+    const n = this.dims[0] * this.dims[1] * this.dims[2];
+    return n * _JfaSdfBaker.bytesPerVoxel();
+  }
   /** The resident colorized-SDF texture (rgba16float: .rgb = per-label colour, .a = signed mm).
    *  Identity stable across bakes → the SceneRenderer bind group stays valid; a live edit updates in
    *  place. */
@@ -3813,19 +4106,42 @@ var JfaSdfBaker = class {
     i32v[27] = 0;
     this.dev.queue.writeBuffer(this.uni, 0, ab);
   }
-  /** FAST bake for LIVE editing: plain JFA (approximate) + a light distance-only blur (crisp colour
-   *  seams). Cheap, so it keeps up with an in-progress stroke; the seams stay voxel-jagged until the
-   *  edit settles and refine() runs. */
+  /** Distance-blur σ, in VOXELS, applied to the signed distance on every bake/refine (0 = none).
+   *  The zero level set barely moves, so the silhouette stays where the labelmap put it; what the
+   *  blur smooths is the GRADIENT, i.e. the shading normal — which is what turns a voxel-faceted
+   *  "golf ball" into a surface. Takes effect on the next bake(); the caller decides when that is,
+   *  since a sweep is ~20 compute passes. */
+  setSmoothing(sigmaVoxels) {
+    this.smoothSigma = Math.max(0, sigmaVoxels);
+  }
+  smoothing() {
+    return this.smoothSigma;
+  }
+  /** σ for the COLOUR-seam blur, which is NOT the geometry σ and must not follow it up.
+   *
+   *  The seam blur exists for one narrow job: the region colour is flooded per voxel, so the border
+   *  between two labels is a voxel staircase in COLOUR even when the surface is smooth. A fraction of
+   *  a voxel of blur hides that. Tying it to the geometry σ (it used to be min(1, σ)) meant that
+   *  asking for a smoother SURFACE also dissolved the label boundaries — and a boundary is the entire
+   *  signal in a comparison view. It showed up worst on the SPINEPS disc layer: a near-white disc
+   *  between two saturated vertebra colours, blurred a full voxel, reads as a milky smear over both
+   *  bones instead of a disc. Capped well below a voxel, the seam stays a seam. */
+  seamSigma() {
+    return Math.min(0.4, this.smoothSigma);
+  }
+  /** FAST bake for LIVE editing: plain JFA (approximate) + the attr blur that band-limits the label
+   *  field (no colour-seam blur). Cheap, so it keeps up with an in-progress stroke; the colour seams
+   *  stay voxel-jagged until the edit settles and refine() runs. */
   bake() {
     this.sweep([], this.smoothSigma, 0);
   }
   /** REFINE for a STATIC labelmap (run once the edit settles): JFA+2 extra passes → a near-exact
    *  Voronoi/SDF (fixes the small JFA mistakes near close/overlapping segments) and a colour-seam blur
-   *  so neighbouring-label boundaries are smooth, not a voxel staircase. Distance blur stays at the
-   *  same σ (dropping it re-introduces Voronoi facets — crispness comes from the render band, not from
-   *  under-smoothing). Higher quality lives in the resident texture, so camera renders stay cheap. */
+   *  so neighbouring-label boundaries are smooth, not a voxel staircase. The attr blur stays at the
+   *  caller's σ — it is the geometry, not a quality knob. Higher quality lives in the resident
+   *  texture, so camera renders stay cheap. */
   refine() {
-    this.sweep([2, 1], this.smoothSigma, 1);
+    this.sweep([2, 1], this.smoothSigma, this.seamSigma());
   }
   /** REGION-LIMITED refine: re-flood ONLY `regionIjk` (padded-grid coords) after a labelmap edit
    *  confined to it — a per-vertebra visibility flip re-bakes a few % of the grid instead of the
@@ -3834,7 +4150,7 @@ var JfaSdfBaker = class {
    *  taps read valid exterior seeds (surfaces just outside the region flood in correctly).
    *  Exterior distances that referenced a surface REMOVED inside the region go stale, but only
    *  ≫band away from any visible shell — invisible, and the next full sweep cleans them. */
-  refineRegion(regionIjk) {
+  refineRegion(regionIjk, maxStep = Infinity) {
     const dev = this.dev, [dx, dy, dz] = this.dims;
     const lo = [Math.max(0, regionIjk.lo[0]), Math.max(0, regionIjk.lo[1]), Math.max(0, regionIjk.lo[2])];
     const hi = [Math.min(dx, regionIjk.hi[0]), Math.min(dy, regionIjk.hi[1]), Math.min(dz, regionIjk.hi[2])];
@@ -3861,10 +4177,7 @@ var JfaSdfBaker = class {
       p2.end();
     }
     dev.queue.submit([enc.finish()]);
-    const maxDim = Math.max(rx, ry, rz);
-    const steps = [];
-    for (let s = 1 << Math.floor(Math.log2(Math.max(2, maxDim - 1))); s >= 1; s >>= 1) steps.push(s);
-    steps.push(2, 1);
+    const steps = [...this.steps.filter((v) => v <= maxStep), 2, 1];
     for (const step of steps) {
       this.writeUni(step, lo);
       const dst = src ^ 1;
@@ -3900,14 +4213,13 @@ var JfaSdfBaker = class {
     p.dispatchWorkgroups(g[0], g[1], g[2]);
     p.end();
     dev.queue.submit([enc.finish()]);
-    this.blurStage(this.blurPipe, this.smoothSigma, this.sdfTex, this.sdfScratch, region);
-    this.blurStage(this.colBlurPipe, 1, this.sdfTex, this.sdfScratch, region);
-    this.blurStage(this.fullBlurPipe, 1, this.attrTex, this.attrScratch, region);
+    if (this.seamSigma() > 0) this.blurStage(this.colBlurPipe, this.seamSigma(), this.sdfTex, this.scratch, region);
+    if (this.smoothSigma > 0) this.blurStage(this.fullBlurPipe, this.smoothSigma, this.attrTex, this.scratch, region);
   }
   /** ATTR-ONLY rebake for palette/opacity changes (per-segment visibility): the distance field
    *  doesn't move, so re-run ONLY the finalize (from the last sweep's seed) with its sdf writes
    *  routed to the scratch texture (discarded — the blurred resident sdfTex stays pristine) and
-   *  re-blur the attribute seams. ~4 passes instead of the ~20-pass init+JFA+blur sweep, which is
+   *  re-blur the attributes. ~4 passes instead of the ~20-pass init+JFA+blur sweep, which is
    *  what makes per-vertebra focus switching real-time. */
   rebakeAttr(blurSeams = false, regionIjk) {
     const dev = this.dev, [dx, dy, dz] = this.dims;
@@ -3922,7 +4234,7 @@ var JfaSdfBaker = class {
     const bf = dev.createBindGroup({ layout: this.finalPipe.getBindGroupLayout(0), entries: [
       { binding: 0, resource: this.seed[this.lastSeed].createView() },
       { binding: 1, resource: this.labelTex.createView() },
-      { binding: 2, resource: this.sdfScratch.createView() },
+      { binding: 2, resource: this.scratch.createView() },
       // sdf writes discarded
       { binding: 3, resource: { buffer: this.uni } },
       { binding: 4, resource: { buffer: this.palBuf } },
@@ -3935,12 +4247,41 @@ var JfaSdfBaker = class {
     p.dispatchWorkgroups(gx, gy, gz);
     p.end();
     dev.queue.submit([enc.finish()]);
-    if (blurSeams) this.blurStage(this.fullBlurPipe, 1, this.attrTex, this.attrScratch, region);
+    if (this.smoothSigma > 0) this.blurStage(this.fullBlurPipe, this.smoothSigma, this.attrTex, this.scratch, region);
+  }
+  /** Re-apply the SMOOTHING only: the distance field does not depend on σ, so re-running the JFA
+   *  for a smoothing change is both wasteful and WRONG — the fast bake's approximate flood differs
+   *  from the refined one by a fraction of a voxel, so the surface visibly shifted back and forth
+   *  as the control moved. This re-derives the attributes and the colour from the EXISTING seeds
+   *  (so the distance is bit-identical) and re-blurs them at the new σ. */
+  resmooth() {
+    const dev = this.dev;
+    this.writeUni(0, [0, 0, 0]);
+    const enc = dev.createCommandEncoder();
+    const bf = dev.createBindGroup({ layout: this.finalPipe.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: this.seed[this.lastSeed].createView() },
+      { binding: 1, resource: this.labelTex.createView() },
+      { binding: 2, resource: this.sdfTex.createView() },
+      // re-derive colour + the SHARP distance
+      { binding: 3, resource: { buffer: this.uni } },
+      { binding: 4, resource: { buffer: this.palBuf } },
+      { binding: 5, resource: this.attrTex.createView() },
+      { binding: 6, resource: { buffer: this.modeBuf } }
+    ] });
+    const p = enc.beginComputePass();
+    p.setPipeline(this.finalPipe);
+    p.setBindGroup(0, bf);
+    p.dispatchWorkgroups(this.g[0], this.g[1], this.g[2]);
+    p.end();
+    dev.queue.submit([enc.finish()]);
+    const seam = this.seamSigma();
+    if (seam > 0) this.blurStage(this.colBlurPipe, seam, this.sdfTex, this.scratch);
+    if (this.smoothSigma > 0) this.blurStage(this.fullBlurPipe, this.smoothSigma, this.attrTex, this.scratch);
   }
   /** Blur the attribute seams of the CURRENT attr texture in place (no re-finalize) — the
    *  cheapest possible settle after a run of rebakeAttr(false) visibility steps. */
   blurAttrOnly() {
-    this.blurStage(this.fullBlurPipe, 1, this.attrTex, this.attrScratch);
+    if (this.smoothSigma > 0) this.blurStage(this.fullBlurPipe, this.smoothSigma, this.attrTex, this.scratch);
   }
   /** One full sweep: init → JFA (schedule + extra) → finalize → blur .a → optional blur .rgb. */
   sweep(extraSteps, distSigma, colorSigma) {
@@ -3995,9 +4336,8 @@ var JfaSdfBaker = class {
     p.dispatchWorkgroups(gx, gy, gz);
     p.end();
     dev.queue.submit([enc.finish()]);
-    if (distSigma > 0) this.blurStage(this.blurPipe, distSigma, this.sdfTex, this.sdfScratch);
-    if (colorSigma > 0) this.blurStage(this.colBlurPipe, colorSigma, this.sdfTex, this.sdfScratch);
-    if (colorSigma > 0) this.blurStage(this.fullBlurPipe, colorSigma, this.attrTex, this.attrScratch);
+    if (colorSigma > 0) this.blurStage(this.colBlurPipe, colorSigma, this.sdfTex, this.scratch);
+    if (distSigma > 0) this.blurStage(this.fullBlurPipe, distSigma, this.attrTex, this.scratch);
   }
   /** 3 separable Gaussian passes with the given pipeline (which channels it blurs), tex↔scratch,
    *  ending in scratch → copied back to `tex` so its identity stays stable for the renderer. */
@@ -4049,11 +4389,1126 @@ var JfaSdfBaker = class {
     this.seed[1].destroy();
     this.sdfTex.destroy();
     this.attrTex.destroy();
-    this.attrScratch.destroy();
-    this.sdfScratch.destroy();
+    this.scratch.destroy();
     this.uni.destroy();
     this.palBuf.destroy();
     this.modeBuf.destroy();
+  }
+};
+
+// render/label-surface-bake.ts
+var DEFAULT_LABEL_SURFACE_BAKE = {
+  sigmaVoxels: 0.85,
+  outer: "twicing",
+  keepDeepest: true,
+  fillGaps: true,
+  thinRule: true
+};
+var LABEL_SURFACE_BLOCK = 4;
+var U_STRUCT = (
+  /* wgsl */
+  `
+struct U {
+  ijkToRAS : mat4x4<f32>,   // padded grid -> RAS (column-major)
+  dims : vec4<u32>,          // padded grid dims; w = pad
+  params : vec4<f32>,        // x = jump-flood step (voxels)
+  origin : vec4<i32>,        // dispatch origin (always 0 here)
+  ldims : vec4<u32>,         // label grid dims; w = flags (1 keep deepest, 2 thin rule)
+  sigma : vec4<f32>,         // xyz = \u03C3 per axis (voxels), w = \u03C3 (mm)
+  gap : vec4<f32>,           // xyz = widest gap filled per axis (voxels), w = outer mode (0 twicing, 1 blur, 2 mask, 3 sharp)
+  spacing : vec4<f32>,       // xyz = spacing (mm), w = band (mm): distances are clamped to it
+};`
+);
+var U_BYTES = 176;
+var LABELS_WGSL = (
+  /* wgsl */
+  `
+fn rawLabel(c : vec3<i32>) -> u32 {
+  let lc = c - vec3<i32>(i32(u.dims.w));
+  if (any(lc < vec3<i32>(0)) || any(lc >= vec3<i32>(u.ldims.xyz))) { return 0u; }
+  return textureLoad(t_label, lc, 0).r;
+}
+fn shownLabel(c : vec3<i32>) -> u32 {
+  let l = rawLabel(c);
+  if (l == 0u || l > 255u) { return 0u; }
+  return select(0u, l, textureLoad(t_pal, vec2<i32>(i32(l), 0), 0).a > 0.0);
+}`
+);
+var GRID_GUARD = (
+  /* wgsl */
+  `
+  let c = vec3<i32>(gid);
+  if (any(c >= vec3<i32>(u.dims.xyz))) { return; }`
+);
+var LABEL_SURFACE_MAX_DIM = 1024;
+var SEED_PACK_WGSL = (
+  /* wgsl */
+  `
+const NO_SEED = 0xffffffffu;
+fn seedPack(lo : vec3<i32>, axis : i32) -> u32 {
+  let l = vec3<u32>(max(lo, vec3<i32>(0)));
+  return l.x | (l.y << 10u) | (l.z << 20u) | (u32(axis) << 30u);
+}
+// Grid position of a seed: half a voxel along its axis from its lower voxel.
+fn seedPos(s : u32) -> vec3<f32> {
+  var p = vec3<f32>(f32(s & 1023u), f32((s >> 10u) & 1023u), f32((s >> 20u) & 1023u));
+  let a = min(s >> 30u, 2u);
+  p[a] = p[a] + 0.5;
+  return p;
+}
+// Squared distance (mm\xB2) from grid voxel c to seed s.
+fn seedDist2(c : vec3<i32>, s : u32) -> f32 {
+  let d = (u.ijkToRAS * vec4<f32>(seedPos(s) - vec3<f32>(c), 0.0)).xyz;
+  return dot(d, d);
+}`
+);
+var SHARE_PACK_WGSL = (
+  /* wgsl */
+  `
+fn sharePack(own : i32, other : i32, share : f32, near : bool) -> u32 {
+  return u32(own) | (u32(other) << 8u) | (u32(round(clamp(share, 0.0, 1.0) * 32767.0)) << 16u) | select(0u, 0x80000000u, near);
+}
+fn shareUnpack(p : u32) -> vec4<f32> {
+  return vec4<f32>(f32(p & 255u), f32((p >> 8u) & 255u), f32((p >> 16u) & 32767u) / 32767.0, f32(p >> 31u));
+}`
+);
+var MASK_WGSL = (
+  /* wgsl */
+  `${U_STRUCT}
+@group(0) @binding(0) var t_label : texture_3d<u32>;
+@group(0) @binding(1) var t_pal : texture_2d<f32>;
+@group(0) @binding(2) var t_out : texture_storage_3d<r32uint, write>;
+@group(0) @binding(3) var<uniform> u : U;
+${LABELS_WGSL}
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {${GRID_GUARD}
+  var inside = shownLabel(c) != 0u;
+  for (var axis = 0; axis < 3; axis = axis + 1) {
+    if (inside) { break; }
+    let maxGap = i32(u.gap[axis] + 0.5);
+    if (maxGap <= 0) { continue; }
+    var e = vec3<i32>(0);
+    e[axis] = 1;
+    var plus = 0;
+    var minus = 0;
+    for (var i = 1; i <= 8; i = i + 1) {
+      if (i > maxGap) { break; }
+      if (plus == 0 && shownLabel(c + e * i) != 0u) { plus = i; }
+      if (minus == 0 && shownLabel(c - e * i) != 0u) { minus = i; }
+    }
+    inside = plus > 0 && minus > 0 && plus + minus - 1 <= maxGap;
+  }
+  textureStore(t_out, c, vec4<u32>(select(0u, 1u, inside), 0u, 0u, 0u));
+}`
+);
+var SEED_WGSL = (
+  /* wgsl */
+  `${U_STRUCT}
+@group(0) @binding(0) var t_mask : texture_3d<u32>;
+@group(0) @binding(1) var t_seed_out : texture_storage_3d<r32uint, write>;
+@group(0) @binding(2) var<uniform> u : U;
+${SEED_PACK_WGSL}
+fn insideAt(c : vec3<i32>) -> bool {
+  if (any(c < vec3<i32>(0)) || any(c >= vec3<i32>(u.dims.xyz))) { return false; }
+  return textureLoad(t_mask, c, 0).r != 0u;
+}
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {${GRID_GUARD}
+  let inside = insideAt(c);
+  var best = 1.0e30;
+  var seed = NO_SEED;
+  for (var axis = 0; axis < 3; axis = axis + 1) {
+    var e = vec3<i32>(0);
+    e[axis] = 1;
+    let fd = 0.5 * u.spacing[axis];
+    let pd = insideAt(c + e) != inside;
+    let md = insideAt(c - e) != inside;
+    if (fd < best && (pd || md)) {
+      best = fd;
+      seed = seedPack(select(c - e, c, pd), axis);   // the face to +e is c's; the face to -e is (c - e)'s
+    }
+  }
+  textureStore(t_seed_out, c, vec4<u32>(seed, 0u, 0u, 0u));
+}`
+);
+var JFA_WGSL2 = (
+  /* wgsl */
+  `${U_STRUCT}
+@group(0) @binding(0) var t_in : texture_3d<u32>;
+@group(0) @binding(1) var t_out : texture_storage_3d<r32uint, write>;
+@group(0) @binding(2) var<uniform> u : U;
+${SEED_PACK_WGSL}
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {${GRID_GUARD}
+  let step = i32(u.params.x);
+  let dmax = vec3<i32>(u.dims.xyz) - vec3<i32>(1);
+  var best = textureLoad(t_in, c, 0).r;
+  var bestD = select(1.0e30, seedDist2(c, best), best != NO_SEED);
+  for (var dz = -1; dz <= 1; dz = dz + 1) {
+    for (var dy = -1; dy <= 1; dy = dy + 1) {
+      for (var dx = -1; dx <= 1; dx = dx + 1) {
+        if (dx == 0 && dy == 0 && dz == 0) { continue; }
+        let sd = textureLoad(t_in, clamp(c + vec3<i32>(dx, dy, dz) * step, vec3<i32>(0), dmax), 0).r;
+        if (sd != NO_SEED) {
+          let d = seedDist2(c, sd);
+          if (d < bestD) { bestD = d; best = sd; }
+        }
+      }
+    }
+  }
+  textureStore(t_out, c, vec4<u32>(best, 0u, 0u, 0u));
+}`
+);
+var FINAL_WGSL2 = (
+  /* wgsl */
+  `${U_STRUCT}
+@group(0) @binding(0) var t_seed : texture_3d<u32>;
+@group(0) @binding(1) var t_mask : texture_3d<u32>;
+@group(0) @binding(2) var t_dist : texture_storage_3d<r32float, write>;
+@group(0) @binding(3) var t_ind : texture_storage_3d<r32float, write>;
+@group(0) @binding(4) var<uniform> u : U;
+${SEED_PACK_WGSL}
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {${GRID_GUARD}
+  let s = textureLoad(t_seed, c, 0).r;
+  let band = u.spacing.w;
+  let d = select(band, min(sqrt(seedDist2(c, s)), band), s != NO_SEED);
+  let inside = textureLoad(t_mask, c, 0).r != 0u;
+  textureStore(t_dist, c, vec4<f32>(select(d, -d, inside), 0.0, 0.0, 0.0));
+  textureStore(t_ind, c, vec4<f32>(select(0.0, 1.0, inside), 0.0, 0.0, 0.0));
+}`
+);
+var BLUR_WGSL3 = (
+  /* wgsl */
+  `
+struct BU { dims : vec4<u32>, axis_r : vec4<u32>, w : array<vec4<f32>, 4> };
+@group(0) @binding(0) var t_in : texture_3d<f32>;
+@group(0) @binding(1) var t_out : texture_storage_3d<r32float, write>;
+@group(0) @binding(2) var<uniform> b : BU;
+fn wt(i : u32) -> f32 { return b.w[i >> 2u][i & 3u]; }
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let c = vec3<i32>(gid);
+  if (any(c >= vec3<i32>(b.dims.xyz))) { return; }
+  let dmax = vec3<i32>(b.dims.xyz) - vec3<i32>(1);
+  var av = vec3<i32>(0);
+  av[b.axis_r.x] = 1;
+  var sum = wt(0u) * textureLoad(t_in, c, 0).r;
+  let R = i32(b.axis_r.y);
+  for (var i = 1; i <= R; i = i + 1) {
+    sum = sum + wt(u32(i)) * (textureLoad(t_in, clamp(c + av * i, vec3<i32>(0), dmax), 0).r
+                            + textureLoad(t_in, clamp(c - av * i, vec3<i32>(0), dmax), 0).r);
+  }
+  textureStore(t_out, c, vec4<f32>(sum, 0.0, 0.0, 0.0));
+}`
+);
+var BU_BYTES = 96;
+var COMBINE_WGSL = (
+  /* wgsl */
+  `${U_STRUCT}
+@group(0) @binding(0) var t_dist : texture_3d<f32>;
+@group(0) @binding(1) var t_g1 : texture_3d<f32>;
+@group(0) @binding(2) var t_g2 : texture_3d<f32>;
+@group(0) @binding(3) var t_out : texture_storage_3d<rgba16float, write>;
+@group(0) @binding(4) var<uniform> u : U;
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {${GRID_GUARD}
+  let d = textureLoad(t_dist, c, 0).r;
+  let mode = u32(u.gap.w + 0.5);
+  var s = d;
+  if (mode == 0u) {
+    // Twicing: G smooths away the staircase but moves curved surfaces inwards (\u03C3\xB2/2 \xD7 curvature) and
+    // removes thin structures; 2\xB7G\xB7f \u2212 G\xB7G\xB7f cancels that to first order.
+    s = 2.0 * textureLoad(t_g1, c, 0).r - textureLoad(t_g2, c, 0).r;
+  } else if (mode == 1u) {
+    s = textureLoad(t_g1, c, 0).r;
+  } else if (mode == 2u) {
+    // The blurred inside/outside mask, crossing one half on the surface. Scaled to about a distance in
+    // mm (the mask's slope across the edge is about 1/(\u03C3\xB7sqrt(2\u03C0))) so normals and the bisection see a
+    // field of the same size as the others; only its sign and direction are used.
+    let minSp = min(u.spacing.x, min(u.spacing.y, u.spacing.z));
+    s = (0.5 - textureLoad(t_g1, c, 0).r) * max(2.5 * u.sigma.w, 1.25 * minSp);
+  }
+  if (mode <= 1u && (u.ldims.w & 1u) != 0u && d < 0.0 && s > 0.5 * d) {
+    // The deepest voxel of a structure (a local minimum of the distance) stays inside, so a structure
+    // painted in one thick slice is not smoothed out of existence.
+    let dmax = vec3<i32>(u.dims.xyz) - vec3<i32>(1);
+    var deepest = true;
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+      for (var dy = -1; dy <= 1; dy = dy + 1) {
+        for (var dx = -1; dx <= 1; dx = dx + 1) {
+          if (deepest) {
+            let n = clamp(c + vec3<i32>(dx, dy, dz), vec3<i32>(0), dmax);
+            deepest = textureLoad(t_dist, n, 0).r >= d - 1.0e-3;
+          }
+        }
+      }
+    }
+    if (deepest) { s = 0.5 * d; }
+  }
+  textureStore(t_out, c, vec4<f32>(s, d, 0.0, 0.0));
+}`
+);
+var SEGMENT_WGSL = (
+  /* wgsl */
+  `${U_STRUCT}
+@group(0) @binding(0) var t_label : texture_3d<u32>;
+@group(0) @binding(1) var t_pal : texture_2d<f32>;
+@group(0) @binding(2) var t_out : texture_storage_3d<r32uint, write>;
+@group(0) @binding(3) var<uniform> u : U;
+@group(0) @binding(4) var t_seed : texture_3d<u32>;
+${LABELS_WGSL}
+${SEED_PACK_WGSL}
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {${GRID_GUARD}
+  var l = shownLabel(c);
+  if (l == 0u) {
+    var nd = 1.0e30;
+    for (var dz = -2; dz <= 2; dz = dz + 1) {
+      for (var dy = -2; dy <= 2; dy = dy + 1) {
+        for (var dx = -2; dx <= 2; dx = dx + 1) {
+          let o = vec3<i32>(dx, dy, dz);
+          let nl = shownLabel(c + o);
+          if (nl != 0u) {
+            let dd = length(vec3<f32>(o) * u.spacing.xyz);
+            if (dd < nd) { nd = dd; l = nl; }
+          }
+        }
+      }
+    }
+  }
+  if (l == 0u) {
+    let sd = textureLoad(t_seed, c, 0).r;
+    if (sd != NO_SEED) {
+      let lo = vec3<i32>(i32(sd & 1023u), i32((sd >> 10u) & 1023u), i32((sd >> 20u) & 1023u));
+      var e = vec3<i32>(0);
+      e[min(sd >> 30u, 2u)] = 1;
+      l = shownLabel(lo);
+      if (l == 0u) { l = shownLabel(lo + e); }
+    }
+  }
+  textureStore(t_out, c, vec4<u32>(l, 0u, 0u, 0u));
+}`
+);
+var INTERFACE_WGSL = (
+  /* wgsl */
+  `${U_STRUCT}
+@group(0) @binding(0) var t_seg : texture_3d<u32>;
+@group(0) @binding(1) var t_out : texture_storage_3d<r32uint, write>;
+@group(0) @binding(2) var<uniform> u : U;
+${SHARE_PACK_WGSL}
+fn segAt(c : vec3<i32>) -> i32 {
+  return i32(textureLoad(t_seg, clamp(c, vec3<i32>(0), vec3<i32>(u.dims.xyz) - vec3<i32>(1)), 0).r);
+}
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {${GRID_GUARD}
+  let own = segAt(c);
+  var first = own;
+  var near = false;
+  for (var dz = -1; dz <= 1; dz = dz + 1) {
+    for (var dy = -1; dy <= 1; dy = dy + 1) {
+      for (var dx = -1; dx <= 1; dx = dx + 1) {
+        let l = segAt(c + vec3<i32>(dx, dy, dz));
+        if (l != 0) {
+          if (first == 0) { first = l; } else if (l != first) { near = true; }
+        }
+      }
+    }
+  }
+  if (!near || own == 0) {
+    textureStore(t_out, c, vec4<u32>(sharePack(own, 0, 1.0, near), 0u, 0u, 0u));
+    return;
+  }
+  var ownShare = 0.0;
+  var ol = array<i32, 4>(0, 0, 0, 0);
+  var os = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
+  let sg = max(min(u.sigma.xyz, vec3<f32>(1.0)), vec3<f32>(1.0e-3));
+  for (var dz = -2; dz <= 2; dz = dz + 1) {
+    for (var dy = -2; dy <= 2; dy = dy + 1) {
+      for (var dx = -2; dx <= 2; dx = dx + 1) {
+        let o = vec3<i32>(dx, dy, dz);
+        let l = segAt(c + o);
+        if (l == 0) { continue; }
+        let q = vec3<f32>(o) / sg;
+        let w = exp(-0.5 * dot(q, q));
+        if (l == own) { ownShare = ownShare + w; continue; }
+        for (var k = 0; k < 4; k = k + 1) {
+          if (ol[k] == l || ol[k] == 0) { ol[k] = l; os[k] = os[k] + w; break; }
+        }
+      }
+    }
+  }
+  var other = 0;
+  var oshare = -1.0;
+  for (var k = 0; k < 4; k = k + 1) {
+    if (ol[k] > 0 && os[k] > oshare) { other = ol[k]; oshare = os[k]; }
+  }
+  let share = ownShare / max(ownShare + max(oshare, 0.0), 1.0e-6);
+  textureStore(t_out, c, vec4<u32>(sharePack(own, other, share, true), 0u, 0u, 0u));
+}`
+);
+var THIN_WGSL = (
+  /* wgsl */
+  `${U_STRUCT}
+@group(0) @binding(0) var t_label : texture_3d<u32>;
+@group(0) @binding(1) var t_pal : texture_2d<f32>;
+@group(0) @binding(2) var t_seg : texture_3d<u32>;
+@group(0) @binding(3) var t_in : texture_3d<u32>;
+@group(0) @binding(4) var t_out : texture_storage_3d<rgba16float, write>;
+@group(0) @binding(5) var<uniform> u : U;
+${LABELS_WGSL}
+${SHARE_PACK_WGSL}
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {${GRID_GUARD}
+  var v = shareUnpack(textureLoad(t_in, c, 0).r);
+  if ((u.ldims.w & 2u) != 0u && v.a > 0.5 && v.b < 0.5) {
+    let own = textureLoad(t_seg, c, 0).r;
+    if (own != 0u && shownLabel(c) == own) {
+      let dmax = vec3<i32>(u.dims.xyz) - vec3<i32>(1);
+      var sticks = false;
+      for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+          for (var dx = -1; dx <= 1; dx = dx + 1) {
+            if (!sticks) {
+              let n = clamp(c + vec3<i32>(dx, dy, dz), vec3<i32>(0), dmax);
+              sticks = textureLoad(t_seg, n, 0).r == own && shareUnpack(textureLoad(t_in, n, 0).r).b >= v.b + 0.35;
+            }
+          }
+        }
+      }
+      if (!sticks) { v.b = 0.75; }
+    }
+  }
+  textureStore(t_out, c, v);
+}`
+);
+var BLOCK_WGSL = (
+  /* wgsl */
+  `${U_STRUCT}
+@group(0) @binding(0) var t_if : texture_3d<f32>;
+@group(0) @binding(1) var t_out : texture_storage_3d<r32uint, write>;
+@group(0) @binding(2) var<uniform> u : U;
+const BS = ${LABEL_SURFACE_BLOCK};
+@compute @workgroup_size(4, 4, 4)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let b = vec3<i32>(gid);
+  let dimsI = vec3<i32>(u.dims.xyz);
+  if (any(b >= (dimsI + vec3<i32>(BS - 1)) / BS)) { return; }
+  let first = b * BS;
+  var found = false;
+  for (var dz = -1; dz <= BS; dz = dz + 1) {
+    for (var dy = -1; dy <= BS; dy = dy + 1) {
+      for (var dx = -1; dx <= BS; dx = dx + 1) {
+        let v = first + vec3<i32>(dx, dy, dz);
+        if (!found && all(v >= vec3<i32>(0)) && all(v < dimsI)) { found = textureLoad(t_if, v, 0).a > 0.5; }
+      }
+    }
+  }
+  textureStore(t_out, b, vec4<u32>(select(0u, 1u, found), 0u, 0u, 0u));
+}`
+);
+var LabelSurfaceBaker = class {
+  constructor(dev, labelTex, labelDims, labelIjkToRAS, opts = {}, pad = 3) {
+    this.labelTex = labelTex;
+    this.dev = dev;
+    this.opts = { ...DEFAULT_LABEL_SURFACE_BAKE, ...opts };
+    this.pad = pad;
+    this.labelDims = [labelDims[0], labelDims[1], labelDims[2]];
+    this.dims = [labelDims[0] + 2 * pad, labelDims[1] + 2 * pad, labelDims[2] + 2 * pad];
+    const m = labelIjkToRAS.slice();
+    for (let r = 0; r < 3; r++) m[r * 4 + 3] -= pad * (m[r * 4] + m[r * 4 + 1] + m[r * 4 + 2]);
+    this.ijkToRAS = m;
+    const col = (c) => Math.hypot(m[c], m[4 + c], m[8 + c]);
+    this.spacing = [col(0), col(1), col(2)];
+    this.blockDims = this.dims.map((d) => Math.ceil(d / LABEL_SURFACE_BLOCK));
+    if (this.dims.some((d) => d > LABEL_SURFACE_MAX_DIM)) {
+      throw new Error(`LabelSurfaceBaker: padded grid ${this.dims.join("\xD7")} exceeds ${LABEL_SURFACE_MAX_DIM} voxels on a side`);
+    }
+    const S = GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING;
+    const mk = (format, label, size = this.dims, extra = 0) => dev.createTexture({ label, size, dimension: "3d", format, usage: S | extra });
+    this.mask = mk("r32uint", "lsb mask, then segment");
+    this.seed = [mk("r32uint", "lsb seed 0, then raw shares"), mk("r32uint", "lsb seed 1")];
+    this.dist = mk("r32float", "lsb distance");
+    this.g1 = mk("r32float", "lsb G\xB7f");
+    this.g2 = mk("r32float", "lsb indicator, then G\xB7G\xB7f");
+    this.scratch = mk("r32float", "lsb blur scratch");
+    this.surf = mk("rgba16float", "lsb surface", this.dims, GPUTextureUsage.COPY_SRC);
+    this.ifB = mk("rgba16float", "lsb shares", this.dims, GPUTextureUsage.COPY_SRC);
+    this.block = mk("r32uint", "lsb wall blocks", this.blockDims);
+    this.palTex = dev.createTexture({ label: "lsb palette", size: [256, 1], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+    const maxDim = Math.max(...this.dims);
+    const steps = [];
+    for (let s = 1 << Math.floor(Math.log2(maxDim - 1)); s >= 1; s >>= 1) steps.push(s);
+    this.steps = [...steps, 2, 1];
+    const ub = (size) => dev.createBuffer({ size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.uni = ub(U_BYTES);
+    this.jfaUni = this.steps.map(() => ub(U_BYTES));
+    this.blurUni = [ub(BU_BYTES), ub(BU_BYTES), ub(BU_BYTES)];
+    const pipe = (code, label) => dev.createComputePipeline({ label, layout: "auto", compute: { module: dev.createShaderModule({ label, code }), entryPoint: "main" } });
+    this.pipes = {
+      mask: pipe(MASK_WGSL, "lsb mask"),
+      seed: pipe(SEED_WGSL, "lsb seed"),
+      jfa: pipe(JFA_WGSL2, "lsb jfa"),
+      final: pipe(FINAL_WGSL2, "lsb final"),
+      blur: pipe(BLUR_WGSL3, "lsb blur"),
+      combine: pipe(COMBINE_WGSL, "lsb combine"),
+      segment: pipe(SEGMENT_WGSL, "lsb segment"),
+      interface: pipe(INTERFACE_WGSL, "lsb interface"),
+      thin: pipe(THIN_WGSL, "lsb thin"),
+      block: pipe(BLOCK_WGSL, "lsb block")
+    };
+  }
+  /** The PADDED grid every texture here lives on, and its voxel → RAS matrix (row-major). */
+  dims;
+  ijkToRAS;
+  pad;
+  labelDims;
+  spacing;
+  dev;
+  opts;
+  palette = new Uint8Array(256 * 4);
+  palTex;
+  mask;
+  // inside/outside, then (after the distance) the segment of each voxel
+  seed;
+  // the flood's ping-pong; seed[0] then holds the raw shares
+  dist;
+  g1;
+  g2;
+  // the indicator, then G·G·f
+  scratch;
+  surf;
+  ifB;
+  block;
+  blockDims;
+  uni;
+  jfaUni;
+  blurUni;
+  steps;
+  pipes;
+  /** GPU bytes per padded-grid voxel, counting the r32uint master the EditableSegmentation owns, as
+   *  JfaSdfBaker.bytesPerVoxel() does (52), so the two compare directly. */
+  static bytesPerVoxel() {
+    return 4 + 2 * 4 + 4 * 4 + 8 + 8 + 4;
+  }
+  options() {
+    return { ...this.opts };
+  }
+  /** Takes effect on the next bake(). */
+  setOptions(o) {
+    this.opts = { ...this.opts, ...o };
+  }
+  /** σ in mm (of the largest spacing — of the source image, if resampled — as Slicer's SmoothingFactor is). */
+  sigmaMm() {
+    return Math.max(0, this.opts.sigmaVoxels) * Math.max(...this.opts.sourceSpacingMm ?? this.spacing);
+  }
+  /** How far the rendered surface can be from the sharp one — the margin the empty-space skip keeps. */
+  skipMarginMm() {
+    return Math.max(...this.spacing) + 3.5 * this.sigmaMm();
+  }
+  /** Palette entry (rgb 0..1, opacity 0..1). Returns true if the label was shown before and not now,
+   *  or the other way round — that changes the surface and needs a bake(); a colour or an opacity
+   *  change alone needs only flushPalette(). */
+  setLabel(id, rgb, opacity) {
+    if (id < 1 || id > 255) return false;
+    const o = id * 4, wasShown = this.palette[o + 3] > 0;
+    if (rgb) for (let i = 0; i < 3; i++) this.palette[o + i] = Math.round(Math.max(0, Math.min(1, rgb[i])) * 255);
+    if (opacity !== null) {
+      const a = Math.max(0, Math.min(1, opacity));
+      this.palette[o + 3] = a > 0 ? Math.max(1, Math.round(a * 255)) : 0;
+    }
+    return wasShown !== this.palette[o + 3] > 0;
+  }
+  labelOpacity(id) {
+    return this.palette[id * 4 + 3] / 255;
+  }
+  flushPalette() {
+    this.dev.queue.writeTexture({ texture: this.palTex }, this.palette, { bytesPerRow: 256 * 4 }, [256, 1]);
+  }
+  surfaceTexture() {
+    return this.surf;
+  }
+  sharesTexture() {
+    return this.ifB;
+  }
+  blockTexture() {
+    return this.block;
+  }
+  paletteTexture() {
+    return this.palTex;
+  }
+  writeU(buf, step, mode) {
+    const ab = new ArrayBuffer(U_BYTES);
+    const f = new Float32Array(ab), u = new Uint32Array(ab);
+    f.set(transpose4(this.ijkToRAS), 0);
+    u[16] = this.dims[0];
+    u[17] = this.dims[1];
+    u[18] = this.dims[2];
+    u[19] = this.pad;
+    f[20] = step;
+    u[28] = this.labelDims[0];
+    u[29] = this.labelDims[1];
+    u[30] = this.labelDims[2];
+    u[31] = (this.opts.keepDeepest ? 1 : 0) | (this.opts.thinRule ? 2 : 0);
+    const smm = this.sigmaMm();
+    const src = this.opts.sourceSpacingMm ?? this.spacing;
+    for (let a = 0; a < 3; a++) {
+      f[32 + a] = smm / this.spacing[a];
+      const gapMm = Math.min(4, Math.floor(smm / src[a] + 1e-6)) * src[a];
+      f[36 + a] = this.opts.fillGaps ? Math.min(8, Math.floor(gapMm / this.spacing[a] + 1e-6)) : 0;
+      f[40 + a] = this.spacing[a];
+    }
+    f[35] = smm;
+    f[39] = mode;
+    f[43] = Math.min(400, 64 * Math.max(...this.spacing));
+    this.dev.queue.writeBuffer(buf, 0, ab);
+  }
+  pass(enc, name, resources, groups) {
+    const pipe = this.pipes[name];
+    const entries = resources.map((r, i) => r instanceof GPUBuffer ? { binding: i, resource: { buffer: r } } : { binding: i, resource: r.createView() });
+    const bg = this.dev.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries });
+    const p = enc.beginComputePass({ label: `lsb ${name}` });
+    p.setPipeline(pipe);
+    p.setBindGroup(0, bg);
+    p.dispatchWorkgroups(Math.ceil(groups[0] / 4), Math.ceil(groups[1] / 4), Math.ceil(groups[2] / 4));
+    p.end();
+  }
+  /** Separable Gaussian at the current σ (per axis), src -> dst (x), dst -> scratch (y), scratch -> dst (z). */
+  blur(enc, src, dst) {
+    const chain = [[src, dst], [dst, this.scratch], [this.scratch, dst]];
+    chain.forEach(([a, b], axis) => this.pass(enc, "blur", [a, b, this.blurUni[axis]], this.dims));
+  }
+  writeBlurUniforms() {
+    const smm = this.sigmaMm();
+    for (let axis = 0; axis < 3; axis++) {
+      const { radius, w } = gaussHalfKernel2(Math.max(smm / this.spacing[axis], 1e-3));
+      const ab = new ArrayBuffer(BU_BYTES);
+      const u = new Uint32Array(ab), f = new Float32Array(ab);
+      u[0] = this.dims[0];
+      u[1] = this.dims[1];
+      u[2] = this.dims[2];
+      u[4] = axis;
+      u[5] = radius;
+      f.set(w, 8);
+      this.dev.queue.writeBuffer(this.blurUni[axis], 0, ab);
+    }
+  }
+  /** The whole pipeline, in one submit: mask → face seeds → jump flood → distance → smoothing →
+   *  surface → segments → shares → thin rule → wall blocks. Uploads the palette first. */
+  bake() {
+    this.flushPalette();
+    const smm = this.sigmaMm();
+    const outer = this.opts.outer;
+    const smoothed = smm > 0;
+    const mode = outer === "mask" ? 2 : !smoothed ? 3 : outer === "blur" ? 1 : 0;
+    this.writeU(this.uni, 0, mode);
+    this.steps.forEach((s, i) => this.writeU(this.jfaUni[i], s, mode));
+    if (smoothed) this.writeBlurUniforms();
+    const enc = this.dev.createCommandEncoder({ label: "label surface bake" });
+    const D = this.dims;
+    this.pass(enc, "mask", [this.labelTex, this.palTex, this.mask, this.uni], D);
+    this.pass(enc, "seed", [this.mask, this.seed[0], this.uni], D);
+    let src = 0;
+    this.steps.forEach((_, i) => {
+      this.pass(enc, "jfa", [this.seed[src], this.seed[src ^ 1], this.jfaUni[i]], D);
+      src ^= 1;
+    });
+    this.pass(enc, "final", [this.seed[src], this.mask, this.dist, this.g2, this.uni], D);
+    let g1 = this.dist, g2 = this.dist;
+    if (outer === "mask") {
+      g1 = this.g2;
+      if (smoothed) {
+        this.blur(enc, this.g2, this.g1);
+        g1 = this.g1;
+      }
+    } else if (smoothed) {
+      this.blur(enc, this.dist, this.g1);
+      g1 = this.g1;
+      if (outer === "twicing") {
+        this.blur(enc, this.g1, this.g2);
+        g2 = this.g2;
+      }
+    }
+    this.pass(enc, "combine", [this.dist, g1, g2, this.surf, this.uni], D);
+    this.pass(enc, "segment", [this.labelTex, this.palTex, this.mask, this.uni, this.seed[src]], D);
+    this.pass(enc, "interface", [this.mask, this.seed[0], this.uni], D);
+    this.pass(enc, "thin", [this.labelTex, this.palTex, this.mask, this.seed[0], this.ifB, this.uni], D);
+    this.pass(enc, "block", [this.ifB, this.block, this.uni], this.blockDims);
+    this.dev.queue.submit([enc.finish()]);
+  }
+  /** Read the surface texture back: s = the surface function (negative inside), d = the sharp signed
+   *  distance, both mm, x-fastest on the padded grid. For tests. */
+  async readSurface() {
+    const [dx, dy, dz] = this.dims;
+    const bpr = Math.ceil(dx * 8 / 256) * 256, rowU16 = bpr / 2;
+    const buf = this.dev.createBuffer({ size: bpr * dy * dz, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const enc = this.dev.createCommandEncoder();
+    enc.copyTextureToBuffer({ texture: this.surf }, { buffer: buf, bytesPerRow: bpr, rowsPerImage: dy }, [dx, dy, dz]);
+    this.dev.queue.submit([enc.finish()]);
+    await buf.mapAsync(GPUMapMode.READ);
+    const h = new Uint16Array(buf.getMappedRange());
+    const h2f = (x) => {
+      const sg = x & 32768 ? -1 : 1, e = (x & 31744) >> 10, fr = x & 1023;
+      if (e === 0) return sg * 2 ** -14 * (fr / 1024);
+      if (e === 31) return fr ? NaN : sg * Infinity;
+      return sg * 2 ** (e - 15) * (1 + fr / 1024);
+    };
+    const s = new Float32Array(dx * dy * dz), d = new Float32Array(dx * dy * dz);
+    for (let z = 0; z < dz; z++) for (let y = 0; y < dy; y++) for (let x = 0; x < dx; x++) {
+      const i = (z * dy + y) * dx + x, j = (z * dy + y) * rowU16 + x * 4;
+      s[i] = h2f(h[j]);
+      d[i] = h2f(h[j + 1]);
+    }
+    buf.unmap();
+    buf.destroy();
+    return { s, d };
+  }
+  destroy() {
+    for (const t of [this.mask, ...this.seed, this.dist, this.g1, this.g2, this.scratch, this.surf, this.ifB, this.block, this.palTex]) t.destroy();
+    for (const b of [this.uni, ...this.jfaUni, ...this.blurUni]) b.destroy();
+  }
+};
+
+// render/label-surface-field.ts
+var LabelSurfaceField = class {
+  constructor(baker, opts = {}) {
+    this.baker = baker;
+    this.p2t = patientToTextureFromIjkToRAS(baker.ijkToRAS, baker.dims);
+    this.box = volumeAABBFromIjkToRAS(baker.ijkToRAS, baker.dims);
+    this.minSp = Math.min(...baker.spacing);
+    this.maxSp = Math.max(...baker.spacing);
+    this.opacity = opts.opacity ?? 1;
+    this.shade = opts.shade ?? [0.2, 0.85, 0.3, 32];
+    this.walls = opts.walls ?? true;
+    this.bothFaces = opts.bothFaces ?? true;
+    this.seamPx = opts.seamPx ?? 1;
+    this.clippable = opts.clippable ?? false;
+  }
+  kind = "lsf";
+  bindingCount = 4;
+  // surface (3d, linear), shares (3d), wall blocks (3d u32), palette (2d)
+  clippable;
+  providesSkip = true;
+  intervalSampling = true;
+  p2t;
+  box;
+  minSp;
+  maxSp;
+  opacity;
+  shade;
+  walls;
+  bothFaces;
+  seamPx;
+  setOpacity(o) {
+    this.opacity = Math.max(0, Math.min(1, o));
+  }
+  setWalls(on) {
+    this.walls = on;
+  }
+  setBothFaces(on) {
+    this.bothFaces = on;
+  }
+  setSeamPx(px) {
+    this.seamPx = Math.max(0, px);
+  }
+  uniformFloats() {
+    return 40;
+  }
+  // p2t(16) + dims(4) + opts(4) + shade(4) + skip(4) + bmin(4) + bmax(4)
+  aabb() {
+    return this.box;
+  }
+  // Half a voxel, as SegmentField (the renderer steps at 0.7 of this), so the two cost the same per
+  // step. Smoothing can leave a one-voxel sheet a fraction of a voxel thick; the shader probes inside
+  // a step that could hold one (sample_field), rather than every step being that fine.
+  sampleStep() {
+    return 0.5 * this.minSp;
+  }
+  structMembers(s) {
+    return [
+      `  lsf${s}_p2t : mat4x4<f32>,`,
+      `  lsf${s}_dims : vec4<f32>,`,
+      // padded grid dims, min spacing (mm)
+      `  lsf${s}_opts : vec4<f32>,`,
+      // opacity, walls, both faces, seam px
+      `  lsf${s}_shade : vec4<f32>,`,
+      // ka, kd, ks, shininess
+      `  lsf${s}_skip : vec4<f32>,`,
+      // margin (mm), max spacing, block size, min spacing
+      `  lsf${s}_bmin : vec4<f32>,`,
+      `  lsf${s}_bmax : vec4<f32>,`
+    ].join("\n");
+  }
+  declareBindings(s, base) {
+    return [
+      `@group(0) @binding(${base}) var t_lsd${s} : texture_3d<f32>;`,
+      `@group(0) @binding(${base + 1}) var t_lsl${s} : texture_3d<f32>;`,
+      `@group(0) @binding(${base + 2}) var t_lsb${s} : texture_3d<u32>;`,
+      `@group(0) @binding(${base + 3}) var t_lsp${s} : texture_2d<f32>;`
+    ].join("\n");
+  }
+  skipWGSL(s) {
+    return (
+      /* wgsl */
+      `
+fn skip_lsf${s}(wp : vec3<f32>) -> f32 {
+  let t = lsf${s}_tex(wp);
+  if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) {
+    // Outside the grid: leap only to its box.
+    let cen = (u_material.lsf${s}_bmin.xyz + u_material.lsf${s}_bmax.xyz) * 0.5;
+    let ext = (u_material.lsf${s}_bmax.xyz - u_material.lsf${s}_bmin.xyz) * 0.5;
+    let q = abs(transform_point_lsf${s}(wp) - cen) - ext;
+    return max(0.0, length(max(q, vec3<f32>(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0));
+  }
+  // The SHARP distance (.g): smoothing moves the rendered surface by up to the margin from it.
+  let sharp = textureSampleLevel(t_lsd${s}, s_lin, t, 0.0).g;
+  if (abs(sharp) > 500.0) { return 0.0; }
+  var leap = max(0.0, abs(sharp) - u_material.lsf${s}_skip.x);
+  if (sharp < 0.0 && u_material.lsf${s}_opts.y > 0.5 && leap > 0.0) {
+    // Inside: the next thing may be a wall. A block that holds no voxel near a wall (in it or one voxel
+    // around it) holds no wall, so the ray may leap to the edge of the block it is in.
+    let gp = t * u_material.lsf${s}_dims.xyz - vec3<f32>(0.5);
+    let nv = clamp(vec3<i32>(floor(gp + vec3<f32>(0.5))), vec3<i32>(0), vec3<i32>(u_material.lsf${s}_dims.xyz) - vec3<i32>(1));
+    let b = nv / ${LABEL_SURFACE_BLOCK};
+    if (textureLoad(t_lsb${s}, b, 0).r != 0u) { return 0.0; }
+    let lo = vec3<f32>(b * ${LABEL_SURFACE_BLOCK}) - vec3<f32>(0.5);
+    let dv = min(gp - lo, lo + vec3<f32>(${LABEL_SURFACE_BLOCK}.0) - gp);
+    leap = min(leap, max(0.0, min(dv.x, min(dv.y, dv.z))) * u_material.lsf${s}_skip.w);
+  }${this.clippable ? `
+  if (sharp < 0.0) {
+    // Inside, a clip plane is a face too (the cap): do not leap past one.
+    let ccount = u32(u_material.clip_count.x);
+    for (var ci = 0u; ci < ccount; ci = ci + 1u) {
+      let cp = u_material.clip_planes[ci];
+      leap = min(leap, abs(dot(wp, cp.xyz) + cp.w));
+    }
+  }` : ""}
+  return leap;
+}`
+    );
+  }
+  samplingWGSL(s) {
+    const P = `lsf${s}`;
+    return (
+      /* wgsl */
+      `
+fn ${P}_tex(wp : vec3<f32>) -> vec3<f32> {
+  return (u_material.${P}_p2t * vec4<f32>(transform_point_${P}(wp), 1.0)).xyz;
+}
+fn ${P}_gp(wp : vec3<f32>) -> vec3<f32> { return ${P}_tex(wp) * u_material.${P}_dims.xyz - vec3<f32>(0.5); }
+// The surface function (negative inside). Outside the grid: outside the surface.
+fn ${P}_surf(wp : vec3<f32>) -> f32 {
+  let t = ${P}_tex(wp);
+  if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) { return 1.0e3; }
+  return textureSampleLevel(t_lsd${s}, s_lin, t, 0.0).r;
+}
+// At a texture coordinate, clamped to the grid edge \u2014 for gradient taps (the padded edge is background).
+fn ${P}_surft(t : vec3<f32>) -> f32 {
+  return textureSampleLevel(t_lsd${s}, s_lin, clamp(t, vec3<f32>(0.0), vec3<f32>(1.0)), 0.0).r;
+}
+// A gradient taken along the GRID axes (per voxel) to a world direction. Normals are differenced over
+// one voxel per axis: on an anisotropic grid (5 mm slices) a tap a fraction of a slice apart reads the
+// slope of one trilinear cell, which jumps at every slice plane \u2014 bands across the surface, one per
+// slice. A one-voxel span averages that jump out. (On an isotropic grid this is what it always was.)
+fn ${P}_gridToWorld(g : vec3<f32>) -> vec3<f32> {
+  let m = u_material.${P}_p2t;
+  let p3 = mat3x3<f32>(m[0].xyz, m[1].xyz, m[2].xyz);
+  return transpose(p3) * (u_material.${P}_dims.xyz * g);
+}
+fn ${P}_pal(l : i32) -> vec4<f32> { return textureLoad(t_lsp${s}, vec2<i32>(clamp(l, 0, 255), 0), 0); }
+
+// Up to four segments near a point and their shares (label 0 = empty slot).
+struct LsfShares${s} { l : array<i32, 4>, w : array<f32, 4> };
+fn ${P}_add(sh : ptr<function, LsfShares${s}>, l : i32, a : f32) {
+  for (var k = 0; k < 4; k = k + 1) {
+    if ((*sh).l[k] == l || (*sh).l[k] == 0) { (*sh).l[k] = l; (*sh).w[k] = (*sh).w[k] + a; return; }
+  }
+}
+// The shares of the segments at a grid position: each of the 8 voxels around it gives its trilinear
+// weight to its own segment and, near a wall, part of it to the other segment, in proportion of the
+// shares baked there. Labels are never interpolated, so there is always a definite segment at a point.
+fn ${P}_shares(gp : vec3<f32>) -> LsfShares${s} {
+  var sh : LsfShares${s};
+  for (var k = 0; k < 4; k = k + 1) { sh.l[k] = 0; sh.w[k] = 0.0; }
+  let dimsI = vec3<i32>(u_material.${P}_dims.xyz);
+  let base = floor(gp);
+  let f = gp - base;
+  var total = 0.0;
+  for (var c = 0; c < 8; c = c + 1) {
+    let o = vec3<i32>(c & 1, (c >> 1u) & 1, c >> 2u);
+    let v = clamp(vec3<i32>(base) + o, vec3<i32>(0), dimsI - vec3<i32>(1));
+    let e = textureLoad(t_lsl${s}, v, 0);
+    let own = i32(e.r + 0.5);
+    if (own == 0) { continue; }
+    let aw = mix(vec3<f32>(1.0) - f, f, vec3<f32>(o));
+    let w = max(aw.x * aw.y * aw.z, 1.0e-4);
+    total = total + w;
+    let other = i32(e.g + 0.5);
+    if (other == 0) { ${P}_add(&sh, own, w); }
+    else { ${P}_add(&sh, own, w * e.b); ${P}_add(&sh, other, w * (1.0 - e.b)); }
+  }
+  if (total > 0.0) { for (var k = 0; k < 4; k = k + 1) { sh.w[k] = sh.w[k] / total; } }
+  return sh;
+}
+fn ${P}_shareOf(sh : LsfShares${s}, l : i32) -> f32 {
+  var r = 0.0;
+  for (var k = 0; k < 4; k = k + 1) { if (l > 0 && sh.l[k] == l) { r = sh.w[k]; } }
+  return r;
+}
+// The segment with the largest share, not counting one (0 if none).
+fn ${P}_largest(sh : LsfShares${s}, excl : i32) -> i32 {
+  var l = 0;
+  var w = -1.0;
+  for (var k = 0; k < 4; k = k + 1) {
+    if (sh.l[k] > 0 && sh.l[k] != excl && sh.w[k] > w) { l = sh.l[k]; w = sh.w[k]; }
+  }
+  return l;
+}
+// The segment at a point; in a block with no wall it is that of the nearest voxel (one texel read).
+fn ${P}_label(wp : vec3<f32>) -> i32 {
+  let gp = ${P}_gp(wp);
+  let nv = clamp(vec3<i32>(floor(gp + vec3<f32>(0.5))), vec3<i32>(0), vec3<i32>(u_material.${P}_dims.xyz) - vec3<i32>(1));
+  if (textureLoad(t_lsb${s}, nv / ${LABEL_SURFACE_BLOCK}, 0).r == 0u) { return i32(textureLoad(t_lsl${s}, nv, 0).r + 0.5); }
+  return ${P}_largest(${P}_shares(gp), 0);
+}
+fn ${P}_diffG(gp : vec3<f32>, la : i32, lb : i32) -> f32 {
+  let sh = ${P}_shares(gp);
+  return ${P}_shareOf(sh, la) - ${P}_shareOf(sh, lb);
+}
+fn ${P}_diff(wp : vec3<f32>, la : i32, lb : i32) -> f32 { return ${P}_diffG(${P}_gp(wp), la, lb); }
+fn ${P}_over(acc : vec4<f32>, c : vec4<f32>) -> vec4<f32> { return acc + (1.0 - acc.a) * c; }
+// Lit exactly as SegmentField lights its surfaces, so the two renderers differ only in geometry and colour.
+fn ${P}_lit(col : vec3<f32>, nIn : vec3<f32>, rd : vec3<f32>, a : f32) -> vec4<f32> {
+  var n = nIn;
+  if (dot(n, -rd) < 0.0) { n = -n; }
+  let ka = u_material.${P}_shade.x; let kd = u_material.${P}_shade.y;
+  let ks = u_material.${P}_shade.z; let shn = u_material.${P}_shade.w;
+  let ldn = max(dot(-rd, n), 0.0);
+  let refl = normalize(2.0 * ldn * n + rd);
+  let rdv = max(dot(refl, -rd), 0.0);
+  var lit = col * ka + col * (kd * ldn) + vec3<f32>(ks * pow(rdv, max(shn, 1.0)));
+  lit = srgb2physical(clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0)));
+  return vec4<f32>(lit * a, a);
+}
+// The colour of a point of the outer surface: its own segment's, turning to the neighbour's across
+// about seamPx pixels at the seam (the share difference changes by about one per voxel), weighted by
+// the two opacities so a nearly transparent neighbour hardly tints an opaque segment's edge.
+fn ${P}_faceColor(wc : vec3<f32>, l : i32, sh : LsfShares${s}) -> vec3<f32> {
+  let pc = ${P}_pal(l);
+  var col = pc.rgb;
+  let nb = ${P}_largest(sh, l);
+  if (nb > 0) {
+    let diff = ${P}_shareOf(sh, l) - ${P}_shareOf(sh, nb);
+    let seam = u_material.${P}_opts.w;
+    var wgt = select(0.0, 1.0, diff >= 0.0);
+    if (seam > 0.0) {
+      let pxVox = distance(u_cam.eye.xyz, wc) / max(u_cam.size.z, 1.0e-6) / max(u_material.${P}_dims.w, 1.0e-6);
+      wgt = clamp(0.5 + 0.5 * diff / max(pxVox * seam, 1.0e-3), 0.0, 1.0);
+    }
+    let nc = ${P}_pal(nb);
+    let nw = (1.0 - wgt) * nc.a;
+    col = mix(col, nc.rgb, nw / max(wgt * pc.a + nw, 1.0e-6));
+  }
+  return col;
+}
+// A face of the outer surface at wc, of segment l \u2014 or, given a normal (a clip cap), a face with that normal.
+fn ${P}_surfaceFace(wc : vec3<f32>, rd : vec3<f32>, l : i32, nGiven : vec3<f32>) -> vec4<f32> {
+  if (l <= 0) { return vec4<f32>(0.0); }
+  let a = ${P}_pal(l).a * u_material.${P}_opts.x;
+  if (a <= 0.0) { return vec4<f32>(0.0); }
+  var n = nGiven;
+  if (dot(n, n) < 0.25) {
+    // \xB1 half a voxel along each grid axis (one voxel in all; not more: a structure may be one voxel thick).
+    let t = ${P}_tex(wc);
+    let hd = vec3<f32>(0.5) / u_material.${P}_dims.xyz;
+    let gi = vec3<f32>(
+      ${P}_surft(t + vec3<f32>(hd.x, 0.0, 0.0)) - ${P}_surft(t - vec3<f32>(hd.x, 0.0, 0.0)),
+      ${P}_surft(t + vec3<f32>(0.0, hd.y, 0.0)) - ${P}_surft(t - vec3<f32>(0.0, hd.y, 0.0)),
+      ${P}_surft(t + vec3<f32>(0.0, 0.0, hd.z)) - ${P}_surft(t - vec3<f32>(0.0, 0.0, hd.z)));
+    let g = ${P}_gridToWorld(gi);
+    n = select(-rd, normalize(g), length(g) > 1.0e-6);
+  }
+  return ${P}_lit(${P}_faceColor(wc, l, ${P}_shares(${P}_gp(wc))), n, rd, a);
+}
+// The wall where the ray passes from segment la (at pa) into lb (at pb): where their shares are
+// equal. Two faces: la's (the segment the ray leaves), then lb's.
+fn ${P}_wall(pa : vec3<f32>, pb : vec3<f32>, la : i32, lb : i32, rd : vec3<f32>) -> vec4<f32> {
+  let ca = ${P}_pal(la);
+  let cb = ${P}_pal(lb);
+  let aA = ca.a * u_material.${P}_opts.x;
+  let aB = cb.a * u_material.${P}_opts.x;
+  let omitA = u_material.${P}_opts.z < 0.5 && aA < 0.999 && aB >= 0.999;
+  if ((aA <= 0.0 || omitA) && aB <= 0.0) { return vec4<f32>(0.0); }
+  // Bisect on the share difference (positive at pa, negative at pb), then interpolate the last bracket.
+  var a = 0.0;
+  var b = 1.0;
+  var da = 1.0e-4;
+  var db = -1.0e-4;
+  for (var i = 0; i < 8; i = i + 1) {
+    // i = 0, 1: the two ends; then the bisection.
+    let m = select(0.5 * (a + b), f32(i), i < 2);
+    let dm = ${P}_diff(mix(pa, pb, m), la, lb);
+    if (i == 0) { da = max(dm, 1.0e-4); } else if (i == 1) { db = min(dm, -1.0e-4); }
+    else if (dm > 0.0) { a = m; da = dm; } else { b = m; db = dm; }
+  }
+  let pw = mix(pa, pb, a + (b - a) * clamp(da / max(da - db, 1.0e-6), 0.0, 1.0));
+  // The normal: the gradient of the share difference, from four points at the vertices of a tetrahedron
+  // 0.7 voxel out along each grid axis.
+  let gpw = ${P}_gp(pw);
+  var tet = array<vec3<f32>, 4>(vec3<f32>(1.0, -1.0, -1.0), vec3<f32>(-1.0, -1.0, 1.0), vec3<f32>(-1.0, 1.0, -1.0), vec3<f32>(1.0, 1.0, 1.0));
+  var gg = vec3<f32>(0.0);
+  for (var v = 0; v < 4; v = v + 1) { gg = gg + tet[v] * ${P}_diffG(gpw + 0.7 * tet[v], lb, la); }
+  let g = ${P}_gridToWorld(gg);
+  let n = select(-rd, normalize(g), length(g) > 1.0e-6);
+  var acc = vec4<f32>(0.0);
+  if (aA > 0.0 && !omitA) { acc = ${P}_over(acc, ${P}_lit(ca.rgb, n, rd, aA)); }
+  if (aB > 0.0) { acc = ${P}_over(acc, ${P}_lit(cb.rgb, n, rd, aB)); }
+  return acc;
+}
+// The outer surface between pa and pb, which are on opposite sides of it: bisect, then interpolate
+// the last bracket.
+fn ${P}_cross(pa : vec3<f32>, pb : vec3<f32>, sa0 : f32, sb0 : f32) -> vec3<f32> {
+  let inA = sa0 < 0.0;
+  var a = 0.0;
+  var b = 1.0;
+  var sa = sa0;
+  var sb = sb0;
+  for (var i = 0; i < 6; i = i + 1) {
+    let m = 0.5 * (a + b);
+    let sm = ${P}_surf(mix(pa, pb, m));
+    if ((sm < 0.0) == inA) { a = m; sa = sm; } else { b = m; sb = sm; }
+  }
+  let den = sa - sb;
+  let fr = select(0.5, clamp(sa / den, 0.0, 1.0), abs(den) > 1.0e-9);
+  return mix(pa, pb, a + (b - a) * fr);
+}
+// What a sample's stretch of ray crosses, in ray order: outer faces (kind 1: at p0, of segment l0),
+// walls (kind 2: from p0 in l0 to p1 in l1) and clip caps (kind 3: at p0, of l0, normal p1). Collected first and shaded in ONE loop, so the
+// shading code is in the shader once \u2014 inlined at several call sites it was large enough to slow
+// every step of the march, not just the ones that hit something.
+struct LsfEvents${s} { n : i32, kind : array<i32, 4>, p0 : array<vec3<f32>, 4>, p1 : array<vec3<f32>, 4>, l0 : array<i32, 4>, l1 : array<i32, 4> };
+fn ${P}_push(ev : ptr<function, LsfEvents${s}>, kind : i32, p0 : vec3<f32>, p1 : vec3<f32>, l0 : i32, l1 : i32) {
+  let i = (*ev).n;
+  if (i < 4) { (*ev).kind[i] = kind; (*ev).p0[i] = p0; (*ev).p1[i] = p1; (*ev).l0[i] = l0; (*ev).l1[i] = l1; (*ev).n = i + 1; }
+}
+// The events on the stretch pa -> pb, which crosses the outer surface at most once.
+fn ${P}_events(pa : vec3<f32>, pb : vec3<f32>, sa : f32, sb : f32, ev : ptr<function, LsfEvents${s}>) {
+  let inA = sa < 0.0;
+  let inB = sb < 0.0;
+  if (!inA && !inB) { return; }
+  let walls = u_material.${P}_opts.y > 0.5;
+  var la = 0;
+  var lb = 0;
+  if (walls && inA) { la = ${P}_label(pa); }
+  if (walls && inB) { lb = ${P}_label(pb); }
+  if (inA != inB) {
+    let wc = ${P}_cross(pa, pb, sa, sb);
+    let lc = ${P}_label(wc);
+    if (inB) {
+      // Into the surface, then perhaps through a wall before pb.
+      ${P}_push(ev, 1, wc, wc, lc, 0);
+      if (walls && lc > 0 && lb > 0 && lb != lc) { ${P}_push(ev, 2, wc, pb, lc, lb); }
+    } else if (walls && la > 0 && lc > 0 && la != lc) {
+      // Through a wall, then out of the segment the ray is in.
+      ${P}_push(ev, 2, pa, wc, la, lc);
+      ${P}_push(ev, 1, wc, wc, lc, 0);
+    } else {
+      ${P}_push(ev, 1, wc, wc, select(lc, la, la > 0), 0);
+    }
+    return;
+  }
+  // Inside at both ends: a wall if the segment changed \u2014 or two, if a segment thinner than the step
+  // lies between (the middle is in another segment).
+  if (!walls || la == 0 || lb == 0) { return; }
+  if (la != lb) { ${P}_push(ev, 2, pa, pb, la, lb); return; }
+  let pm = 0.5 * (pa + pb);
+  let lm = ${P}_label(pm);
+  if (lm != 0 && lm != la) { ${P}_push(ev, 2, pa, pm, la, lm); ${P}_push(ev, 2, pm, pb, lm, la); }
+}
+fn sample_field_${P}(wp : vec3<f32>, rd : vec3<f32>, ds : f32) -> vec4<f32> {
+  if (u_material.${P}_opts.x <= 0.0) { return vec4<f32>(0.0); }
+  var L = max(ds, 1.0e-4);
+  var back = wp - rd * L;
+  var cap = vec3<f32>(0.0);${this.clippable ? `
+  // The stretch may start on the cut-away side of a clip plane (wp is on the kept side, or this would
+  // not be called): start it at the plane, and if the plane is inside a segment, that is a face (cap).
+  let ccount = u32(u_material.clip_count.x);
+  var fc = -1.0;
+  for (var ci = 0u; ci < ccount; ci = ci + 1u) {
+    let cp = u_material.clip_planes[ci];
+    let db = dot(back, cp.xyz) + cp.w;
+    if (db < 0.0) {
+      let f = -db / max(dot(wp, cp.xyz) + cp.w - db, 1.0e-9);
+      if (f > fc) { fc = f; cap = -cp.xyz; }
+    }
+  }
+  if (fc >= 0.0) { let f = min(fc, 1.0); back = mix(back, wp, f); L = max(L * (1.0 - f), 1.0e-4); }` : ""}
+  let s1 = ${P}_surf(wp);
+  let s0 = ${P}_surf(back);
+  var pts = array<vec3<f32>, 3>(back, wp, wp);
+  var ss = array<f32, 3>(s0, s1, s1);
+  var stretches = 1;
+  if (s0 >= 0.0 && s1 >= 0.0) {
+    // Outside at both ends. A structure thinner than the step can still lie between, but only if the
+    // two distances to the surface add up to less than the stretch; then look at three points inside it.
+    stretches = 0;
+    if (s0 + s1 < 1.5 * L) {
+      for (var k = 1; k <= 3; k = k + 1) {
+        let pk = back + rd * (L * f32(k) * 0.25);
+        let sk = ${P}_surf(pk);
+        if (sk < 0.0) { pts[1] = pk; ss[1] = sk; stretches = 2; break; }
+      }
+    }
+    if (stretches == 0) { return vec4<f32>(0.0); }
+  }
+  var ev : LsfEvents${s};
+  ev.n = 0;${this.clippable ? `
+  if (dot(cap, cap) > 0.25 && s0 < 0.0) { ${P}_push(&ev, 3, back, cap, ${P}_label(back), 0); }` : ""}
+  for (var j = 0; j < stretches; j = j + 1) { ${P}_events(pts[j], pts[j + 1], ss[j], ss[j + 1], &ev); }
+  var acc = vec4<f32>(0.0);
+  for (var i = 0; i < ev.n; i = i + 1) {
+    var c = vec4<f32>(0.0);
+    if (ev.kind[i] == 2) { c = ${P}_wall(ev.p0[i], ev.p1[i], ev.l0[i], ev.l1[i], rd); }
+    else { c = ${P}_surfaceFace(ev.p0[i], rd, ev.l0[i], select(vec3<f32>(0.0), ev.p1[i], ev.kind[i] == 3)); }
+    acc = ${P}_over(acc, c);
+  }
+  return acc;
+}`
+    );
+  }
+  fillUniforms(out, off) {
+    out.set(this.p2t, off);
+    const d = this.baker.dims;
+    out[off + 16] = d[0];
+    out[off + 17] = d[1];
+    out[off + 18] = d[2];
+    out[off + 19] = this.minSp;
+    out[off + 20] = this.opacity;
+    out[off + 21] = this.walls ? 1 : 0;
+    out[off + 22] = this.bothFaces ? 1 : 0;
+    out[off + 23] = this.seamPx;
+    out[off + 24] = this.shade[0];
+    out[off + 25] = this.shade[1];
+    out[off + 26] = this.shade[2];
+    out[off + 27] = this.shade[3];
+    out[off + 28] = this.baker.skipMarginMm();
+    out[off + 29] = this.maxSp;
+    out[off + 30] = LABEL_SURFACE_BLOCK;
+    out[off + 31] = this.minSp;
+    out[off + 32] = this.box[0][0];
+    out[off + 33] = this.box[0][1];
+    out[off + 34] = this.box[0][2];
+    out[off + 36] = this.box[1][0];
+    out[off + 37] = this.box[1][1];
+    out[off + 38] = this.box[1][2];
+  }
+  bindEntries(_s, base) {
+    return [
+      { binding: base, resource: this.baker.surfaceTexture().createView() },
+      { binding: base + 1, resource: this.baker.sharesTexture().createView() },
+      { binding: base + 2, resource: this.baker.blockTexture().createView() },
+      { binding: base + 3, resource: this.baker.paletteTexture().createView() }
+    ];
   }
 };
 
@@ -4092,19 +5547,51 @@ function invertAffine(m) {
     1
   ];
 }
-var SegmentationLogic = class {
+var SegmentationLogic = class _SegmentationLogic {
   constructor(device, seg, opts = {}) {
     this.seg = seg;
-    this.renderMode = opts.renderMode ?? "sdf";
+    this.device = device;
+    let mode = opts.renderMode ?? "label";
+    if (mode === "label" && seg.dims.some((d) => d + 6 > LABEL_SURFACE_MAX_DIM)) {
+      console.warn(`SegmentationLogic: ${seg.dims.join("\xD7")} is too large for the label renderer; using sdf`);
+      mode = "sdf";
+    }
+    this.renderMode = mode;
     this.sigma = opts.sigmaVoxels ?? 1;
     this.bandMm = opts.bandMm;
     this.opacity = opts.opacity ?? 1;
     this.refineDelayMs = opts.refineDelayMs ?? 180;
     this.boundaryMode = opts.boundaryMode ?? "outer";
     this.clippable = opts.clippable ?? false;
+    this.regionReflood = opts.regionReflood ?? false;
+    this.lsRender = { ...this.lsRender, ...opts.labelRender };
+    if (this.renderMode === "label") {
+      this.lsb = new LabelSurfaceBaker(
+        device,
+        seg.masterTexture(),
+        seg.dims,
+        seg.ijkToRAS,
+        { ...opts.labelBake, sigmaVoxels: this.sigma, sourceSpacingMm: opts.sourceSpacingMm }
+      );
+      this.setLabelColor(1, opts.color ?? [0.3, 0.85, 0.55]);
+      this.bakeLabels();
+      this.unsubDirty = seg.onDirty(() => {
+        this.labelsDirty = true;
+        if (this.bakePending) return;
+        this.bakePending = true;
+        queueMicrotask(() => {
+          this.bakePending = false;
+          if (this.labelsDirty) {
+            this.bakeLabels();
+            this.notify();
+          }
+        });
+      });
+      return;
+    }
     this.setLabelColor(1, opts.color ?? [0.3, 0.85, 0.55]);
     if (this.renderMode === "sdf") {
-      this.sdf = new JfaSdfBaker(device, seg.masterTexture(), seg.dims, seg.ijkToRAS, 1, 2, this.boundaryMode);
+      this.sdf = new JfaSdfBaker(device, seg.masterTexture(), seg.dims, seg.ijkToRAS, this.sigma, 2, this.boundaryMode);
     } else {
       this.baker = new ColorizeBaker(device, seg.masterTexture(), seg.dims);
       this.presenceTex = this.baker.output();
@@ -4119,7 +5606,18 @@ var SegmentationLogic = class {
   }
   renderMode;
   clippable;
-  attrSettleTimer;
+  lsb;
+  // label path
+  lsf;
+  lsRender = { walls: true, bothFaces: true, seamPx: 1 };
+  visibilityDirty = false;
+  // label: a segment was shown or hidden since the last bake
+  labelsDirty = false;
+  // label: the labelmap was edited since the last bake
+  bakePending = false;
+  // label: a bake is queued for the end of this task
+  /** label mode: GPU time of the last bake, ms (to queue completion; 0 until the first one lands). */
+  lastBakeMs = 0;
   sdf;
   // sdf path
   baker;
@@ -4133,16 +5631,36 @@ var SegmentationLogic = class {
   modePalette = new Float32Array(256 * 4);
   // label id → (.x = shading mode: 0 surface / 1 volume) — sdf only
   segField;
+  device;
   redrawCbs = [];
   unsubDirty;
   refineTimer;
   refineDelayMs;
   // quiescence before the settle-refine (sdf mode; capability-tuned)
   boundaryMode;
+  regionReflood;
+  notify() {
+    for (const cb of this.redrawCbs) cb();
+  }
+  /** label: one full bake (palette included), timed to queue completion. */
+  bakeLabels() {
+    const t0 = performance.now();
+    this.lsb.bake();
+    this.visibilityDirty = false;
+    this.labelsDirty = false;
+    this.device.queue.onSubmittedWorkDone().then(() => {
+      this.lastBakeMs = performance.now() - t0;
+    });
+  }
   /** Assign a display colour to a label id (0..255). Keeps the current opacity (defaults to 1 =
-   *  opaque). Takes effect on the next rebake. */
+   *  opaque). Takes effect on the next rebake (label mode: refineNow(), a palette write). */
   setLabelColor(id, rgb) {
     if (id < 1 || id > 255) return;
+    if (this.lsb) {
+      const first = this.lsb.labelOpacity(id) === 0;
+      if (this.lsb.setLabel(id, rgb, first ? 1 : null)) this.visibilityDirty = true;
+      return;
+    }
     const o = id * 4;
     this.palette[o] = rgb[0];
     this.palette[o + 1] = rgb[1];
@@ -4153,10 +5671,15 @@ var SegmentationLogic = class {
    *  rendering (see through outer segments to inner ones). Rebake/refine to apply. */
   setLabelOpacity(id, opacity) {
     if (id < 1 || id > 255) return;
+    if (this.lsb) {
+      if (this.lsb.setLabel(id, null, opacity)) this.visibilityDirty = true;
+      return;
+    }
     this.palette[id * 4 + 3] = Math.max(0, Math.min(1, opacity));
   }
   /** Per-segment shading (sdf mode): "surface" = crisp SDF shell (surface model), "volume" = DVR fill
-   *  of the interior (translucent cloud). Rebake/refine to apply. */
+   *  of the interior (translucent cloud). Rebake/refine to apply. The label renderer draws every
+   *  segment as a surface and ignores this. */
   setLabelShading(id, shading) {
     if (id < 1 || id > 255) return;
     this.modePalette[id * 4] = shading === "volume" ? 1 : 0;
@@ -4181,6 +5704,12 @@ var SegmentationLogic = class {
   /** Run the settle-refine now (JFA+2 + tighter distance blur + colour-seam blur), then redraw.
    *  Public so a test — or an app that knows the edit is done — can force the high-quality bake. */
   refineNow() {
+    if (this.lsb) {
+      if (this.visibilityDirty || this.labelsDirty) this.bakeLabels();
+      else this.lsb.flushPalette();
+      this.notify();
+      return;
+    }
     if (this.refineTimer !== void 0) {
       clearTimeout(this.refineTimer);
       this.refineTimer = void 0;
@@ -4198,8 +5727,24 @@ var SegmentationLogic = class {
    *  With `regionRAS` (the bbox of the labels whose opacity changed): the finalize AND the
    *  seam blur run region-limited in one shot — full settled quality lands immediately, no
    *  two-phase. Without it: full-volume fast pass + a debounced full-volume seam blur. */
-  /** RAS bbox → padded-SDF-grid ijk bbox with an M-voxel margin (shell band + blur radii). */
-  regionToIjk(regionRAS, M = 8) {
+  /** RAS bbox → padded-SDF-grid ijk bbox with an M-voxel HALO.
+   *
+   *  The halo is not just room for the shell band and the blur radii. A region re-flood reuses the
+   *  previous flood's seeds outside the box, and a seed OUTSIDE the box that pointed at a surface
+   *  just DELETED inside it is stale — a voxel in the box that taps it inherits a phantom surface
+   *  that is no longer there. Re-initialising over a wide halo rebuilds those seeds, so the halo has
+   *  to be at least as wide as the spacing to the next real structure (~15-20 mm between vertebrae);
+   *  at 8 voxels it was not, and one arrow step left a sliver of the hidden level on screen. The box
+   *  is still a few per cent of the grid, so this costs essentially nothing (measured: a level step
+   *  stays ~14 ms against ~390 ms for a full rebake). */
+  static HALO = 32;
+  // voxels of re-initialised ring around a region patch
+  /** Largest JFA step a region patch may use: capped so a tap (reach = 2·step - 1) stays inside the
+   *  halo this patch re-seeded, and can never read a seed left over from an older bake. */
+  static haloMaxStep() {
+    return 1 << Math.floor(Math.log2((_SegmentationLogic.HALO + 1) / 2));
+  }
+  regionToIjk(regionRAS, M = _SegmentationLogic.HALO) {
     const inv = invertAffine(this.sdf.sdfIjkToRAS());
     const lo = [Infinity, Infinity, Infinity];
     const hi = [-Infinity, -Infinity, -Infinity];
@@ -4224,8 +5769,20 @@ var SegmentationLogic = class {
    *  refine quality — JFA re-flood, finalize, seam blurs — over just the region, immediately.
    *  Small regions bake in ~ms, so stepping through per-label visibility stays real-time. */
   rebakeShellRegion(regionRAS) {
+    if (this.lsb) {
+      this.bakeLabels();
+      this.notify();
+      return;
+    }
     if (!this.sdf) {
       this.rebake();
+      return;
+    }
+    const region = this.regionToIjk(regionRAS);
+    const core = this.regionToIjk(regionRAS, 0);
+    const reach = 2 * _SegmentationLogic.haloMaxStep();
+    if (!this.regionReflood || [0, 1, 2].some((d) => core.hi[d] - core.lo[d] > reach)) {
+      this.refineNow();
       return;
     }
     if (this.refineTimer !== void 0) {
@@ -4234,10 +5791,14 @@ var SegmentationLogic = class {
     }
     this.sdf.setPalette(this.palette);
     this.sdf.setModePalette(this.modePalette);
-    this.sdf.refineRegion(this.regionToIjk(regionRAS));
+    this.sdf.refineRegion(region, _SegmentationLogic.haloMaxStep());
     for (const cb of this.redrawCbs) cb();
   }
   refreshOpacity(regionRAS) {
+    if (this.lsb) {
+      this.refineNow();
+      return;
+    }
     if (!this.sdf) {
       this.rebake();
       return;
@@ -4248,20 +5809,17 @@ var SegmentationLogic = class {
       for (const cb of this.redrawCbs) cb();
       return;
     }
-    this.sdf.rebakeAttr(false);
+    this.sdf.rebakeAttr(true);
     for (const cb of this.redrawCbs) cb();
-    if (this.attrSettleTimer !== void 0) clearTimeout(this.attrSettleTimer);
-    this.attrSettleTimer = setTimeout(() => {
-      this.attrSettleTimer = void 0;
-      if (this.sdf) {
-        this.sdf.blurAttrOnly();
-        for (const cb of this.redrawCbs) cb();
-      }
-    }, 600);
   }
-  /** A SegmentField bound to the shared render texture — hand this to the SceneRenderer once; edits
-   *  update it in place. Colour comes from the texture (per-label); the uniform supplies opacity. */
+  /** The field to hand to the SceneRenderer once; edits update its textures in place. label mode: a
+   *  LabelSurfaceField; otherwise a SegmentField whose colour comes from the texture (per-label) and
+   *  whose uniform supplies the global opacity. */
   field() {
+    if (this.lsb) {
+      if (!this.lsf) this.lsf = new LabelSurfaceField(this.lsb, { ...this.lsRender, opacity: this.opacity, clippable: this.clippable });
+      return this.lsf;
+    }
     if (!this.segField) {
       const tex = this.sdf ? this.sdf.sdfTexture() : this.presenceTex;
       const voxelMm = Math.min(...this.seg.spacingMm());
@@ -4281,6 +5839,8 @@ var SegmentationLogic = class {
         // per-segment opacity (sdf)
         interfaceMode
       });
+      this.segField.setVoxelMode(this.renderMode === "sdf" && this.sigma <= 0);
+      this.segField.setSmoothingVox(this.sigma);
     }
     return this.segField;
   }
@@ -4289,6 +5849,68 @@ var SegmentationLogic = class {
   setGlobalOpacity(o) {
     this.opacity = o;
     this.segField?.setOpacity(o);
+    this.lsf?.setOpacity(o);
+  }
+  /** label mode: the bake options (σ, outer surface, deepest voxel, gap fill, thin rule). */
+  bakeOptions() {
+    return this.lsb?.options();
+  }
+  /** label mode: change bake options and re-bake. */
+  setBakeOptions(o) {
+    if (!this.lsb) return;
+    if (o.sigmaVoxels !== void 0) this.sigma = Math.max(0, o.sigmaVoxels);
+    this.lsb.setOptions(o);
+    this.bakeLabels();
+    this.notify();
+  }
+  /** label mode: walls / both faces / seam width (uniforms; the caller syncs the scene on redraw). */
+  renderOptions() {
+    return { ...this.lsRender };
+  }
+  setRenderOptions(o) {
+    this.lsRender = { ...this.lsRender, ...o };
+    if (this.lsf) {
+      this.lsf.setWalls(this.lsRender.walls);
+      this.lsf.setBothFaces(this.lsRender.bothFaces);
+      this.lsf.setSeamPx(this.lsRender.seamPx);
+    }
+    this.notify();
+  }
+  /** GPU bytes the render path holds, counting the master labelmap. */
+  byteSize() {
+    if (this.lsb) {
+      const [x2, y2, z2] = this.lsb.dims;
+      return x2 * y2 * z2 * LabelSurfaceBaker.bytesPerVoxel();
+    }
+    if (this.sdf) return this.sdf.byteSize();
+    const [x, y, z] = this.seg.dims;
+    return x * y * z * (8 + 4);
+  }
+  /** Surface smoothing, σ in VOXELS (0 = none) — the RECONSTRUCTION WIDTH of the band-limited label
+   *  field. In sdf/outer mode the rendered surface is the 0.5 level set of p = G_σ * 1(label != 0):
+   *  σ ≈ 0.5 is the grid's Nyquist limit, the most faithful rendition of the labels that is not
+   *  aliased; below that it approaches the trilinear (voxel-faceted) reconstruction and at 0 it
+   *  switches to literal cubes; above it the surface is deliberately modelled, trading ≈ σ²/2R of
+   *  inward motion on convex features for smoothness. In interface ("all") mode σ still only blurs
+   *  the shading distance. In surface (Gaussian presence) mode it is the presence-field Gaussian.
+   *
+   *  Re-bakes immediately (fast path, so a slider stays responsive) and schedules the settle
+   *  refine, exactly as an edit does. */
+  setSmoothing(sigmaVoxels) {
+    if (this.lsb) {
+      this.setBakeOptions({ sigmaVoxels });
+      return;
+    }
+    this.sigma = Math.max(0, sigmaVoxels);
+    this.sdf?.setSmoothing(this.sigma);
+    this.segField?.setSmoothingVox(this.sigma);
+    this.segField?.setVoxelMode(this.renderMode === "sdf" && this.sigma <= 0);
+    if (this.sdf) this.sdf.resmooth();
+    else this.baker.bakeInto(this.presenceTex, this.palette, this.sigma);
+    for (const cb of this.redrawCbs) cb();
+  }
+  smoothing() {
+    return this.sigma;
   }
   /** Notified after every edit (post-rebake) so the app can redraw. */
   onRedraw(cb) {
@@ -4300,6 +5922,7 @@ var SegmentationLogic = class {
     this.sdf?.destroy();
     this.baker?.destroy();
     this.presenceTex?.destroy();
+    this.lsb?.destroy();
   }
 };
 
@@ -4374,7 +5997,7 @@ async function buildSegmentation(dev, onBytes) {
     }
   }
   const editable = new EditableSegmentation(dev, sv.dims, { ijkToRAS: sv.ijkToRAS });
-  const logic = new SegmentationLogic(dev, editable, { renderMode: "sdf", opacity: 1 });
+  const logic = new SegmentationLogic(dev, editable, { opacity: 1 });
   logic.setLabelColor(1, SEGMENTS[0].color);
   logic.setLabelColor(2, SEGMENTS[1].color);
   editable.loadLabelmap(lab);
