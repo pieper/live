@@ -5165,9 +5165,15 @@ var LabelSurfaceBaker = class {
       this.dev.queue.writeBuffer(this.blurUni[axis], 0, ab);
     }
   }
-  /** The whole pipeline, in one submit: mask → face seeds → jump flood → distance → smoothing →
-   *  surface → segments → shares → thin rule → wall blocks. Uploads the palette first. */
-  bake() {
+  /** The whole pipeline: mask → face seeds → jump flood → distance → smoothing → surface →
+   *  segments → shares → thin rule → wall blocks. Uploads the palette first. Resolves when the GPU
+   *  has finished it.
+   *
+   *  With `onProgress` the four stages go to the queue as four submits, and each one reports as
+   *  the GPU FINISHES it — progress of the work itself, not of its encoding, which is instant. The
+   *  message names the stage now running; `frac` is the share of the passes already done. Without
+   *  a listener it is one submit, as before. */
+  bake(onProgress) {
     this.flushPalette();
     const smm = this.sigmaMm();
     const outer = this.opts.outer;
@@ -5176,16 +5182,32 @@ var LabelSurfaceBaker = class {
     this.writeU(this.uni, 0, mode);
     this.steps.forEach((s, i) => this.writeU(this.jfaUni[i], s, mode));
     if (smoothed) this.writeBlurUniforms();
-    const enc = this.dev.createCommandEncoder({ label: "label surface bake" });
+    const blurs = !smoothed ? 0 : outer === "twicing" ? 6 : 3;
+    const stagePasses = [2, this.steps.length + 1, blurs + 1, 4];
+    const total = stagePasses.reduce((a, b) => a + b, 0);
+    const STAGES = ["finding segment boundaries", "measuring distances", smoothed ? "smoothing surfaces" : "shaping surfaces", "separating segments"];
+    let enc = this.dev.createCommandEncoder({ label: "label surface bake" });
+    let stage = 0, passesDone = 0;
+    onProgress?.({ msg: STAGES[0], frac: 0 });
+    const endStage = () => {
+      if (!onProgress) return;
+      this.dev.queue.submit([enc.finish()]);
+      passesDone += stagePasses[stage++];
+      const p = stage < STAGES.length ? { msg: STAGES[stage], frac: passesDone / total } : { msg: "surfaces ready", frac: 1 };
+      this.dev.queue.onSubmittedWorkDone().then(() => onProgress(p));
+      enc = this.dev.createCommandEncoder({ label: "label surface bake" });
+    };
     const D = this.dims;
     this.pass(enc, "mask", [this.labelTex, this.palTex, this.mask, this.uni], D);
     this.pass(enc, "seed", [this.mask, this.seed[0], this.uni], D);
+    endStage();
     let src = 0;
     this.steps.forEach((_, i) => {
       this.pass(enc, "jfa", [this.seed[src], this.seed[src ^ 1], this.jfaUni[i]], D);
       src ^= 1;
     });
     this.pass(enc, "final", [this.seed[src], this.mask, this.dist, this.g2, this.uni], D);
+    endStage();
     let g1 = this.dist, g2 = this.dist;
     if (outer === "mask") {
       g1 = this.g2;
@@ -5202,11 +5224,14 @@ var LabelSurfaceBaker = class {
       }
     }
     this.pass(enc, "combine", [this.dist, g1, g2, this.surf, this.uni], D);
+    endStage();
     this.pass(enc, "segment", [this.labelTex, this.palTex, this.mask, this.uni, this.seed[src]], D);
     this.pass(enc, "interface", [this.mask, this.seed[0], this.uni], D);
     this.pass(enc, "thin", [this.labelTex, this.palTex, this.mask, this.seed[0], this.ifB, this.uni], D);
     this.pass(enc, "block", [this.ifB, this.block, this.uni], this.blockDims);
-    this.dev.queue.submit([enc.finish()]);
+    if (onProgress) endStage();
+    else this.dev.queue.submit([enc.finish()]);
+    return this.dev.queue.onSubmittedWorkDone();
   }
   /** Read the surface texture back: s = the surface function (negative inside), d = the sharp signed
    *  distance, both mm, x-fastest on the padded grid. For tests. */
@@ -5737,6 +5762,7 @@ var SegmentationLogic = class _SegmentationLogic {
     this.clippable = opts.clippable ?? false;
     this.regionReflood = opts.regionReflood ?? false;
     this.lsRender = { ...this.lsRender, ...opts.labelRender };
+    this.onProgress = opts.onProgress;
     if (this.renderMode === "label") {
       this.lsb = new LabelSurfaceBaker(
         device,
@@ -5746,18 +5772,11 @@ var SegmentationLogic = class _SegmentationLogic {
         { ...opts.labelBake, sigmaVoxels: this.sigma, sourceSpacingMm: opts.sourceSpacingMm }
       );
       this.setLabelColor(1, opts.color ?? [0.3, 0.85, 0.55]);
-      this.bakeLabels();
+      this.labelsDirty = true;
+      this.scheduleLabelBake();
       this.unsubDirty = seg.onDirty(() => {
         this.labelsDirty = true;
-        if (this.bakePending) return;
-        this.bakePending = true;
-        queueMicrotask(() => {
-          this.bakePending = false;
-          if (this.labelsDirty) {
-            this.bakeLabels();
-            this.notify();
-          }
-        });
+        this.scheduleLabelBake();
       });
       return;
     }
@@ -5790,6 +5809,10 @@ var SegmentationLogic = class _SegmentationLogic {
   // label: a bake is queued for the end of this task
   /** label mode: GPU time of the last bake, ms (to queue completion; 0 until the first one lands). */
   lastBakeMs = 0;
+  /** label mode: progress of each bake as the GPU works through it (undefined = no reports). */
+  onProgress;
+  bakeDone = Promise.resolve();
+  // GPU completion of the latest bake
   sdf;
   // sdf path
   baker;
@@ -5814,15 +5837,35 @@ var SegmentationLogic = class _SegmentationLogic {
   notify() {
     for (const cb of this.redrawCbs) cb();
   }
+  /** label: bake at the end of this task (coalesces a burst of edits into one bake). */
+  scheduleLabelBake() {
+    if (this.bakePending) return;
+    this.bakePending = true;
+    queueMicrotask(() => {
+      this.bakePending = false;
+      if (this.labelsDirty) {
+        this.bakeLabels();
+        this.notify();
+      }
+    });
+  }
   /** label: one full bake (palette included), timed to queue completion. */
   bakeLabels() {
     const t0 = performance.now();
-    this.lsb.bake();
+    this.bakeDone = this.lsb.bake(this.onProgress);
     this.visibilityDirty = false;
     this.labelsDirty = false;
-    this.device.queue.onSubmittedWorkDone().then(() => {
+    this.bakeDone.then(() => {
       this.lastBakeMs = performance.now() - t0;
     });
+  }
+  /** Resolves when the GPU has finished the latest bake — including one still queued for the end
+   *  of this task — i.e. when field() shows the current labelmap. For a loader that wants to say
+   *  "ready" when the surfaces are actually there, not when their work was merely submitted. */
+  async ready() {
+    await Promise.resolve();
+    if (!this.lsb) return this.device.queue.onSubmittedWorkDone();
+    return this.bakeDone;
   }
   /** Assign a display colour to a label id (0..255). Keeps the current opacity (defaults to 1 =
    *  opaque). Takes effect on the next rebake (label mode: refineNow(), a palette write). */
@@ -6165,10 +6208,11 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
     palette.fill(0);
     const total = dims[0] * dims[1] * dims[2];
     const stack = layersOf(sg);
+    const counts = new Uint32Array(256);
+    for (const lay of stack) for (let i = 0; i < lay.length; i++) counts[lay[i]]++;
     for (const [num, r, g, b] of sg.colors) {
       if (num === 0 || r === 0 && g === 0 && b === 0) continue;
-      let n = 0;
-      for (const lay of stack) for (let i = 0; i < lay.length; i++) if (lay[i] === num) n++;
+      const n = num < 256 ? counts[num] : 0;
       if (!n || n > total * 0.6) continue;
       if (num < 256) {
         palette[num * 4] = r;
@@ -6249,13 +6293,14 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
     editable = new EditableSegmentation(dev, cap.dims, { ijkToRAS: cap.ijkToRAS });
     const boundaryMode = labelmapHasInternalBoundary(cap.lab, cap.dims) ? "all" : "outer";
     const m = ct.ijkToRAS, sourceSpacingMm = [0, 1, 2].map((c) => Math.hypot(m[c], m[4 + c], m[8 + c]));
-    segLogic = new SegmentationLogic(dev, editable, { opacity: 1, boundaryMode, sigmaVoxels: segSigma, sourceSpacingMm, refineDelayMs: opts.refineDelayMs });
+    segLogic = new SegmentationLogic(dev, editable, { opacity: 1, boundaryMode, sigmaVoxels: segSigma, sourceSpacingMm, refineDelayMs: opts.refineDelayMs, onProgress: opts.onProgress });
     for (const s of segments) {
       segLogic.setLabelColor(s.num, s.color);
       segLogic.setLabelOpacity(s.num, opacityOf(s.num));
     }
     editable.loadLabelmap(cap.lab);
     segLogic.refineNow();
+    segLogic.onProgress = void 0;
     mode = "sdf";
   };
   if (seg && segments.length > 0) buildSdf(seg);
@@ -6434,6 +6479,9 @@ function buildSegrouletteScene(gpu, format, ct, seg, opts = {}) {
       if (roiEnabled) scene.setClipBox(roi.lo(), roi.hi());
       else scene.clearClip();
       scene.syncUniforms();
+    },
+    ready() {
+      return segLogic?.ready() ?? Promise.resolve();
     },
     destroy() {
       segLogic?.destroy();
@@ -9161,9 +9209,16 @@ function createMosaic(host, opts = {}) {
   canvas.style.cssText = strip ? TILES_STRIP : TILES_FULL + TILES_CSS;
   const cap = document.createElement("div");
   cap.style.cssText = strip ? "position:absolute;left:50%;bottom:7px;transform:translateX(-50%);z-index:1;font:600 12px ui-monospace,Menlo,monospace;color:#9fe9ff;text-shadow:0 0 5px #000,0 0 5px #000;background:rgba(5,8,14,.55);padding:2px 10px;border-radius:6px;pointer-events:none;white-space:nowrap;" : "font:600 12px ui-monospace,Menlo,monospace;color:#9fe9ff;text-shadow:0 0 4px #000;";
+  const bar = document.createElement("div");
+  bar.style.cssText = (strip ? "position:absolute;left:0;right:0;bottom:0;height:3px;z-index:1;pointer-events:none;" : "width:min(52vmin,440px);height:4px;border-radius:2px;overflow:hidden;") + "background:rgba(159,233,255,.14);visibility:hidden;";
+  const fill = document.createElement("div");
+  fill.style.cssText = "height:100%;width:0%;background:#9fe9ff;box-shadow:0 0 6px rgba(159,233,255,.6);transition:width 160ms linear;";
+  bar.appendChild(fill);
+  let barFrac = 0;
   wrap.appendChild(preview_);
   wrap.appendChild(canvas);
   wrap.appendChild(cap);
+  wrap.appendChild(bar);
   if (!strip) {
     const hostPos = getComputedStyle(host).position;
     if (hostPos === "static") host.style.position = "relative";
@@ -9245,6 +9300,12 @@ function createMosaic(host, opts = {}) {
     status(msg) {
       cap.textContent = msg;
     },
+    progress(frac) {
+      if (!Number.isFinite(frac)) return;
+      barFrac = Math.max(barFrac, Math.min(1, Math.max(0, frac)));
+      bar.style.visibility = "visible";
+      fill.style.width = `${(barFrac * 100).toFixed(1)}%`;
+    },
     preview(w, h, rgba) {
       preview_.width = w;
       preview_.height = h;
@@ -9256,6 +9317,7 @@ function createMosaic(host, opts = {}) {
       preview_.remove();
       canvas.remove();
       cap.remove();
+      bar.remove();
       const card = document.createElement("div");
       card.style.cssText = "max-width:min(560px,86vw);padding:16px 18px;border-radius:12px;background:rgba(18,10,12,.92);border:1px solid rgba(255,107,116,.5);color:#ffd9dc;font:13px/1.5 -apple-system,system-ui,sans-serif;box-shadow:0 10px 40px rgba(0,0,0,.5);";
       const h = document.createElement("div");
@@ -9309,6 +9371,9 @@ ${location.href}`;
       filled = 0;
       count = 0;
       laidOut = false;
+      barFrac = 0;
+      fill.style.width = "0%";
+      bar.style.visibility = "hidden";
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       preview_.style.display = "none";
       canvas.style.cssText = (strip ? "max-height:100%;max-width:62vw;" : TILES_FULL) + TILES_CSS;
@@ -9316,6 +9381,31 @@ ${location.href}`;
       if (!wrap.isConnected) host.appendChild(wrap);
     }
   };
+}
+
+// render/progress.ts
+function subProgress(fn, lo, hi, prefix = "") {
+  if (!fn) return void 0;
+  return (p) => fn({
+    msg: prefix + p.msg,
+    frac: p.frac === void 0 ? void 0 : lo + (hi - lo) * Math.max(0, Math.min(1, p.frac))
+  });
+}
+function formatProgress(p) {
+  return p.frac === void 0 || !Number.isFinite(p.frac) ? p.msg : `${p.msg} \u2014 ${Math.round(Math.max(0, Math.min(1, p.frac)) * 100)}%`;
+}
+function nextPaint() {
+  return new Promise((resolve) => {
+    let done = false;
+    const go = () => {
+      if (!done) {
+        done = true;
+        setTimeout(resolve, 0);
+      }
+    };
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(go);
+    setTimeout(go, 100);
+  });
 }
 
 // render/vendor/idc_tools/s3.js
@@ -9693,11 +9783,13 @@ async function main() {
     info.innerHTML = `<span class="col">${entry?.col ?? "IDC"}</span><span class="mod">${entry?.m ?? ""}</span><span class="sd">${entry?.sd ?? "segmentation"}</span><span class="n">\xB7 ${n} segment${n === 1 ? "" : "s"}${entry?.lic ? " \xB7 " + entry.lic : ""}</span>`;
   };
   const spinBtn = el("spin");
+  const showProgress = (p) => {
+    status(formatProgress(p));
+    mosaic.status(p.msg);
+    if (p.frac !== void 0) mosaic.progress(p.frac);
+  };
   const handlers = {
-    onProgress: (p) => {
-      status(`${p.msg}${p.frac ? ` \u2014 ${Math.round(p.frac * 100)}%` : ""}`);
-      mosaic.status(p.msg);
-    },
+    onProgress: showProgress,
     onSliceCount: (n) => mosaic.setCount(n),
     onThumb: (n, w, h, rgba) => mosaic.thumb(n, w, h, rgba)
   };
@@ -9718,9 +9810,17 @@ async function main() {
     try {
       const res = await pickAndLoad();
       lastEntry = res.entry;
-      status("baking segmentation surface\u2026");
+      const nSeg = res.seg ? res.seg.colors.filter(([num]) => num !== 0).length : 0;
+      showProgress({ msg: nSeg ? `building the 3D view \xB7 ${nSeg} segment${nSeg === 1 ? "" : "s"}\u2026` : "building the view\u2026", frac: 0.96 });
+      await nextPaint();
       rs?.destroy();
-      rs = buildSegrouletteScene(gpu, srgb, res.ct, res.seg, { sdfMaxDim: budget.sdfMaxDim(), sdfMaxVoxels: budget.sdfMaxVoxels(), refineDelayMs: budget.refineDelayMs() });
+      rs = buildSegrouletteScene(gpu, srgb, res.ct, res.seg, {
+        sdfMaxDim: budget.sdfMaxDim(),
+        sdfMaxVoxels: budget.sdfMaxVoxels(),
+        refineDelayMs: budget.refineDelayMs(),
+        onProgress: subProgress(showProgress, 0.97, 1, "3D surfaces: ")
+        // GPU bake stages as they finish
+      });
       sliceIx = new SliceInteractor({ ijkToRAS: rs.ijkToRAS, rasLo: rs.rasLo, rasHi: rs.rasHi });
       for (const p of planes) off[p.cell] = slicerDefaultOffset01(p.orient, rs.dims, rs.ijkToRAS, rs.rasLo, rs.rasHi);
       const framed = framedCamera(rs.center, rs.radius);
@@ -9734,9 +9834,10 @@ async function main() {
       chrome.refresh();
       showMeta(res.entry, rs);
       const d3 = document.querySelector(".lab.d3");
-      if (d3) d3.textContent = rs.mode === "sdf" ? "3D \xB7 SDF surface" : "3D \xB7 volume";
+      if (d3) d3.textContent = rs.mode === "sdf" ? "3D \xB7 segment surfaces" : "3D \xB7 volume";
       segCards.setScene(res.ct, res.seg ?? null, rs.segments);
       resize();
+      await Promise.race([rs.ready(), new Promise((r) => setTimeout(r, 2e4))]);
       mosaic.done();
       status(`${res.entry?.col ?? "IDC"} \xB7 ${res.entry?.m ?? ""} \xB7 ${rs.segments.length} segment${rs.segments.length === 1 ? "" : "s"} \xB7 scroll a slice, drag 3D to orbit \xB7 Spin for another`);
     } catch (e) {

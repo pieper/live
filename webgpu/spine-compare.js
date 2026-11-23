@@ -6027,9 +6027,15 @@ var LabelSurfaceBaker = class {
       this.dev.queue.writeBuffer(this.blurUni[axis], 0, ab);
     }
   }
-  /** The whole pipeline, in one submit: mask → face seeds → jump flood → distance → smoothing →
-   *  surface → segments → shares → thin rule → wall blocks. Uploads the palette first. */
-  bake() {
+  /** The whole pipeline: mask → face seeds → jump flood → distance → smoothing → surface →
+   *  segments → shares → thin rule → wall blocks. Uploads the palette first. Resolves when the GPU
+   *  has finished it.
+   *
+   *  With `onProgress` the four stages go to the queue as four submits, and each one reports as
+   *  the GPU FINISHES it — progress of the work itself, not of its encoding, which is instant. The
+   *  message names the stage now running; `frac` is the share of the passes already done. Without
+   *  a listener it is one submit, as before. */
+  bake(onProgress) {
     this.flushPalette();
     const smm = this.sigmaMm();
     const outer = this.opts.outer;
@@ -6038,16 +6044,32 @@ var LabelSurfaceBaker = class {
     this.writeU(this.uni, 0, mode);
     this.steps.forEach((s, i) => this.writeU(this.jfaUni[i], s, mode));
     if (smoothed) this.writeBlurUniforms();
-    const enc = this.dev.createCommandEncoder({ label: "label surface bake" });
+    const blurs = !smoothed ? 0 : outer === "twicing" ? 6 : 3;
+    const stagePasses = [2, this.steps.length + 1, blurs + 1, 4];
+    const total = stagePasses.reduce((a, b) => a + b, 0);
+    const STAGES = ["finding segment boundaries", "measuring distances", smoothed ? "smoothing surfaces" : "shaping surfaces", "separating segments"];
+    let enc = this.dev.createCommandEncoder({ label: "label surface bake" });
+    let stage = 0, passesDone = 0;
+    onProgress?.({ msg: STAGES[0], frac: 0 });
+    const endStage = () => {
+      if (!onProgress) return;
+      this.dev.queue.submit([enc.finish()]);
+      passesDone += stagePasses[stage++];
+      const p = stage < STAGES.length ? { msg: STAGES[stage], frac: passesDone / total } : { msg: "surfaces ready", frac: 1 };
+      this.dev.queue.onSubmittedWorkDone().then(() => onProgress(p));
+      enc = this.dev.createCommandEncoder({ label: "label surface bake" });
+    };
     const D = this.dims;
     this.pass(enc, "mask", [this.labelTex, this.palTex, this.mask, this.uni], D);
     this.pass(enc, "seed", [this.mask, this.seed[0], this.uni], D);
+    endStage();
     let src = 0;
     this.steps.forEach((_, i) => {
       this.pass(enc, "jfa", [this.seed[src], this.seed[src ^ 1], this.jfaUni[i]], D);
       src ^= 1;
     });
     this.pass(enc, "final", [this.seed[src], this.mask, this.dist, this.g2, this.uni], D);
+    endStage();
     let g1 = this.dist, g2 = this.dist;
     if (outer === "mask") {
       g1 = this.g2;
@@ -6064,11 +6086,14 @@ var LabelSurfaceBaker = class {
       }
     }
     this.pass(enc, "combine", [this.dist, g1, g2, this.surf, this.uni], D);
+    endStage();
     this.pass(enc, "segment", [this.labelTex, this.palTex, this.mask, this.uni, this.seed[src]], D);
     this.pass(enc, "interface", [this.mask, this.seed[0], this.uni], D);
     this.pass(enc, "thin", [this.labelTex, this.palTex, this.mask, this.seed[0], this.ifB, this.uni], D);
     this.pass(enc, "block", [this.ifB, this.block, this.uni], this.blockDims);
-    this.dev.queue.submit([enc.finish()]);
+    if (onProgress) endStage();
+    else this.dev.queue.submit([enc.finish()]);
+    return this.dev.queue.onSubmittedWorkDone();
   }
   /** Read the surface texture back: s = the surface function (negative inside), d = the sharp signed
    *  distance, both mm, x-fastest on the padded grid. For tests. */
@@ -6599,6 +6624,7 @@ var SegmentationLogic = class _SegmentationLogic {
     this.clippable = opts.clippable ?? false;
     this.regionReflood = opts.regionReflood ?? false;
     this.lsRender = { ...this.lsRender, ...opts.labelRender };
+    this.onProgress = opts.onProgress;
     if (this.renderMode === "label") {
       this.lsb = new LabelSurfaceBaker(
         device,
@@ -6608,18 +6634,11 @@ var SegmentationLogic = class _SegmentationLogic {
         { ...opts.labelBake, sigmaVoxels: this.sigma, sourceSpacingMm: opts.sourceSpacingMm }
       );
       this.setLabelColor(1, opts.color ?? [0.3, 0.85, 0.55]);
-      this.bakeLabels();
+      this.labelsDirty = true;
+      this.scheduleLabelBake();
       this.unsubDirty = seg.onDirty(() => {
         this.labelsDirty = true;
-        if (this.bakePending) return;
-        this.bakePending = true;
-        queueMicrotask(() => {
-          this.bakePending = false;
-          if (this.labelsDirty) {
-            this.bakeLabels();
-            this.notify();
-          }
-        });
+        this.scheduleLabelBake();
       });
       return;
     }
@@ -6652,6 +6671,10 @@ var SegmentationLogic = class _SegmentationLogic {
   // label: a bake is queued for the end of this task
   /** label mode: GPU time of the last bake, ms (to queue completion; 0 until the first one lands). */
   lastBakeMs = 0;
+  /** label mode: progress of each bake as the GPU works through it (undefined = no reports). */
+  onProgress;
+  bakeDone = Promise.resolve();
+  // GPU completion of the latest bake
   sdf;
   // sdf path
   baker;
@@ -6676,15 +6699,35 @@ var SegmentationLogic = class _SegmentationLogic {
   notify() {
     for (const cb of this.redrawCbs) cb();
   }
+  /** label: bake at the end of this task (coalesces a burst of edits into one bake). */
+  scheduleLabelBake() {
+    if (this.bakePending) return;
+    this.bakePending = true;
+    queueMicrotask(() => {
+      this.bakePending = false;
+      if (this.labelsDirty) {
+        this.bakeLabels();
+        this.notify();
+      }
+    });
+  }
   /** label: one full bake (palette included), timed to queue completion. */
   bakeLabels() {
     const t0 = performance.now();
-    this.lsb.bake();
+    this.bakeDone = this.lsb.bake(this.onProgress);
     this.visibilityDirty = false;
     this.labelsDirty = false;
-    this.device.queue.onSubmittedWorkDone().then(() => {
+    this.bakeDone.then(() => {
       this.lastBakeMs = performance.now() - t0;
     });
+  }
+  /** Resolves when the GPU has finished the latest bake — including one still queued for the end
+   *  of this task — i.e. when field() shows the current labelmap. For a loader that wants to say
+   *  "ready" when the surfaces are actually there, not when their work was merely submitted. */
+  async ready() {
+    await Promise.resolve();
+    if (!this.lsb) return this.device.queue.onSubmittedWorkDone();
+    return this.bakeDone;
   }
   /** Assign a display colour to a label id (0..255). Keeps the current opacity (defaults to 1 =
    *  opaque). Takes effect on the next rebake (label mode: refineNow(), a palette write). */

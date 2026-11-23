@@ -29,6 +29,15 @@ let CT_S3 = s3url(), SEG_S3 = s3url();
 let MODNAME = 'image';
 const post = (m, x) => self.postMessage(m, x || []);
 const prog = (msg, frac) => post({ t: 'progress', msg, frac });
+// Progress from inside a loop: at most every ~80 ms (one post per frame would flood the page with
+// thousands of messages), and always when `force` — the first and last of a stage must land.
+let progAt = 0;
+const progEvery = (msg, frac, force) => {
+    const now = performance.now();
+    if (!force && now - progAt < 80) return;
+    progAt = now;
+    prog(msg, frac);
+};
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function fetchRetry(url, opts, tries = 6) {
     let err;
@@ -330,6 +339,7 @@ function buildLabelmap(ds, bits, ct) {
         };
     }
     const seenSeg = new Set();
+    const nSegs = Object.keys(names).length;
     const perFrameAll = ds.PerFrameFunctionalGroupsSequence || [];
     // Which PAIRS of segments overlap? Answered from the frame bitmasks themselves, before any
     // painting: two segments can only overlap where they both have a frame on the same plane, and
@@ -337,6 +347,12 @@ function buildLabelmap(ds, bits, ct) {
     // assignment that is PER SEGMENT rather than per voxel — which is what keeps the contours
     // honest. (Assign per voxel and a segment that is sometimes-overlapped lives in two layers,
     // so the layer-to-layer transition draws a contour through the middle of it.)
+    //
+    // The test runs once per plane with an OWNER per pixel: the first segment to set a pixel owns
+    // it, and a different segment setting it links to every segment already there. That finds
+    // exactly the pairs the old frame-by-frame AND did, but in one pass over the mask bits rather
+    // than one per PAIR of frames — ~20 segments share a plane in a TotalSegmentator SEG, ~200
+    // pairs, and on a 68-segment SEG the pairwise version was seconds of silence before painting.
     const planeFrames = new Map();
     for (let f = 0; f < perFrameAll.length; f++) {
         const fg = perFrameAll[f];
@@ -354,15 +370,38 @@ function buildLabelmap(ds, bits, ct) {
         if (!adj.has(b)) adj.set(b, new Set());
         adj.get(a).add(b); adj.get(b).add(a);
     };
+    const nPix = sx * sy;
+    const owner = new Uint16Array(nPix);
+    const onPixel = new Map();   // pixel -> every segment that sets it, kept only where there are 2+
+    let planesDone = 0;
+    const OVL_LO = 0.58, OVL_HI = 0.62, PAINT_HI = 0.95;
+    const ovlMsg = `${nSegs} segment${nSegs === 1 ? '' : 's'}: checking ${planeFrames.size} planes for overlaps`;
+    progEvery(ovlMsg, OVL_LO, true);
     for (const at of planeFrames.values()) {
-        for (let a = 0; a < at.length; a++) {
-            for (let b = a + 1; b < at.length; b++) {
-                if (at[a].sn === at[b].sn) continue;
-                for (let byte = 0; byte < frameBytes; byte++) {
-                    if (bits[at[a].off + byte] & bits[at[b].off + byte]) { link(at[a].sn, at[b].sn); break; }
+        planesDone++;
+        if (at.length < 2) continue;
+        owner.fill(0);
+        onPixel.clear();
+        for (const { sn, off } of at) {
+            for (let byte = 0; byte < frameBytes; byte++) {
+                const v = bits[off + byte];
+                if (!v) continue;
+                for (let bit = 0; bit < 8; bit++) {
+                    if (!((v >> bit) & 1)) continue;
+                    const px = (byte << 3) | bit;
+                    if (px >= nPix) break;
+                    const o = owner[px];
+                    if (!o) { owner[px] = sn; continue; }
+                    if (o === sn) continue;
+                    let on = onPixel.get(px);
+                    if (!on) { on = [o]; onPixel.set(px, on); }
+                    if (on.includes(sn)) continue;
+                    for (const q of on) link(q, sn);
+                    on.push(sn);
                 }
             }
         }
+        progEvery(ovlMsg, OVL_LO + (OVL_HI - OVL_LO) * planesDone / planeFrames.size);
     }
     // Greedy graph colouring: a segment takes the lowest layer none of its overlapping
     // neighbours already holds. Non-overlapping SEGs colour entirely to layer 0.
@@ -408,6 +447,7 @@ function buildLabelmap(ds, bits, ct) {
             seenSeg.add(segNum);
             post({ t: 'seg', name: names[segNum] || ('Segment ' + segNum) });
         }
+        progEvery(`painting ${names[segNum] || ('Segment ' + segNum)} · segment ${seenSeg.size}/${nSegs}`, OVL_HI + (PAINT_HI - OVL_HI) * f / perFrame.length, f === 0);
         const o = toIJK(ippLps), fb = f * frameBytes;
         const myLayer = layerOf.get(Number(segNum)) ?? 0;
         for (let row = 0; row < sy; row++) {
@@ -444,9 +484,8 @@ function buildLabelmap(ds, bits, ct) {
                         }
             }
         }
-        if (f % 200 === 0)
-            prog(`SEG ${f}/${perFrame.length}`, 0.55 + 0.4 * f / perFrame.length);
     }
+    prog(`${seenSeg.size} segment${seenSeg.size === 1 ? '' : 's'} painted`, PAINT_HI);
     return {
         lab: layers[0], extra: layers.slice(1), colors, names, terminology,
         overlap: {
@@ -471,9 +510,30 @@ function invAffine(m) {
     const tz = -(r[6] * t[0] + r[7] * t[1] + r[8] * t[2]);
     return [r[0], r[1], r[2], tx, r[3], r[4], r[5], ty, r[6], r[7], r[8], tz, 0, 0, 0, 1];
 }
+/** The first `n` bytes of a SEG, read as a stream so the download can report as it goes: on a slow
+ *  link these 4 MB are seconds, and they used to pass with no word at all. */
+async function fetchSegHead(url, n) {
+    const r = await fetchRetry(url, { headers: { Range: `bytes=0-${n - 1}` } });
+    if (!r.body || typeof r.body.getReader !== 'function') return new Uint8Array(await r.arrayBuffer());
+    const total = Number(r.headers.get('content-length')) || n;
+    const reader = r.body.getReader(), parts = [];
+    let got = 0;
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        parts.push(value);
+        got += value.byteLength;
+        progEvery(`fetching SEG header ${(got / 1e6).toFixed(1)}/${(total / 1e6).toFixed(1)} MB`, 0.5 + 0.01 * Math.min(1, got / total));
+    }
+    const out = new Uint8Array(got);
+    let o = 0;
+    for (const part of parts) { out.set(part, o); o += part.byteLength; }
+    return out;
+}
 async function fetchSeg(key) {
     const HEAD = 4 << 20;
-    const head = new Uint8Array(await fetchRetry(SEG_S3 + key, { headers: { Range: `bytes=0-${HEAD - 1}` } }).then((r) => r.arrayBuffer()));
+    prog('fetching SEG header…', 0.5);
+    const head = await fetchSegHead(SEG_S3 + key, HEAD);
     const dv = new DataView(head.buffer, head.byteOffset);
     let pt = -1;
     for (let i = 132; i + 12 <= head.length; i += 2) {
@@ -490,26 +550,34 @@ async function fetchSeg(key) {
     const valOff = pt + 12, pdLen = dv.getUint32(pt + 8, true);
     if (!pdLen || pdLen === 0xFFFFFFFF)
         throw new Error('encapsulated/undefined PixelData length');
-    const ds = naturalize(head.slice(0, pt).buffer);
     const bits = new Uint8Array(pdLen);
-    const have = Math.max(0, Math.min(HEAD, valOff + pdLen) - valOff);
+    const have = Math.max(0, Math.min(head.length, valOff + pdLen) - valOff);
     if (have > 0)
         bits.set(head.subarray(valOff, valOff + have), 0);
     const rs = valOff + have, re = valOff + pdLen - 1;
+    // Start the pixel ranges BEFORE parsing the header. The parse is CPU in this worker and the
+    // ranges are network: issued first, they download while it runs instead of queueing behind it.
+    let got = have;
+    const pending = [];
     if (rs <= re) {
         const CH = 8, cs = Math.ceil((re - rs + 1) / CH);
-        let got = have;
-        await Promise.all(Array.from({ length: CH }, (_, c) => {
+        for (let c = 0; c < CH; c++) {
             const s = rs + c * cs, e = Math.min(re, s + cs - 1);
             if (s > e)
-                return null;
-            return fetchRetry(SEG_S3 + key, { headers: { Range: `bytes=${s}-${e}` } }).then((r) => r.arrayBuffer()).then((ab) => {
+                continue;
+            pending.push(fetchRetry(SEG_S3 + key, { headers: { Range: `bytes=${s}-${e}` } }).then((r) => r.arrayBuffer()).then((ab) => {
                 bits.set(new Uint8Array(ab), s - valOff);
                 got += ab.byteLength;
-                prog(`SEG ${(got / 1e6) | 0}/${(pdLen / 1e6) | 0} MB`, 0.5 + 0.08 * got / pdLen);
-            });
-        }));
+                prog(`fetching SEG pixels ${(got / 1e6) | 0}/${(pdLen / 1e6) | 0} MB`, 0.51 + 0.07 * got / pdLen);
+            }));
+        }
     }
+    prog('parsing the SEG header…', 0.51 + 0.07 * got / pdLen);
+    const ds = naturalize(head.slice(0, pt).buffer);
+    const nSeg = (ds.SegmentSequence || []).length, nFrames = (ds.PerFrameFunctionalGroupsSequence || []).length;
+    if (got < pdLen)
+        prog(`${nSeg} segment${nSeg === 1 ? '' : 's'} in ${nFrames} frames — fetching SEG pixels…`, 0.51 + 0.07 * got / pdLen);
+    await Promise.all(pending);
     return { ds, bits };
 }
 // SOP classes that are not image slices but can share a series prefix. Anything here is
